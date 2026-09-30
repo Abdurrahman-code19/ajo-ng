@@ -96,6 +96,55 @@ def transaction(body: str) -> str:
     return f"BEGIN;\n{body}\nSET CONSTRAINTS ALL IMMEDIATE;\nROLLBACK;"
 
 
+
+def as_role(db: str, role: str, user_email: str, body: str, commit: bool = False) -> str:
+    """
+    Run `body` as `role`, impersonating `user_email`.
+
+    `commit=True` leaves the writes in place, which is the only way to assert
+    something that a *different* transaction will observe. A trigger's effects
+    are as much part of the write as the row itself, so an audit assertion has
+    to look at the trail from outside the transaction that wrote it; wrapping
+    both the insert and the count in one rolled-back transaction proves nothing,
+    because the audit row is rolled back along with everything else.
+
+    Two details are load-bearing and both cost a debugging session to find.
+
+    The GUC has to be set in the *same session* as the query. `psql -c "select
+    set_config(...); select ..."` looks equivalent and is not: each `-c` is its
+    own transaction, and a GUC set in a transaction that then ends is gone by
+    the time the next statement runs. So the GUC is set inside the same script
+    as the body.
+
+    `SET ROLE` has to come *after* the GUC. A GUC set before the role change is
+    reset, because the GUC belongs to the session and the role change resets
+    the session's privilege context.
+    """
+    return (
+        "BEGIN;\n"
+        # The GUC value is returned in a two-column row on purpose. `scalar`
+        # skips any line containing the field separator, so this line is
+        # invisible to it, and the body's own first line is what it reads. The
+        # bare `SELECT set_config(...)` this replaced printed the uuid on a line
+        # of its own, and every case that asked for a count silently got the
+        # uuid instead -- which is how a case came to report "should see 1 of 3
+        # users, saw '01a0f455-...'".
+        f"SELECT 'guc' AS ignored, set_config('app.user_id', "
+        f"(SELECT id::text FROM users WHERE email = '{user_email}'), false);\n"
+        f"SET LOCAL ROLE {role};\n"
+        f"{body}\n"
+        + ("COMMIT;\n" if commit else "ROLLBACK;\n")
+    )
+
+
+def scalar(db: str, sql: str) -> str:
+    """The first column of the first row, or '' when there are no rows."""
+    out = psql(db, sql).strip().splitlines()
+    for line in out:
+        if line and not line.startswith("(") and "|" not in line and "---" not in line:
+            return line.strip()
+    return out[0].strip() if out else ""
+
 # ---------------------------------------------------------------------------
 # Cases. Each returns a short human-readable line describing what it proved.
 # ---------------------------------------------------------------------------
@@ -301,6 +350,458 @@ def _reference(db: str) -> str:
     return "4 frequencies, 6 roles, 3 channels, 10 document types, 7 checks, 8 dispute reasons, 7 settings"
 
 
+# ---------------------------------------------------------------------------
+# The three roles. §9.2.
+#
+# These cases only mean anything after scripts/bootstrap_roles.sql has run, so
+# the suite applies it. A migration-built database is owned by the superuser
+# that ran the migrations, and every assertion here would pass vacuously against
+# that owner -- which is precisely the mistake 9.13 warns about.
+# ---------------------------------------------------------------------------
+
+
+def _two_members(db: str) -> tuple[str, str]:
+    """
+    Two ordinary members and one platform support agent, all committed.
+
+    This is a fixture, so it must persist for the cases that follow -- and it
+    previously did not. It was wrapped in `transaction()`, whose ROLLBACK
+    discarded the rows the docstring claimed were committed, so every case
+    downstream that looked a member up by email found nothing and the role
+    cases failed for a reason that had nothing to do with roles. The wrapper is
+    gone.
+
+    Leaving the statements in one `psql -c` still makes them atomic: PostgreSQL
+    runs a multi-statement simple query inside a single implicit transaction, so
+    either all four rows land or none do, and a partial fixture cannot happen.
+    """
+    must_succeed(
+        db,
+        "two members and a support agent",
+        "\n".join(
+            [
+                # ON CONFLICT because three cases call this fixture and only the
+                # first should do the inserting. Every role case needs the same
+                # two members and the same support agent, and the alternative --
+                # building the fixture once and sharing it -- would make each
+                # case depend on the ones before it having run.
+                "INSERT INTO users (auth_subject_id, email, status) VALUES "
+                "('rls-1', 'rls-a@example.ng', 'active') "
+                "ON CONFLICT DO NOTHING;",
+                "INSERT INTO users (auth_subject_id, email, status) VALUES "
+                "('rls-2', 'rls-b@example.ng', 'active') "
+                "ON CONFLICT DO NOTHING;",
+                "INSERT INTO users (auth_subject_id, email, status) VALUES "
+                "('rls-3', 'rls-staff@example.ng', 'active') "
+                "ON CONFLICT DO NOTHING;",
+                # A support agent is the only way to reach the staff
+                # branches of the policies, and R10 is about exactly that.
+                "INSERT INTO role_assignments (user_id, role_id, scope, "
+                "granted_by_user_id) SELECT u.id, 'support', 'platform', u.id "
+                "FROM users u WHERE u.email = 'rls-staff@example.ng' "
+                "ON CONFLICT DO NOTHING;",
+            ]
+        ),
+    )
+    return "rls-a@example.ng", "rls-b@example.ng"
+
+
+@case("a role cannot bypass RLS, and only the policy decides")
+def _rls_binds(db: str) -> str:
+    """
+    The load-bearing assertion of the whole role split.
+
+    Run as the table owner, every member is visible. Run as `ajo_app`
+    impersonating one member, only that member is. The difference is not the
+    grant -- `ajo_app` has full DML on public -- it is that the owner is exempt
+    from policies and `ajo_app` is not.
+    """
+    a, b = _two_members(db)
+
+    as_owner = psql(db, "SELECT count(*) FROM users;").strip()
+    if as_owner != "3":
+        raise Failure(f"expected the 3 fixture users, owner saw {as_owner!r}")
+
+    seen_by_a = scalar(db, as_role(db, "ajo_app", a, "SELECT count(*) FROM users;"))
+    if seen_by_a != "1":
+        raise Failure(
+            "ajo_app impersonating a member should see exactly 1 of 3 users, "
+            f"saw {seen_by_a!r}. If this is 3 the role is the owner, and the "
+            "policies are decorative."
+        )
+
+    # And the row it does see must be its own, not merely a count of one.
+    whose = scalar(db, as_role(db, "ajo_app", a, "SELECT string_agg(email, ',') FROM users;"))
+    if whose != "rls-a@example.ng":
+        raise Failure(f"ajo_app saw {whose!r} while impersonating rls-a")
+
+    # A different member sees their own row instead: the policy is per-row, not
+    # "the first row happens to be visible".
+    whose_b = scalar(db, as_role(db, "ajo_app", b, "SELECT string_agg(email, ',') FROM users;"))
+    if whose_b != "rls-b@example.ng":
+        raise Failure(f"ajo_app saw {whose_b!r} while impersonating rls-b")
+
+    return (
+        f"the owner sees all 3 users, ajo_app sees 1 -- its own -- as either member"
+    )
+
+
+@case("the three roles hold exactly the privileges the spec asks for")
+def _role_grants(db: str) -> str:
+    a, _ = _two_members(db)
+
+    # ajo_analytics: SELECT yes, write no.
+    must_succeed(
+        db, "analytics can SELECT", as_role(db, "ajo_analytics", a, "SELECT count(*) FROM users;")
+    )
+    must_fail(
+        db,
+        "analytics cannot INSERT",
+        as_role(
+            db,
+            "ajo_analytics",
+            a,
+            "INSERT INTO users (auth_subject_id, email, status) "
+            "VALUES ('nope', 'nope@example.ng', 'active');",
+        ),
+        expect="permission denied",
+    )
+
+    # ajo_app: DML granted, but a table with no INSERT policy still refuses.
+    # Grants say which table; policies say which row, and the second can be
+    # stricter than the first.
+    must_fail(
+        db,
+        "app cannot INSERT without an INSERT policy",
+        as_role(
+            db,
+            "ajo_app",
+            a,
+            "INSERT INTO users (auth_subject_id, email, status) "
+            "VALUES ('nope2', 'nope2@example.ng', 'active');",
+        ),
+        expect="row-level security",
+    )
+
+    # Neither application role may create objects in public. A role that can
+    # create a table can create one with a permissive policy and read through it.
+    for role in ("ajo_app", "ajo_analytics"):
+        must_fail(
+            db,
+            f"{role} cannot CREATE",
+            as_role(db, role, a, "CREATE TABLE public.rls_probe (x int);"),
+            expect="permission denied",
+        )
+
+    return (
+        "analytics is read-only, app has DML but is bound by policies, and "
+        "neither can create in public"
+    )
+
+
+@case("staff see the ledger and ordinary members see none of it")
+def _staff_ledger(db: str) -> str:
+    """R10 and R4: the two halves of the ledger rule, as the spec states them."""
+    _, b = _two_members(db)
+
+    # The rows have to exist. This case previously asserted that the support
+    # agent "should see the 6 fixture ledger rows" while creating none and while
+    # the case that does write ledger rows runs later and rolls them back, so
+    # there was never anything to see. Both halves of the assertion were
+    # therefore satisfied by an empty table, which is the weakest possible
+    # evidence for a rule whose entire content is who can see what.
+    for i in range(6):
+        must_succeed(
+            db,
+            f"ledger fixture {i}",
+            f"""
+            DO $$
+            DECLARE v_tx uuid := gen_random_uuid();
+            BEGIN
+              INSERT INTO ledger_transactions (id, kind, memo)
+              VALUES (v_tx, 'contribution.received', 'staff visibility fixture');
+              INSERT INTO ledger_postings (transaction_id, account_kind, side, amount_kobo)
+              VALUES (v_tx, 'escrow_cash', 'debit', 100000),
+                     (v_tx, 'contributions_receivable', 'credit', 100000);
+            END $$;
+            """,
+        )
+
+    member_rows = scalar(
+        db, as_role(db, "ajo_app", b, "SELECT count(*) FROM ledger_transactions;")
+    )
+    if member_rows != "0":
+        raise Failure(f"a member should see 0 ledger rows, saw {member_rows!r}")
+
+    staff_rows = scalar(
+        db,
+        as_role(
+            db, "ajo_app", "rls-staff@example.ng", "SELECT count(*) FROM ledger_transactions;"
+        ),
+    )
+    if staff_rows == "0":
+        raise Failure(
+            "the support agent should see the 6 fixture ledger rows, saw 0. "
+            "app.is_platform_staff() is not resolving through the grants."
+        )
+
+    return f"a member sees {member_rows} ledger rows, the support agent sees {staff_rows}"
+
+
+@case("SECURITY DEFINER functions run as a bounded owner, not a superuser")
+def _security_definer(db: str) -> str:
+    """
+    The six SECURITY DEFINER functions in app execute as their owner. If that
+    owner is a superuser they can read anything, and every policy that calls
+    them is a policy with a hole in it.
+    """
+    out = must_succeed(
+        db,
+        "read the SECURITY DEFINER owners",
+        "SELECT p.proname || '=' || pg_get_userbyid(p.proowner) "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE p.prosecdef AND n.nspname IN ('app', 'public') ORDER BY 1;",
+    )
+    if not out.strip():
+        raise Failure("found no SECURITY DEFINER functions, so this proves nothing")
+
+    for line in out.strip().splitlines():
+        if "=" not in line:
+            continue
+        name, _, owner = line.partition("=")
+        if owner != "ajo_migrator":
+            raise Failure(
+                f"app.{name.strip()} is SECURITY DEFINER and owned by {owner!r}, "
+                "expected ajo_migrator"
+            )
+        # And the owner must not itself be exempt from the policies it enforces.
+        bypass = must_succeed(
+            db,
+            f"check rolbypassrls for {owner}",
+            f"SELECT rolbypassrls::text FROM pg_roles WHERE rolname = '{owner}';",
+        ).strip()
+        # `::text` on a boolean is 'false', not psql's display form 'f'. Comparing
+        # against 'f' made this assert the opposite of what it meant: it failed
+        # while the role correctly had no BYPASSRLS, and would have passed if the
+        # role had it.
+        if bypass.strip() not in ("false", "f"):
+            raise Failure(f"{owner} has BYPASSRLS, so RLS does not bind it")
+
+    return (
+        f"all {len(out.strip().splitlines())} SECURITY DEFINER functions are owned by "
+        "ajo_migrator, which has neither superuser nor BYPASSRLS"
+    )
+
+
+@case("the schema grant the owner needs is not optional")
+def _owner_needs_schema_grant(db: str) -> str:
+    """
+    Guards the bug this bootstrap actually had.
+
+    PUBLIC has no USAGE on schema public here, which is correct and deliberate.
+    A superuser ignores that, so nothing notices until ownership moves off the
+    superuser -- at which point the new owner cannot see its own tables, and
+    every SECURITY DEFINER function reports "relation does not exist" while the
+    bootstrap itself reports success.
+    """
+    usage = must_succeed(
+        db,
+        "check the owner's schema privilege",
+        "SELECT has_schema_privilege('ajo_migrator', 'public', 'USAGE')::text;",
+    ).strip()
+    if usage != "true":
+        raise Failure(
+            "ajo_migrator owns the tables but has no USAGE on schema public, so "
+            "it cannot read them. The SECURITY DEFINER functions are broken and "
+            "the error is reported as a missing relation, not a missing grant."
+        )
+
+    # And prove the function that reads through the schema actually works.
+    must_succeed(
+        db,
+        "has_platform_role resolves",
+        "SELECT app.has_platform_role('support') IS NOT NULL;",
+    )
+
+    return (
+        "ajo_migrator has USAGE on public, so the SECURITY DEFINER functions can "
+        "resolve the tables they read"
+    )
+
+
+def uid(db: str, email: str) -> str:
+    """
+    A user's id, read as the superuser so it is not filtered by RLS.
+
+    Needed because of a trap worth naming. A case that, while impersonating
+    rls-a, selects the id of rls-b out of `users` to try to write a row owned by
+    rls-b gets *no rows*, because `users` has a self-only SELECT policy and rls-b
+    is not visible to rls-a. The INSERT then matches nothing, inserts nothing,
+    raises nothing, and the case concludes the write was refused when in fact it
+    was never attempted. That is a policy test passing for the wrong reason, and
+    it is worse than no test, because the assertion it was written to make is
+    precisely the one an attacker would try.
+
+    So the id is fetched here, outside the role switch, and embedded as a
+    literal. The write is then genuinely attempted and genuinely refused.
+    """
+    out = scalar(db, f"SELECT id FROM users WHERE email = '{email}';")
+    if not out:
+        raise Failure(f"no user {email!r} to build the assertion from")
+    return out.strip()
+
+
+@case("an audited write records an audit row")
+def _audit_trail_writes(db: str) -> str:
+    """
+    Guards the failure that was silent for a whole round of work.
+
+    `app.audit_row()` is SECURITY DEFINER, so all 18 audit triggers insert into
+    `audit_logs` as `ajo_migrator` rather than as the caller. `audit_logs` is
+    FORCE RLS, and FORCE binds the owner, so the insert needs a policy of its
+    own. Without one, every audited write in the schema is refused by its own
+    audit trigger, inside a transaction that rolls back.
+
+    Nothing announces that. The write looks like it should work, the bootstrap
+    reports success, and the only symptom is an absence -- so the way to catch
+    it is to assert the row exists, which is what this does. A test that only
+    asserted "the insert succeeded" would have passed before the split and
+    failed after it, and neither fact would have told anyone the trail was gone.
+
+    The second half is the property that makes the fix safe rather than merely
+    working: `ajo_app` must still be unable to write `audit_logs` itself. A
+    policy that let the application role insert audit rows would be a way to
+    forge history, which is the one thing an audit table must not permit.
+    """
+    before = scalar(db, "SELECT count(*) FROM audit_logs;")
+    rows_before = scalar(db, "SELECT count(*) FROM profiles;")
+    owner = uid(db, "rls-a@example.ng")
+    # Committed, because the audit row has to still be there when the count runs.
+    # See `as_role`'s `commit` note -- a rolled-back insert takes its own audit
+    # row with it, and the assertion passes against a table that never recorded
+    # anything. The owning id is a literal rather than a subquery for the same
+    # reason the count is a separate statement: both have to be real.
+    must_succeed(
+        db,
+        "an audited insert as the application role",
+        as_role(
+            db,
+            "ajo_app",
+            "rls-a@example.ng",
+            "INSERT INTO profiles (user_id, display_name) "
+            f"VALUES ('{owner}', 'Audited');",
+            commit=True,
+        ),
+    )
+
+    # The row itself is checked before the audit row, and the reason is that
+    # `must_succeed` only looks for "ERROR". An INSERT that matches no source
+    # row reports INSERT 0 0, which is a success, so an earlier version of this
+    # case named a document_type code that does not exist, inserted nothing,
+    # triggered nothing, and then reported -- correctly, and uselessly -- that
+    # the audit trail was empty. Asserting the write landed is what stops the
+    # audit assertion from being evidence about a statement that never ran.
+    if scalar(db, "SELECT count(*) FROM profiles;") == rows_before:
+        raise Failure(
+            "the audited insert inserted no row, so there was nothing for the "
+            "trigger to record and the audit assertion below proves nothing"
+        )
+
+    after = scalar(db, "SELECT count(*) FROM audit_logs;")
+    if after == before:
+        raise Failure(
+            "the insert succeeded but wrote no audit row, so the trail is not "
+            "recording anything and every write here is unaccounted for"
+        )
+
+    must_fail(
+        db,
+        "the application role forging an audit row",
+        as_role(
+            db,
+            "ajo_app",
+            "rls-a@example.ng",
+            "INSERT INTO audit_logs (actor_user_id, subject_type, action) "
+            f"VALUES ('{owner}', 'user', 'forged');",
+        ),
+        expect="row-level security",
+    )
+
+    return (
+        f"an audited write as ajo_app produced an audit row ({before} to {after}), "
+        "and ajo_app still cannot insert one itself"
+    )
+
+
+@case("a member can create only their own identity rows")
+def _self_insert(db: str) -> str:
+    """
+    The two grants in 096, and the shape every other self-owned INSERT follows.
+
+    Both checks compare the row against the identity the request proved, so the
+    only thing a member can do here is create a row that is already theirs. The
+    refusal below is the half that matters: the same role must not be able to
+    write a row attributed to somebody else, which is the only way a
+    self-owned INSERT policy becomes a real hole.
+    """
+    # rls-b rather than rls-a: the audit case above commits a profile for rls-a,
+    # and `profiles.user_id` is unique, so sharing a member makes this case fail
+    # on a constraint instead of on the policy it is here to test. Each case
+    # owning a different member is cheaper than ordering the cases.
+    mine = uid(db, "rls-b@example.ng")
+    theirs = uid(db, "rls-a@example.ng")
+
+    must_succeed(
+        db,
+        "a member inserting their own profile",
+        as_role(
+            db,
+            "ajo_app",
+            "rls-b@example.ng",
+            "INSERT INTO profiles (user_id, display_name) "
+            f"VALUES ('{mine}', 'Self');",
+        ),
+    )
+    must_fail(
+        db,
+        "a member inserting a profile for somebody else",
+        as_role(
+            db,
+            "ajo_app",
+            "rls-b@example.ng",
+            "INSERT INTO profiles (user_id, display_name) "
+            f"VALUES ('{theirs}', 'Not mine');",
+        ),
+        expect="row-level security",
+    )
+
+    # And the tables 096 deliberately leaves without an INSERT policy. These are
+    # the money and ledger tables, and asserting they are closed is what stops a
+    # later "just grant it" from going unnoticed.
+    for table in (
+        "payments",
+        "payouts",
+        "ledger_transactions",
+        "ledger_postings",
+        "risk_events",
+    ):
+        granted = scalar(
+            db,
+            "SELECT count(*) FROM pg_policies WHERE tablename = "
+            f"'{table}' AND cmd = 'INSERT';",
+        )
+        if granted != "0":
+            raise Failure(
+                f"{table} has an INSERT policy, but 096 records that writing it "
+                "is a product decision and no app function writes it yet. Who may "
+                "write a payout is not a detail to change without noticing."
+            )
+
+    return (
+        "profiles accepts a self-owned row and refuses someone else's, and the "
+        "five money, ledger and risk tables remain closed"
+    )
+
 @case("the ledger stays balanced and append-only")
 def _ledger(db: str) -> str:
     # The invariant: at least two postings whose signed amounts sum to zero. The
@@ -391,6 +892,19 @@ def main() -> int:
     )
     if applied.returncode != 0:
         print("migrations failed to apply:\n" + applied.stdout + applied.stderr)
+        return 1
+
+    # The role cases below assert that a non-owner role is bound by RLS. Against
+    # the superuser that just applied the migrations they would all pass
+    # vacuously, so ownership has to move first.
+    bootstrapped = subprocess.run(
+        pg.psql(args.db, "-q", "-v", "ON_ERROR_STOP=1", "-f",
+                os.path.join(here, "bootstrap_roles.sql")),
+        capture_output=True,
+        text=True,
+    )
+    if bootstrapped.returncode != 0:
+        print("role bootstrap failed:\n" + bootstrapped.stdout + bootstrapped.stderr)
         return 1
 
     failures = 0

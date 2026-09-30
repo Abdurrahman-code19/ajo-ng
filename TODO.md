@@ -205,10 +205,25 @@ Enforced by the database, not just by the domain:
   Ajo whose organiser is not a member of it
 - `app.assert_draft_exit()` — at least 5 positions, and no more than 20, before DRAFT is left
 
-- [ ] Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations only),
+- [x] Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations only),
       `ajo_app` (DML, does **not** own tables so RLS holds), `ajo_analytics` (`SELECT` only).
-      **Not yet in `migrations/`.** Roles are cluster-level, so `CREATE ROLE` cannot run inside
-      a migration transaction; they belong in a bootstrap script plus grants, not in a dump.
+      `scripts/bootstrap_roles.sql`, not a migration: a role is cluster state, and a database
+      restored onto a cluster without these roles has to be able to come up before anyone
+      runs a migration. Applied to `ajo`; 7 role cases assert it, including that the owner
+      is neither superuser nor `BYPASSRLS` and that `ajo_app` sees 1 of 3 users where the
+      owner sees 3.
+- [ ] **Write path for the five tables `096` deliberately leaves closed.** `payments`, `payouts`,
+      `ledger_transactions`, `ledger_postings` and `risk_events` have RLS and no `INSERT` policy,
+      so a non-owner cannot write them. This is correct today and is *not* an oversight, but it
+      means those tables are unwritable until the application layer that owns them exists. The
+      spec's `§9.6` table is headed "Who can read a row", so its "Nobody" is a statement about
+      `SELECT` and is not permission to write. No function in `app` writes any of the five --
+      the only writer the migrations create is `app.audit_row()`, which writes `audit_logs`.
+      The fix is `SECURITY DEFINER` functions that validate the entry (a balanced ledger
+      transaction, a closed round, a settled payment), **not** a grant to a role that already
+      holds DML on every table. `scripts/test_migrations.py` asserts these five stay closed, so
+      a later "just grant it" cannot land unnoticed. Who may write a payout is a product
+      decision and is not a detail to change in passing.
 - [ ] Reconcile the column count: the adopted schema has **621** columns, the spec says 576.
       Tables, indexes, constraints, triggers and policies all match. Until this is resolved,
       treat the migrations as the source of truth for shape and the spec as the source of

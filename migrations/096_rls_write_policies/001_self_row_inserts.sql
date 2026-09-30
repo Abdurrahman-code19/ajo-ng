@@ -1,0 +1,71 @@
+-- Gives a member the two INSERT paths they can be given without a product
+-- decision, and records, by omission, the ones that need one.
+--
+-- The gap this closes. `users` and `profiles` are RLS-enabled and FORCE-RLS,
+-- which binds the table owner as well as everyone else. Before the role split
+-- in `scripts/bootstrap_roles.sql` their writes worked only because the owner
+-- was a superuser, and a superuser bypasses FORCE ROW LEVEL SECURITY
+-- unconditionally. Moving ownership to `ajo_migrator` -- NOSUPERUSER,
+-- NOBYPASSRLS -- removed that bypass, and a table with RLS on and no policy
+-- for a command denies that command. So the two tables gained SELECT and
+-- UPDATE policies in 070 and nothing else: an INSERT was refused.
+--
+-- The house style for a self-owned row is already set by the six INSERT
+-- policies adopted in 070, and these two follow it exactly: no USING clause,
+-- because INSERT has no rows to filter, only a WITH CHECK. Compare
+-- `documents_insert_own` and `ajo_members_insert_own`.
+--
+-- Why these two are safe to grant without further product input. Both are
+-- identity rows whose owner is the caller, and both checks compare the row
+-- against the identity the request already proved: a member can create their
+-- own row and nobody else's, which is the same sentence the spec's read table
+-- states for these tables. There is no path here to another member's row, no
+-- aggregate, no money.
+--
+-- Why the rest are absent, deliberately. `payments`, `payouts`,
+-- `ledger_transactions`, `ledger_postings` and `risk_events` are also RLS with
+-- no INSERT policy, and they are also unwritable by a non-owner as things
+-- stand. They are not fixed here because granting them is a product decision
+-- rather than a mechanical one, and the spec does not state one:
+--
+--   * The spec's table at 9.6 is headed "Who can read a row". "Nobody" in it is
+--     a statement about SELECT. It is not permission to write.
+--   * The ledger is append-only and is written when a contribution is
+--     confirmed. No function in `app` writes it -- checked, not assumed: the
+--     only writer the migrations create is `app.audit_row()`, which writes
+--     `audit_logs` and nothing else. So there is no definer function to grant
+--     through, and an INSERT policy for the application role would be the first
+--     thing in this schema to let a caller write an arbitrary ledger entry.
+--   * The same applies to `risk_events`, which is written by fraud and risk
+--     logic that does not exist yet.
+--   * `payments` and `payouts` are money. A plausible-looking WITH CHECK here is
+--     the most dangerous thing this repository could contain, because it would
+--     be the only thing standing between a caller and a payout.
+--
+-- Writing those five is application work, and it belongs behind
+-- SECURITY DEFINER functions that validate the entry -- a balanced ledger
+-- transaction, a closed round, a settled payment -- rather than behind grants
+-- to a role that holds DML on every table. The privileges that let `ajo_app`
+-- attempt those inserts already exist; the policies that would permit a
+-- specific one do not, and are not invented here.
+--
+-- `audit_logs` is the one table whose writer is present and known, and its
+-- fix is in `scripts/bootstrap_roles.sql` rather than here, because that
+-- policy has to name a cluster role and a role is cluster state. See the
+-- "Trigger write path" section there.
+CREATE POLICY users_insert_own ON public.users
+  FOR INSERT
+  WITH CHECK (id = app.request_user_id());
+
+-- `profiles.user_id` is the owning column, as on `ajo_members.user_id`.
+--
+-- On `users`: registration is the one moment the row does not exist yet, so
+-- this check assumes the caller has already set `app.user_id` to the id of the
+-- row it is creating -- the same GUC every other policy in 9.6 reads, set
+-- before the role switch. If registration instead runs with no identity set,
+-- `request_user_id()` is null, the check is not satisfied, and the insert is
+-- refused. That is the correct direction to fail: a signup path that stops is
+-- visible, a signup path that silently creates an unattributable row is not.
+CREATE POLICY profiles_insert_own ON public.profiles
+  FOR INSERT
+  WITH CHECK (user_id = app.request_user_id());

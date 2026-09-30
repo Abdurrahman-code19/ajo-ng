@@ -105,6 +105,32 @@ Things that will bite you:
   everything that is not `080` — including `090`, which sorts after it.
 - **Never edit an applied migration.** The checksum in `app.schema_migrations`
   will no longer match and every deployment will halt. Add a new file.
+- **The three roles are bootstrap, not migration** (`§9.2`). Run
+  `psql -d <name> -f scripts/bootstrap_roles.sql`; it creates `ajo_migrator`,
+  `ajo_app` and `ajo_analytics` and is safe to re-run, including against a role
+  whose attributes were damaged. A role is cluster state, so a database restored
+  onto a cluster without them must be able to come up before anyone migrates.
+  `test_migrations.py` applies it before the role cases, because those cases
+  would otherwise pass vacuously against the superuser that ran the migrations.
+- **A `SECURITY DEFINER` function writes as its owner, and `FORCE ROW LEVEL
+  SECURITY` binds the owner too.** So the 18 audit triggers on `app.audit_row()`
+  insert into `audit_logs` as `ajo_migrator` and need a policy of their own. The
+  failure mode is silent: the write is refused inside a transaction that rolls
+  back, and nothing prints a warning. The policy lives in the bootstrap rather
+  than in a migration because it names a cluster role, and a clean build may not
+  have that role. Any new `SECURITY DEFINER` function that writes needs the same
+  treatment, and a test that asserts the row was actually written.
+- **A role with DML on every table is bound by policies, not by grants.** A table
+  with RLS on and no policy for a command denies that command, so `INSERT` into
+  `users` was refused until `096_rls_write_policies` added the self-owned
+  policies. Five tables are still deliberately closed — `payments`, `payouts`,
+  both ledger tables and `risk_events` — and the reason is in that migration and
+  in `TODO.md`. Do not open one with a bare `GRANT`.
+- **Two GUCs, and the audit trigger reads the one people forget.** The policies
+  read `app.user_id`; `app.audit_row()` reads `app.actor_user_id` and
+  `app.actor_type`. A request that sets only `app.user_id` writes an audit row
+  with `actor_user_id` null and `actor_type` `'service'`, which is a correct
+  record of a system action and a useless record of a person's.
 - **To regenerate after a schema change**, run
   `python3 scripts/adopt_schema.py --from-db <name>` and
   `python3 scripts/seed_reference_data.py --from-db <name>`, then read the diff.

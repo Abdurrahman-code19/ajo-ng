@@ -48,6 +48,7 @@ its own foreign keys by hand without a great deal of care. The result is
 | `080_ajo_size_bounds` | 5-to-20 members, default 10, creator is a member |
 | `090_reference_data` | frequencies, roles, channels, document types, settings |
 | `095_pgdump_artifacts` | drops a pg_dump helper that leaked into `public` |
+| `096_rls_write_policies` | self-owned `INSERT` policies for `users` and `profiles`, and the record of why the five money, ledger and risk tables stay closed |
 
 Deferred objects come last because they reference things created above them.
 
