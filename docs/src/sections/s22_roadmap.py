@@ -33,8 +33,8 @@ BLOCKS = [
         ["Append-only double-entry ledger", "Complete", "Balanced entries, reversal-only correction, computed balances"],
         ["Ajo lifecycle state machine", "Complete", "All transitions, the 5-day enrollment window, position lock"],
         ["FinancialProvider abstraction", "Complete", "Interface plus a production-guarded mock"],
-        ["Adversarial domain tests", "Complete", "44 tests covering the money, ledger, and state machine"],
-        ["Technical specification document", "In progress", "This document"],
+        ["Adversarial domain tests", "Complete", "61 tests covering the money, ledger, fee arithmetic, and state machine"],
+        ["Technical specification document", "Complete", "26 sections; the generated DOCX is committed alongside this table"],
     ]},
 
     {"t": "h2", "text": "22.3 Phase 1 — Hardened core and legal position"},

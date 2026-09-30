@@ -1,0 +1,500 @@
+# TODO — AJO.ng
+
+Build plan for AJO.ng, derived from `AJO-ng-Complete-Product-Technical-Specification.docx`.
+
+Every requirement below traces to the specification. Section numbers (`§1`, `§9.3`) refer to
+the numbered sections of the DOCX; `FR-*`, `BR-*` and `NFR-*` are requirement IDs from §1;
+`E*-**` are backlog items from §23. Nothing here is invented — if a task is not traceable to
+the specification, it should not be in this file.
+
+**Source of truth:** `docs/src/CANONICAL.md` for terminology, money rules, roles, states and
+API surface. When this file and the specification disagree, the specification is right and
+this file is a bug.
+
+---
+
+## How to read this
+
+**Status legend**
+
+| Mark | Meaning |
+|---|---|
+| `[x]` | Done and verified |
+| `[ ]` | Not started |
+| `[~]` | Partially done — note what is missing |
+| `[!]` | Blocked on something outside engineering |
+
+**Priority**
+
+| Mark | Meaning |
+|---|---|
+| `P0` | Blocks everything else, or touches member money |
+| `P1` | Required for MVP |
+| `P2` | Required before public launch |
+| `P3` | Post-launch |
+
+**Rule of thumb**, from §23.1: *safety before money movement, money movement before
+convenience, convenience before polish.* A beautiful interface on an incorrect ledger is a
+liability.
+
+**Two hard gates.** These are not engineering tasks and no amount of code substitutes for
+them:
+
+1. **No real money before the legal position is established** (§24.14, all 15 items).
+2. **No money movement before the ledger and reconciliation are tested** (§22.1).
+
+---
+
+## Current state
+
+| | |
+|---|---|
+| Specification | Complete — 26 sections, ~238k words, 445 tables |
+| Domain core | 2,018 lines, 61 tests passing |
+| Database | **0 of 40 tables built** |
+| API | **0 of 66 endpoints built** |
+| Web / admin | Not started |
+| Mobile | Not started |
+| Legal | **0 of 15 items cleared** |
+
+Verified at `fe884ae`: `npm run verify` → 61/61 pass.
+
+---
+
+## Phase 0 — Foundation ✅
+
+The financial core, built before any product surface. This is the most consequential
+decision in the project: it is far cheaper to get the money right now than to migrate a live
+ledger later.
+
+- [x] Canonical business and financial specification (`docs/src/CANONICAL.md`)
+- [x] Complete product and technical specification (26 sections, DOCX)
+- [x] `E1-01` Money in integer kobo, branded, no floating point
+- [x] `E1-02` NGN formatting and parsing across all magnitudes
+- [x] `E1-03` Double-entry ledger with balanced postings
+- [x] `E1-04` Reversal-only correction; no update or delete path
+- [x] `E1-05` Balances computed from entries, never from mutable columns
+- [x] `E1-06` Ajo lifecycle state machine with all transitions
+- [x] `E1-07` Five-day enrollment window and position lock (`BR-001`, `BR-002`)
+- [x] `E1-08` `FinancialProvider` interface
+- [x] `E1-09` `MockFinancialProvider` with a production guard
+- [x] `E1-10` Adversarial test suite
+- [x] `E1-11` Balanced 2% fee posting for contribution capture — `entries.feeRecognised`
+- [x] `E1-12` Fee reversal preserving recognised revenue — reversal test in `ledger.test.ts`
+- [x] `E1-13` Payout recognition and settlement entries — `entries.payoutRecognized` / `payoutSettled`
+- [x] `E1-14` Continuous invariant check — `assertSolvent()`
+- [x] `E11-01` Repository, CI pipeline, and quality gates — private GitHub remote, pre-commit
+      hook blocking unverified pushes via versioned `core.hooksPath`
+- [x] Pre-commit hook blocking unverified pushes (`.githooks/pre-commit`)
+
+**Note:** the specification's §23.3 still shows E1-11 → E1-14 as *To do*. They are built.
+That table needs updating — see *Spec maintenance* at the bottom.
+
+---
+
+## Phase 1 — Hardened core and legal position
+
+Phase 1 has a legal exit criterion, not just an engineering one. The advice obtained here
+determines whether AJO.ng may operate at all, and in what form.
+
+### Engineering
+
+- [ ] `E1-15` Reconciliation service — compare provider statement against ledger, daily
+- [ ] `E1-16` Reconciliation break alerting — **halts payouts** on a break (`E3-09`)
+- [ ] `E1-17` Fault-injection test proving a deliberately broken invariant is *detected*
+- [ ] `E11-07` Migration strategy: expand-then-contract, no destructive change in one deploy
+- [ ] `E11-02` Environments: local, CI, staging, pre-prod, production
+- [ ] `E11-08` Secret management and rotation
+- [ ] `E11-03` Structured logging with PII redaction **at source**
+- [ ] `E11-06` Backups with a rehearsed restore (a backup never tested is not a backup)
+
+### Legal and compliance — `[!]` blocked, requires qualified Nigerian counsel
+
+Per §24.14. **All 15 items outstanding.** None is an engineering task.
+
+- [ ] `!` 1. Regulatory characterisation and licensing determination, in writing
+- [ ] `!` 2. Payments partner agreement executed, permitted use cases confirmed
+- [ ] `!` 3. Custody position confirmed and account structure approved
+- [ ] `!` 4. Terms of service drafted by counsel and approved
+- [ ] `!` 5. Privacy notice and cookie notice drafted, published
+- [ ] `!` 6. Ajo rules and organizer role agreement drafted and approved
+- [ ] `!` 7. AML/CTF risk assessment completed, if legally required
+- [ ] `!` 8. Data protection registration or notification made, if required
+- [ ] `!` 9. Data processing agreements executed with every processor
+- [ ] `!` 10. Retention schedule approved and implemented in the system
+- [ ] `!` 11. Complaint procedure published and staffed
+- [ ] `!` 12. Trademark search completed; name and marks protected
+- [ ] `!` 13. Insurance arranged
+- [ ] `!` 14. Staff contracts, confidentiality, IP assignment in place
+- [ ] `!` 15. Advice on tax treatment of the fee and of contributions
+
+**Build against current assumptions, adjust when counsel answers. Never treat any of this as
+cleared.**
+
+### Payments partner
+
+- [ ] `!` `E3-01` ProvidusUnity technical due diligence — verified sandbox spec, published fee
+      schedule, settlement behaviour — **or a documented decision to use a different provider**
+- [ ] Never invent ProvidusUnity behaviour. `MockFinancialProvider` refuses production use for
+      exactly this reason.
+
+---
+
+## Phase 2 — Payments spine
+
+The first phase where real money can move. Everything before this is reversible.
+
+### Database — 40 tables (§9.3), 576 columns, 145 indexes, 216 constraints, 73 triggers
+
+The counts are the database's own, read back from `pg_class`, `pg_index` and `pg_constraint`.
+
+- [ ] **Identity (7):** `users` `profiles` `admins` `sessions` `device_tokens` `roles` `role_assignments`
+- [ ] **Onboarding (5):** `invitations` `verification_checks` `verification_check_types` `document_types` `documents`
+- [ ] **Ajo core (6):** `ajos` `ajo_positions` `ajo_members` `rounds` `contribution_schedules` `contribution_frequencies`
+- [ ] **Money (5):** `contributions` `payments` `fees` `payouts` `payment_channels`
+- [ ] **Ledger (2):** `ledger_transactions` `ledger_postings` — postings sum to exactly zero
+- [ ] **Disputes (4):** `disputes` `dispute_messages` `dispute_evidence` `dispute_reasons`
+- [ ] **Risk and ops (5):** `risk_events` `reconciliation_runs` `support_tickets` `audit_logs` `platform_settings`
+- [ ] **Notifications (3):** `notifications` `notification_templates` `notification_preferences`
+- [ ] **Infrastructure (3):** `idempotency_keys` `webhook_events` `outbox_events`
+
+Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations only),
+`ajo_app` (DML, does **not** own tables so RLS holds), `ajo_analytics` (`SELECT` only).
+
+### Identity — E2
+
+- [ ] `E2-01` Registration with email verification and consent capture
+- [ ] `E2-02` BVN verification and liveness flow — the BVN is never stored in full
+- [ ] `E2-03` Phone normalisation to E.164 and uniqueness (`BR-030` one identity, one account)
+- [ ] `E2-04` Account states: pending, active, frozen, suspended, dormant, closed
+- [ ] `E2-05` Profile management and self-service data export
+- [ ] `E2-06` Login, refresh rotation, reuse detection
+- [ ] `E2-07` MFA — SMS OTP for sensitive actions, TOTP for staff
+- [ ] `E2-08` Step-up authentication framework
+- [ ] `E2-09` Device management and revocation
+- [ ] `E2-10` Role and permission enforcement with RLS
+- [ ] `E2-11` Staff access review tooling
+
+### Payments — E3
+
+- [ ] `E3-02` `ProvidusFinancialProvider` adapter
+- [ ] `E3-03` Provider contract test suite
+- [ ] `E3-04` Webhook verification, replay protection, idempotency, out-of-order handling
+- [ ] `E3-05` Collection initiation and pending contribution flow
+- [ ] `E3-06` Fee calculation and capture posting — itemised, never a hidden line
+- [ ] `E3-07` Escrow and settlement account setup — **no member funds in operating accounts, ever**
+- [ ] `E3-08` Daily reconciliation service and reporting
+- [ ] `E3-09` Reconciliation alerting, with payouts halted on a break
+- [ ] `E3-10` Refunds and reversals, including duplicate capture
+- [ ] `E3-11` Unmatched inbound payment handling and aging
+- [ ] `E3-12` Provider status polling as a webhook backstop
+- [ ] `E3-13` Payment status query for members
+- [ ] `E3-14` USSD or feature-phone fallback
+
+### Payouts — E4
+
+- [ ] `E4-01` Payout preconditions engine
+- [ ] `E4-02` `PayoutIntent` state machine
+- [ ] `E4-03` Single payout with ledger recognition then settlement
+- [ ] `E4-04` Batch dispatch for a completing Ajo
+- [ ] `E4-05` Retry with exponential backoff, then human review
+- [ ] `E4-06` `HELD` state with bounded automatic release — a payout is never silently reduced
+- [ ] `E4-07` Receipt and payout notification
+- [ ] `E4-08` Member-initiated payout request
+- [ ] `E4-09` Monthly and annual statements
+- [ ] `E4-10` Payout reconciliation against bank statements
+
+---
+
+## Phase 3 — Member experience
+
+### Ajo lifecycle — E5
+
+- [ ] `E5-01` Create an Ajo with all parameters and validation
+- [ ] `E5-02` Ajo rules and acknowledgement record (`BR-004` complete-cycle commitment)
+- [ ] `E5-03` Invitation generation, single-use validation (`BR-006` invitation only)
+- [ ] `E5-04` Join and position assignment
+- [ ] `E5-05` Five-day enrollment window with **boundary tests** (`BR-001`)
+- [ ] `E5-06` Activation to `FUNDED` — positions lock here (`BR-002`)
+- [ ] `E5-07` Round scheduling and advance
+- [ ] `E5-08` Completion and Ajo closure — terminal states are terminal (`BR-009`)
+- [ ] `E5-09` Cancellation before activation, with full refunds
+- [ ] `E5-10` Ajo detail and history view
+- [ ] `E5-11` Ajo completion record
+- [ ] `BR-003` No unilateral post-activation exit — there is no mechanism, by design
+- [ ] `BR-005` Terms immutable once active
+
+### Contributions and defaults — E6
+
+- [ ] `E6-01` Contribution schedule and due dates
+- [ ] `E6-02` Collection flow with the fee shown as a separate line
+- [ ] `E6-03` Position status: unpaid, pending, funded
+- [ ] `E6-04` Reminder escalation schedule
+- [ ] `E6-05` Default recording (`BR-016` fixed sequence)
+- [ ] `E6-06` 48-hour grace period with recovery offer
+- [ ] `E6-07` Organizer acknowledgement of a default
+- [ ] `E6-08` Recovery payment flow
+- [ ] `E6-09` Replacement member with debt assumption
+- [ ] `E6-10` Assert no extra charge to other members (`BR-015`, `BR-018`)
+
+The default sequence is fixed: reminder → retry → 48-hour grace → organizer notified → member
+contacted → payment or default recorded. **No shaming** (`BR-014`), **no reputational
+consequence**, and a default is private between the member, the organizer and platform risk.
+
+### Notifications — E7
+
+- [ ] `E7-01` Event model and taxonomy
+- [ ] `E7-02` In-app notification centre and history
+- [ ] `E7-03` Push delivery — APNs and FCM
+- [ ] `E7-04` Email templates and delivery
+- [ ] `E7-05` SMS fallback for critical events
+- [ ] `E7-06` Money event templates, complete set
+- [ ] `E7-07` Reminder scheduler with quiet hours and daily caps
+- [ ] `E7-08` Preference centre, per channel and category
+- [ ] `E7-09` Delivery logging, bounce handling, dead letters
+- [ ] `E7-10` WhatsApp Business integration
+- [ ] `E7-11` Localisation of templates
+
+### Web — Next.js
+
+- [ ] `P1` Design system and component library from `§5`, `§6`, `§7`
+- [ ] `P1` Onboarding: registration, verification, consent
+- [ ] `P1` Create and join an Ajo, with the fee disclosed pre-commitment (`BR-011`)
+- [ ] `P1` Contribute — fee as a separate line, correct total, failure states handled
+- [ ] `P1` Payout experience: receipt and statement
+- [ ] `P1` Profile, bank accounts, settings — cooling-off enforced on bank changes
+- [ ] `P1` Help and support with a documented escalation path
+- [ ] Accessibility target: WCAG 2.2 AA, verified, not asserted
+
+### Mobile — React Native / Expo
+
+- [ ] `P2` Member app: Ajo list, contribute, payout status, notifications
+- [ ] `P2` `E11-11` Build pipeline, signing, staged rollout
+- [ ] Feature-phone reach is a deliberate consideration; USSD fallback is `E3-14`
+
+---
+
+## Phase 4 — Organizer and admin
+
+### Organizer tools — E8
+
+- [ ] `E8-01` Dashboard for their own Ajos only
+- [ ] `E8-02` Invitation management
+- [ ] `E8-03` Contribution status monitoring
+- [ ] `E8-04` Member removal, **before activation only** (`BR-007`)
+- [ ] `E8-05` Send reminders, as AJO.ng messages — never impersonating a member
+- [ ] `E8-06` Default acknowledgement (`BR-020`)
+- [ ] `E8-07` Ajo completion reporting
+- [ ] `E8-08` Ajo history and reputation signals
+- [ ] `E8-09` Messaging within the Ajo
+- [ ] `BR-008` The organizer is not a guarantor — enforced in copy and in the disclaimer
+- [ ] `BR-022` The organizer never handles the money
+
+### Operations console — E9
+
+- [ ] `E9-01` Admin: Ajo and member oversight
+- [ ] `E9-02` Support lookup by transaction or member
+- [ ] `E9-03` Reconciliation dashboard with break alerts
+- [ ] `E9-04` Manual payout retry and destination reassignment
+- [ ] `E9-05` Manual ledger correction — **reversal only** (`BR-025` no role edits the ledger)
+- [ ] `E9-06` Risk queue with holds, reasons, deadlines
+- [ ] `E9-07` Audit log viewer
+- [ ] `E9-08` Dispute management
+- [ ] `E9-09` Finance reporting and month-end close
+- [ ] `E9-10` Role assignment administration
+- [ ] `BR-023` Support never moves money
+
+---
+
+## Phase 5 — Trust and safety
+
+Not deferrable to "after launch". The cooling-off period and multi-channel notification are
+what stand between a legitimate member and a drained account.
+
+- [ ] `E10-01` Bank-account change cooling-off, **14 days**
+- [ ] `E10-02` Multi-channel notification of every sensitive change
+- [ ] `E10-03` Risk engine v1 — interpretable scores **with reasons**, not a black box
+- [ ] `E10-04` Velocity limits: contribution, Ajo count, payout count
+- [ ] `E10-05` Device, phone, and bank graph analysis
+- [ ] `E10-06` Sanctions and PEP screening
+- [ ] `E10-07` Member reporting of organizers and messages
+- [ ] `E10-08` Freeze that blocks sending but **never** receiving
+- [ ] `E10-09` SAR workflow and filing — statutory deadline, named reporting officer
+- [ ] `E10-10` Fraud metrics including false positive rate
+- [ ] `E10-11` Anti-phishing messaging throughout the product
+
+---
+
+## Phase 6 — Platform
+
+- [ ] `E11-04` Metrics, dashboards, alerting with runbooks
+- [ ] `E11-05` Distributed tracing across the async boundary
+- [ ] `E11-09` API versioning and backward compatibility
+- [ ] `E11-10` Feature flags with an audit trail
+- [ ] Operations runbook for §13.13, rehearsed before the pilot
+
+---
+
+## Phase 7 — Controlled pilot `[!]` gate
+
+- [ ] `[!]` All Phase 1 legal items cleared
+- [ ] `[!]` Payments partner agreement executed
+- [ ] 10–20 trusted members, recruited personally, with real money
+- [ ] At least three complete Ajo cycles to a real bank account, reconciled
+- [ ] Runbook followed for the full pilot **without improvisation**
+- [ ] At least one real default processed end to end
+- [ ] Structured interviews with every pilot member
+- [ ] All critical and high defects closed
+
+A pilot exists to discover the assumptions that were wrong. If three cycles produce no
+surprises, the pilot was not run properly — the cohort was too safe, or nobody was watching.
+
+---
+
+## Phase 8 — Public launch
+
+- [ ] `[!]` Legal items cleared, pen test passed
+- [ ] Open registration, with onboarding and verification proven at volume
+- [ ] Independent penetration test — all critical and high findings closed
+- [ ] Observability live, alerting routed to a real rota, runbooks written
+- [ ] Operations staffed: reconciliation, support, risk
+- [ ] Professional localisation of all financial and instructional content
+- [ ] Pre-approved incident templates and a member communication process
+
+---
+
+## Out of scope for MVP (§22.10)
+
+Do not build these. Each was considered and rejected on purpose.
+
+- Corporate or institutional Ajos, employer partnerships
+- Partial or graduated payouts — full payout or no payout
+- Late-payment penalties, or charging other members for a default (`BR-015`)
+- Public defaulters lists, shaming, reputational consequences (`BR-014`)
+- Open social features: public profiles, member directory, follower graphs, feeds
+- Unilateral post-activation exit (`BR-003`)
+- Escrow in the legal sense — AJO.ng holds no member funds itself, pending determination
+- Cryptocurrency, investment products, or any return on savings (`BR-027`, `BR-028`)
+- Multi-currency — all money is NGN, all values integer kobo (`BR-031`)
+- Native Android-only build
+- An independent escrow agent as a launch dependency
+
+---
+
+## The money rules
+
+Encoded in `packages/domain/src/money.ts` and `ledger.ts`, with tests that assert them. These
+are not preferences.
+
+- Everything is **integer kobo**. No floating point anywhere in the money path.
+- The fee is **2%, added on top** (`BR-010`). NGN 1,000 → NGN 20 fee → NGN 1,020 charged, and
+  the recipient still receives the full NGN 1,000 base pool. The fee never reduces a payout
+  (`BR-012`).
+- Rounding is **half-up in integer kobo**, expressed as `FEE_BASIS_POINTS`.
+- **Every entry balances to zero on its own, or it is rejected** (`BR-013`). No update, no
+  delete; a correction is a new reversing transaction.
+- **Recognition is separate from settlement.** `payout.recognized` raises the liability,
+  `payout.settled` moves the cash. Skipping recognition makes `assertSolvent` correctly report
+  insolvency and halt disbursement (`BR-020`).
+- Contribution and fee are **separate entries** so a refund can reverse one while keeping the
+  earned fee. A bare `credit fees_income` with no debit is not a transaction.
+- When a member pays *in*: **debit `escrow_cash`, credit `contributions_receivable`**.
+- Idempotency on **every** money movement (`BR-024`).
+- Money moves by **two events only** (`BR-032`): a contribution, and a payout.
+- The **recognition sequence is mandatory and ordered** (`BR-021`): contribution.received →
+  fee.recognised → payout.recognized → payout.settled. Steps are not skipped or reordered.
+- A **payout failure is never hidden** (`BR-017`): it is surfaced to the member, escalated to a
+  human, and visible in the ops console. A silently failed payout is a trust-ending event.
+- The fee may **never** be raised silently (`BR-026`).
+- **Invitation-only at MVP** (`BR-029`) — the one registration path is a single-use invitation.
+
+---
+
+## Engineering standards
+
+**Stack:** TypeScript throughout. Fastify API, Next.js web/admin, React Native/Expo mobile,
+PostgreSQL/Supabase, Redis/BullMQ. Modular monolith with a pure domain core. **No long-lived
+financial work on serverless functions** — a payout that times out halfway is a payout nobody
+can trace.
+
+**Testing:** Vitest for units, testcontainers for integration against real PostgreSQL,
+Playwright for end-to-end. The ledger needs adversarial tests, not coverage percentages.
+
+**Definition of done** (§23.15): working, tested, reviewed, documented, observable, and
+security-checked. Not "it works on my machine".
+
+**Before every commit**
+
+```bash
+./scripts/commit.sh "message"    # stages, verifies, commits, pushes
+```
+
+The pre-commit hook runs `npm run verify` and refuses the commit on failure. It travels with
+the repo via `core.hooksPath`, so a fresh clone is protected too.
+
+**When editing the specification:** `docs/src/sections/*.py` are the source, the DOCX is a
+build artefact. Rebuild with `python3 docs/src/build_spec.py` (2–4 minutes — detach with
+`setsid`, and do not trust `pgrep -f build_spec.py`, which self-matches and reports a process
+that has already exited). Commit the rebuilt DOCX.
+
+---
+
+## Cross-cutting requirements
+
+Every phase inherits these. They are not a phase.
+
+| Area | Requirement | Source |
+|---|---|---|
+| Money | Integer kobo, balanced entries, reversal-only correction | `BR-010`–`BR-013`, `BR-031` |
+| Legal | Licensed, not a savings group, no implied return | `BR-027`, `BR-028` |
+| Privacy | Consent records, DSR, retention enforced in the system | `§14`, legal item 10 |
+| Security | RLS, MFA, step-up, cooling-off, PII redaction at source | `§12`, `§14` |
+| Accessibility | WCAG 2.2 AA, verified | `§4` |
+| Audit | Every sensitive action in `audit_logs` | `NFR-AUD-*` |
+| Money copy | Correct about money; a placeholder in a payment flow is a defect | `§4` |
+
+**Requirement coverage:** 148 `FR-*`, 31 `BR-*`, 40 `NFR-*`, 38 `US-*`, 40 tables, 66 endpoints,
+15 legal items. When implementing, check the requirement is satisfied — do not assume.
+
+---
+
+## Spec maintenance
+
+The specification is not self-updating, and drift is how a spec stops being trustworthy.
+
+- [ ] Update `§23.3` E1-11 → E1-14 to **Done** — built, spec still says *To do*
+- [ ] Update `§22.2` test count from 44 to **61**
+- [ ] `§22.2` "Technical specification document: In progress" → **Complete**
+- [ ] Add a status column to the legal checklist that reflects reality
+- [ ] Rebuild the DOCX after any spec edit, and commit it
+
+---
+
+## Open questions
+
+Answers change the design. Chase them early.
+
+1. **Does ProvidusUnity support the required rails,** and what are the real fees? If not, the
+   adapter boundary keeps the cost of switching to engineering rather than redesign.
+2. **Does holding member funds in a pooled account constitute custody?** If yes, the account
+   structure, segregation, reconciliation and possibly licensing all change.
+3. **What are the AML, KYC and SAR obligations, and who discharges them?** A reporting officer
+   may be legally required, and the deadline is statutory.
+4. **How is a default legally characterised** — breach, debt, or loss? Foundational, not an
+   edge case.
+5. **What is the tax treatment** of the fee and of contributions?
+6. **What is the refund SLA** after a provider approves a reversal? No screen may state a
+   timeframe that has not been confirmed.
+
+---
+
+## Immediate next steps
+
+1. **Read the spec.** Skim §1 (PRD), §9 (schema), §11 (API) before building. 238k words
+   generated from source has never been reviewed by a human.
+2. **Build the 40 tables** in dependency order, migrations only, `ajo_migrator` ownership.
+3. **Stand up local infrastructure** — PostgreSQL and Redis via containers, three roles, RLS
+   policies from §9.6.
+4. **E2 identity**, then **E3 collection flow** with the mock provider.
+5. **Start the legal engagement.** It is the critical path and it does not run through
+   engineering. Every week it does not start is a week closer to the date it gates.
