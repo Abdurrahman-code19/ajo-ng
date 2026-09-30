@@ -13,7 +13,9 @@
     "build": "tsc --build",
     "typecheck": "tsc --noEmit -p packages/domain/tsconfig.json && tsc --noEmit -p packages/domain/tsconfig.test.json",
     "test": "tsc -p packages/domain/tsconfig.test.json && node --test packages/domain/build-test/test/",
-    "verify": "npm run typecheck && npm test"
+    "verify": "npm run typecheck && npm test",
+    "prepare": "bash scripts/install-hooks.sh",
+    "postinstall": "bash scripts/install-hooks.sh"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
