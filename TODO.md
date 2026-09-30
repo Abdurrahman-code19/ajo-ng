@@ -88,11 +88,14 @@ ledger later.
       `.github/workflows/ci.yml` running `npm run verify` plus the specification
       structure and staleness checks on every push to `main`
 - [x] Pre-commit hook blocking unverified pushes (`.githooks/pre-commit`)
-- [x] CI workflow on push and pull request (`.github/workflows/ci.yml`) — `verify` job and
-      `spec` job, with `concurrency` cancelling superseded runs
-- [x] CI green on the real remote — run 36763233139, both jobs `success`
+- [x] CI workflow on push and pull request (`.github/workflows/ci.yml`) — `verify`, `db` and
+      `spec` jobs, with `concurrency` cancelling superseded runs
+- [x] CI green on the real remote — run 36777830629, all three jobs `success`
 - [x] Reproducible specification build — `_normalise_zip()` pins zip entry timestamps, so
       an unchanged spec rebuilds byte-identically and the CI staleness gate is meaningful
+- [x] Database invariants in CI — the `db` job builds a database from `migrations/` alone
+      against a Postgres 16 service container and asserts 7 cases, because a rule enforced
+      only in the domain code is a rule the first direct SQL write will break
 
 **Note:** §23.3 and §22.2 have been reconciled with the code. See *Spec maintenance*.
 
