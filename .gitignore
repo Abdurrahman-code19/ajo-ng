@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build-test/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Python build artefacts from the DOCX generator
+__pycache__/
+*.py[cod]
+
+# Word lock files, created whenever the spec is open in Word
+~$*.docx
