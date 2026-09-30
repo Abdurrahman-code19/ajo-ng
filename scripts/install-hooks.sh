@@ -28,5 +28,18 @@ if [ ! -d "$HOOKS_DIR" ]; then
   exit 0
 fi
 
+# Git silently ignores a non-executable hook. The repository lives on a Windows
+# mount, where the executable bit does not reliably survive a checkout, so a
+# fresh clone got a 100644 pre-commit and committed with no verification at all
+# -- silently, and with only a hint nobody reads. Setting it here means the hook
+# works even when the recorded mode is wrong.
+for hook in "$HOOKS_DIR"/*; do
+  [ -f "$hook" ] || continue
+  if [ ! -x "$hook" ]; then
+    chmod +x "$hook"
+    echo "==> Made $(basename "$hook") executable"
+  fi
+done
+
 git config core.hooksPath "$HOOKS_DIR"
 echo "==> core.hooksPath set to .githooks (pre-commit will run npm run verify)"
