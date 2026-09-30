@@ -60,6 +60,44 @@ Verify the output rather than assuming it built:
 python3 -c "import sys,os; sys.path.insert(0,'docs/src'); from build_spec import check; raise SystemExit(check(os.path.abspath('AJO-ng-Complete-Product-Technical-Specification.docx')))"
 ```
 
+### The database
+
+`migrations/` is the source of truth for schema. It was adopted from a working
+database that had no version control, so the files are a `pg_dump` broken up by
+dependency order rather than hand-written DDL — which is exactly why the runner
+checksums them and refuses to proceed if one changes after being applied.
+
+```bash
+python3 scripts/migrate.py --db <name>            # apply pending migrations
+python3 scripts/migrate.py --db <name> --status   # what is applied and what is pending
+python3 scripts/migrate.py --db <name> --check    # fail if any applied file has drifted
+python3 scripts/test_migrations.py                # build a scratch DB and assert the invariants
+```
+
+`npm run test:db` is the same thing. CI runs it against a real Postgres service
+container, so the claim being tested is that the *database* refuses bad data, not
+that the TypeScript would have caught it.
+
+Things that will bite you:
+
+- **Connection.** The scripts read `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` and
+  fall back to `sudo -n -u postgres` only when those are unset. Set them in CI; do
+  not hardcode a connection.
+- **Never edit an applied migration.** The checksum in `app.schema_migrations`
+  will no longer match and every deployment will halt. Add a new file.
+- **To regenerate after a schema change**, run
+  `python3 scripts/adopt_schema.py --from-db <name>` and
+  `python3 scripts/seed_reference_data.py --from-db <name>`, then read the diff.
+  These overwrite files, so commit the schema change first.
+- **`ledger_postings.signed_kobo` is generated** from `side` and `amount_kobo`.
+  Inserting it is an error, which is the point: a posting cannot lie about which
+  way money moved.
+- **Rules that span two tables need a trigger, not a CHECK.** A CHECK sees one
+  row. The creator-is-a-member rule is the worked example: an
+  `AFTER INSERT` trigger on `ajo_positions` binds the organiser to a seat, and a
+  `DEFERRABLE INITIALLY DEFERRED` constraint trigger on `ajos` refuses to commit
+  an Ajo whose organiser is not a member.
+
 ## The money rules
 
 These are not negotiable, and they are encoded in `packages/domain/src/money.ts`

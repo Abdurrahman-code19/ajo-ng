@@ -40,6 +40,50 @@ jobs:
       - name: Confirm the working tree is clean
         run: git diff --exit-code
 
+  db:
+    name: Database invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # A real Postgres, because the claim being tested is that the database
+    # refuses bad data. A test double cannot make that claim, and the product's
+    # core rules live in constraints and triggers rather than in TypeScript.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ajo
+          POSTGRES_PASSWORD: ajo
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # How the migration scripts find Postgres. Without these they fall back to
+      # `sudo -u postgres`, which cannot work against a service container.
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: ajo
+      PGPASSWORD: ajo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Builds a database from the migration files alone and asserts the
+      # product rules against it: 5 to 20 members, the creator inside the
+      # member count, the draft-exit floor, seeded reference data, and a ledger
+      # that is balanced and append-only.
+      - name: Test schema invariants
+        run: python scripts/test_migrations.py
+
   spec:
     name: Specification structure
     runs-on: ubuntu-latest

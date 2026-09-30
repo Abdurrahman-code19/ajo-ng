@@ -154,19 +154,39 @@ The first phase where real money can move. Everything before this is reversible.
 
 The counts are the database's own, read back from `pg_class`, `pg_index` and `pg_constraint`.
 
-- [ ] **Size rule:** `position_count` between **5 and 20**, default 10, **creator included**
-- [ ] **Identity (7):** `users` `profiles` `admins` `sessions` `device_tokens` `roles` `role_assignments`
-- [ ] **Onboarding (5):** `invitations` `verification_checks` `verification_check_types` `document_types` `documents`
-- [ ] **Ajo core (6):** `ajos` `ajo_positions` `ajo_members` `rounds` `contribution_schedules` `contribution_frequencies`
-- [ ] **Money (5):** `contributions` `payments` `fees` `payouts` `payment_channels`
-- [ ] **Ledger (2):** `ledger_transactions` `ledger_postings` — postings sum to exactly zero
-- [ ] **Disputes (4):** `disputes` `dispute_messages` `dispute_evidence` `dispute_reasons`
-- [ ] **Risk and ops (5):** `risk_events` `reconciliation_runs` `support_tickets` `audit_logs` `platform_settings`
-- [ ] **Notifications (3):** `notifications` `notification_templates` `notification_preferences`
-- [ ] **Infrastructure (3):** `idempotency_keys` `webhook_events` `outbox_events`
+- [x] **Size rule:** `position_count` between **5 and 20**, default 10, **creator included**
+- [x] **Identity (7):** `users` `profiles` `admins` `sessions` `device_tokens` `roles` `role_assignments`
+- [x] **Onboarding (5):** `invitations` `verification_checks` `verification_check_types` `document_types` `documents`
+- [x] **Ajo core (6):** `ajos` `ajo_positions` `ajo_members` `rounds` `contribution_schedules` `contribution_frequencies`
+- [x] **Money (5):** `contributions` `payments` `fees` `payouts` `payment_channels`
+- [x] **Ledger (2):** `ledger_transactions` `ledger_postings` — postings sum to exactly zero
+- [x] **Disputes (4):** `disputes` `dispute_messages` `dispute_evidence` `dispute_reasons`
+- [x] **Risk and ops (5):** `risk_events` `reconciliation_runs` `support_tickets` `audit_logs` `platform_settings`
+- [x] **Notifications (3):** `notifications` `notification_templates` `notification_preferences`
+- [x] **Infrastructure (3):** `idempotency_keys` `webhook_events` `outbox_events`
+- [x] **Reference data:** 4 frequencies, 6 roles, 3 payment channels, 10 document types,
+      7 verification checks, 8 dispute reasons, 7 platform settings, 53 notification templates
 
-Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations only),
-`ajo_app` (DML, does **not** own tables so RLS holds), `ajo_analytics` (`SELECT` only).
+All 40 tables are in `migrations/`, adopted from the existing schema and verified: CI builds a
+database from the migration files alone and asserts the invariants against it (`npm run test:db`).
+
+Enforced by the database, not just by the domain:
+
+- `ajos_position_count_within_bounds` — 5 to 20, with `position_count` defaulting to 10
+- `app.materialize_organizer_membership()` — the creator is bound to position 1, so a
+  ten-member Ajo is one organiser and nine invitees
+- `app.assert_organizer_is_member()` — a deferred constraint trigger refusing to commit an
+  Ajo whose organiser is not a member of it
+- `app.assert_draft_exit()` — at least 5 positions, and no more than 20, before DRAFT is left
+
+- [ ] Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations only),
+      `ajo_app` (DML, does **not** own tables so RLS holds), `ajo_analytics` (`SELECT` only).
+      **Not yet in `migrations/`.** Roles are cluster-level, so `CREATE ROLE` cannot run inside
+      a migration transaction; they belong in a bootstrap script plus grants, not in a dump.
+- [ ] Reconcile the column count: the adopted schema has **621** columns, the spec says 576.
+      Tables, indexes, constraints, triggers and policies all match. Until this is resolved,
+      treat the migrations as the source of truth for shape and the spec as the source of
+      truth for intent, and log every divergence rather than assuming either is wrong.
 
 ### Identity — E2
 
@@ -504,9 +524,12 @@ Answers change the design. Chase them early.
 
 1. **Read the spec.** Skim §1 (PRD), §9 (schema), §11 (API) before building. 238k words
    generated from source has never been reviewed by a human.
-2. **Build the 40 tables** in dependency order, migrations only, `ajo_migrator` ownership.
-3. **Stand up local infrastructure** — PostgreSQL and Redis via containers, three roles, RLS
-   policies from §9.6.
+2. **Create the three roles** and their grants. Everything else in the schema is in place;
+   `ajo_app` deliberately does not own tables, so RLS holds, and that is only true once the
+   grants exist. Then apply the 12 migrations to the working `ajo` database and record the
+   pre-existing objects as the baseline rather than re-running them over the top.
+3. **Redis** is the last piece of local infrastructure still missing — needed for rate
+   limiting, idempotency locks and the outbox worker. PostgreSQL is done and CI-verified.
 4. **E2 identity**, then **E3 collection flow** with the mock provider.
 5. **Start the legal engagement.** It is the critical path and it does not run through
    engineering. Every week it does not start is a week closer to the date it gates.
