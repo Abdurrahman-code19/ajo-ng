@@ -203,10 +203,53 @@ export interface FeeSchedule {
   readonly monthlySubscriptionKobo: Kobo;
 }
 
-export function assertValidContributionAmount(amount: Kobo, memberCount: number): void {
-  if (memberCount < 2) {
-    throw new AjoRuleError(`an Ajo needs at least 2 members, received ${memberCount}`);
+/**
+ * Product rule: an Ajo has between 5 and 20 members, ten being the default.
+ *
+ * The floor is what makes a group a rotation rather than a transfer between
+ * two or three people. The ceiling bounds how many positions one organizer can
+ * actually invite, monitor and default-handle inside a single Ajo.
+ */
+export const MIN_AJO_MEMBERS = 5;
+export const MAX_AJO_MEMBERS = 20;
+export const DEFAULT_AJO_MEMBERS = 10;
+
+/**
+ * Validate an Ajo's member count.
+ *
+ * The creator occupies one of these positions rather than sitting outside
+ * them, so a ten-member Ajo is one organizer and nine invitees. A caller that
+ * passes an invitee count of 10 for a ten-member Ajo is asking for eleven
+ * members, and must be rejected here rather than producing an Ajo whose
+ * position count and roster disagree.
+ */
+export function assertValidMemberCount(memberCount: number): void {
+  if (!Number.isSafeInteger(memberCount)) {
+    throw new AjoRuleError(
+      `member count must be a whole number, received ${String(memberCount)}`,
+    );
   }
+  if (memberCount < MIN_AJO_MEMBERS) {
+    throw new AjoRuleError(
+      `an Ajo needs at least ${MIN_AJO_MEMBERS} members to rotate, received ${memberCount}`,
+    );
+  }
+  if (memberCount > MAX_AJO_MEMBERS) {
+    throw new AjoRuleError(
+      `an Ajo may have at most ${MAX_AJO_MEMBERS} members, received ${memberCount}`,
+    );
+  }
+}
+
+/**
+ * Validate a contribution amount for an Ajo of a given size.
+ *
+ * Member count is validated first, because an amount is meaningless without a
+ * valid group: NGN 10,000 across two people and NGN 10,000 across twenty are
+ * different products, and only one of them is an Ajo.
+ */
+export function assertValidContributionAmount(amount: Kobo, memberCount: number): void {
+  assertValidMemberCount(memberCount);
   try {
     if (amount <= 0) {
       throw new AjoRuleError('contribution amount must be positive');

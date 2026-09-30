@@ -863,13 +863,13 @@ BLOCKS = [
          "reviewed for pattern, because a freeze that always lands on the same organizers "
          "is an inequity."],
         ["EC-060",
-         "The organiser configures fewer than two positions.",
-         "The `OPEN_ENROLLMENT` guard fails and the Ajo stays in "
-         "`DRAFT`. The rule is a floor, not a preference: an Ajo of one "
-         "is a savings account, and pretending otherwise produces a "
-         "product that does not mean what it says.",
-         "*An Ajo needs at least two members. One member is a savings "
-         "account, not an Ajo.*",
+         "The organiser configures fewer than five positions, or more than twenty.",
+         "The `CHECK (position_count BETWEEN 5 AND 20)` on `ajos` rejects it and the Ajo "
+         "stays in `DRAFT`. The bounds are a floor and a ceiling, not preferences: below five "
+         "it is a savings account or a transfer between two people, and above twenty it is a "
+         "group no single organiser can realistically invite, monitor and default-handle.",
+         "*An Ajo needs between 5 and 20 members. Ten is the most common. You count as one of "
+         "them.*",
          "Raise the member count and re-submit.",
          "Rejected configuration with the count attempted. The guard is "
          "asserted in a test, so it cannot be lost in a refactor."],

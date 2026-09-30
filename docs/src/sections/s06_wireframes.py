@@ -1393,8 +1393,8 @@ BLOCKS = [
 |  Positions                   |
 |  [  10                 ]    |
 |  [ - ][ + ]                  |
-|  2 to 50. Ten is the most    |
-|  common.                     |
+|  5 to 20. Ten is the most    |
+|  common. You count as one.   |
 |                              |
 |  Currency    NGN             |
 |  Naira only at launch.       |

@@ -109,7 +109,7 @@ with `CANCELLED`, `CANCELLING`, `FROZEN` as branches.
 
 | From | Event | To | Guard |
 |---|---|---|---|
-| DRAFT | OPEN_ENROLLMENT | ENROLLMENT | ≥2 positions, contribution and frequency set |
+| DRAFT | OPEN_ENROLLMENT | ENROLLMENT | position_count between 5 and 20, contribution and frequency set |
 | ENROLLMENT | CLOSE_ENROLLMENT | ACTIVE | every position filled, **or** day 5 reached |
 | ENROLLMENT | (auto) | CANCELLED | day 5 reached with positions unfilled |
 | ACTIVE | START_ROUND | ROUND_IN_PROGRESS | round number = previous + 1 |
@@ -121,6 +121,20 @@ with `CANCELLED`, `CANCELLING`, `FROZEN` as branches.
 
 **Enrollment window: exactly 5 days.** If every position is not filled by day 5,
 the Ajo cancels and contributions are refunded in full.
+
+**Ajo size: 5 to 20 members, defaulting to 10.** Rounds equal members, so a
+ten-member Ajo runs ten rounds. The floor of five is what makes a group a
+rotation rather than a transfer between two or three people; the ceiling of
+twenty bounds how many positions one person can invite, monitor and
+default-handle in a single Ajo.
+
+**The creator is a member.** The organizer occupies one of the
+`position_count` positions — not one in addition to them. A ten-member Ajo is
+one organizer plus nine invitees, and the organizer has a turn, pays
+contributions, and receives a payout like everyone else. Organizer authority is
+a role layered on top of membership, never a substitute for it. This is
+enforced by the database, not by convention: the organizer's own membership is
+materialised with the positions, and `CHECK (position_count BETWEEN 5 AND 20)`.
 
 **Payout positions lock on activation.** No member may change position after
 activation. Reordering requires a formal replacement/transfer request.

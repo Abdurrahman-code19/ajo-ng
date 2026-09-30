@@ -367,8 +367,8 @@ BLOCKS = [
             "  status                    ajo_status NOT NULL DEFAULT 'draft',\n"
             "  contribution_amount_kobo  bigint    NOT NULL\n"
             "                              CHECK (contribution_amount_kobo > 0),\n"
-            "  position_count            smallint  NOT NULL DEFAULT 3\n"
-            "                              CHECK (position_count >= 2),\n"
+            "  position_count            smallint  NOT NULL DEFAULT 10\n"
+            "                              CHECK (position_count BETWEEN 5 AND 20),\n"
             "  total_rounds              smallint  NOT NULL DEFAULT 2\n"
             "                              CHECK (total_rounds >= 2),\n"
             "  enrollment_opens_at       timestamptz NOT NULL,\n"
@@ -390,10 +390,20 @@ BLOCKS = [
             "The five-day enrollment window is a CHECK, not application code. CANONICAL.md "
             "says the window is exactly five days, and a CHECK makes an organizer who asks "
             "for six days fail at the database rather than discover the rule from a support "
-            "ticket. `position_count >= 2` and `total_rounds >= 2` are both there because an "
-            "Ajo of one is a transfer, not a rotation. `total_rounds` defaults to 2 because "
-            "the first draft of this table defaulted to 1, which is rejected by its own "
-            "CHECK, and a table whose default fails its own constraint is a bug that only "
+            "ticket. `position_count BETWEEN 5 AND 20` is there for the same reason: the "
+            "product decision is that an Ajo has between five and twenty members, ten being "
+            "the default and by far the most common. The floor of five is what makes a group "
+            "a rotation rather than a transfer between two or three people, and the ceiling of "
+            "twenty bounds the operational surface — twenty positions to invite, monitor, and "
+            "default-handle in a single Ajo, which is a group a person can still hold in their "
+            "head. The default is 10 because that is the working example the rest of this "
+            "document uses throughout. **The creator is one of these members, not a member in "
+            "addition to them**, so a ten-member Ajo is one organizer and nine invitees; this "
+            "is enforced by the trigger that materialises the organizer's own membership, not "
+            "by convention. `total_rounds >= 2` is there because an Ajo of one is a transfer, "
+            "not a rotation, and because rounds equal members. `total_rounds` defaults to 2 "
+            "because the first draft of this table defaulted to 1, which is rejected by its "
+            "own CHECK, and a table whose default fails its own constraint is a bug that only "
             "appears in production."
         ),
     },
@@ -1295,7 +1305,7 @@ BLOCKS = [
         "t": "table",
         "head": ["Growth", "First thing to break", "Why"],
         "rows": [
-            ["Members per Ajo", "Nothing", "Capped at `position_count`, which is small by construction. An Ajo of 200 is not a product this schema has to survive."],
+            ["Members per Ajo", "Nothing", "Bounded by `CHECK (position_count BETWEEN 5 AND 20)`, default 10. Small by construction: at most twenty positions to invite, monitor and default-handle in one Ajo. An Ajo of 200 is not a product this schema has to survive."],
             ["Ajos per member", "Nothing until the hundreds", "One index range scan on `ajo_members (user_id)`."],
             ["Total contributions", "`notifications` and `audit_logs`", "Both grow with total activity rather than with active members, and both are append-heavy. This is the first table that needs partitioning."],
             ["Total payments", "`reconciliation_runs`", "Each run scans a date range of payments. Past a few million, it wants a materialised view or a summary table."],

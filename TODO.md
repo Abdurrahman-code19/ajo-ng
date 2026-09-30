@@ -148,6 +148,7 @@ The first phase where real money can move. Everything before this is reversible.
 
 The counts are the database's own, read back from `pg_class`, `pg_index` and `pg_constraint`.
 
+- [ ] **Size rule:** `position_count` between **5 and 20**, default 10, **creator included**
 - [ ] **Identity (7):** `users` `profiles` `admins` `sessions` `device_tokens` `roles` `role_assignments`
 - [ ] **Onboarding (5):** `invitations` `verification_checks` `verification_check_types` `document_types` `documents`
 - [ ] **Ajo core (6):** `ajos` `ajo_positions` `ajo_members` `rounds` `contribution_schedules` `contribution_frequencies`
@@ -210,7 +211,9 @@ Three roles, never one (`§9.2`): `ajo_migrator` (owns the schema, migrations on
 
 ### Ajo lifecycle — E5
 
-- [ ] `E5-01` Create an Ajo with all parameters and validation
+- [ ] `E5-01` Create an Ajo with all parameters and validation — 5 to 20 members, default 10,
+      `CHECK (position_count BETWEEN 5 AND 20)`; the creator occupies one of those positions
+- [x] Ajo size rule enforced in the domain — `assertValidMemberCount`, 8 tests, `CAN §3`
 - [ ] `E5-02` Ajo rules and acknowledgement record (`BR-004` complete-cycle commitment)
 - [ ] `E5-03` Invitation generation, single-use validation (`BR-006` invitation only)
 - [ ] `E5-04` Join and position assignment
