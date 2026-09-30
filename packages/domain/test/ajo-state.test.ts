@@ -27,10 +27,11 @@ describe('Ajo state machine', () => {
   });
 
   it('walks the happy path to completion', () => {
-    let ajo = createAjo(3);
+    // Five members is the smallest legal Ajo, and it runs five rounds.
+    let ajo = createAjo(5);
     ajo = transition(ajo, { type: 'OPEN_ENROLLMENT' });
     ajo = transition(ajo, { type: 'CLOSE_ENROLLMENT' });
-    for (let round = 1; round <= 3; round += 1) {
+    for (let round = 1; round <= 5; round += 1) {
       ajo = transition(ajo, { type: 'START_ROUND', roundNumber: round });
       ajo = transition(ajo, { type: 'COMPLETE_ROUND', roundNumber: round });
     }
@@ -77,9 +78,24 @@ describe('Ajo state machine', () => {
     assert.equal(ajo.status, 'ACTIVE');
   });
 
-  it('refuses to create an Ajo with fewer than 2 rounds', () => {
-    assert.throws(() => createAjo(1), AjoRuleError);
-    assert.throws(() => createAjo(0), AjoRuleError);
+  it('refuses to create an Ajo outside the 5 to 20 member range', () => {
+    // Below the floor: not a rotation.
+    for (const n of [0, 1, 2, 3, 4]) {
+      assert.throws(() => createAjo(n), AjoRuleError, `${n} should be rejected`);
+    }
+    // Above the ceiling: more than one organizer can manage.
+    for (const n of [21, 50, 100]) {
+      assert.throws(() => createAjo(n), AjoRuleError, `${n} should be rejected`);
+    }
+    // Both boundaries are legal.
+    assert.doesNotThrow(() => createAjo(MIN_AJO_MEMBERS));
+    assert.doesNotThrow(() => createAjo(MAX_AJO_MEMBERS));
+  });
+
+  it('treats the round count as the member count, so both are bounded together', () => {
+    const twenty = createAjo(MAX_AJO_MEMBERS);
+    assert.equal(twenty.totalRounds, MAX_AJO_MEMBERS);
+    assert.equal(createAjo(DEFAULT_AJO_MEMBERS).totalRounds, DEFAULT_AJO_MEMBERS);
   });
 });
 

@@ -84,8 +84,14 @@ ledger later.
 - [x] `E1-13` Payout recognition and settlement entries — `entries.payoutRecognized` / `payoutSettled`
 - [x] `E1-14` Continuous invariant check — `assertSolvent()`
 - [x] `E11-01` Repository, CI pipeline, and quality gates — private GitHub remote, pre-commit
-      hook blocking unverified pushes via versioned `core.hooksPath`
+      hook blocking unverified pushes via versioned `core.hooksPath`, and
+      `.github/workflows/ci.yml` running `npm run verify` plus the specification
+      structure and staleness checks on every push to `main`
 - [x] Pre-commit hook blocking unverified pushes (`.githooks/pre-commit`)
+- [x] CI workflow on push and pull request (`.github/workflows/ci.yml`) — `verify` job and
+      `spec` job, with `concurrency` cancelling superseded runs
+- [x] Reproducible specification build — `_normalise_zip()` pins zip entry timestamps, so
+      an unchanged spec rebuilds byte-identically and the CI staleness gate is meaningful
 
 **Note:** the specification's §23.3 still shows E1-11 → E1-14 as *To do*. They are built.
 That table needs updating — see *Spec maintenance* at the bottom.

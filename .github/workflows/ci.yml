@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch supersedes an in-flight run, so the latest
+# commit is always the one verified.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The same gate the pre-commit hook runs, so a contributor who bypassed
+      # hooks locally cannot land a commit that only passes on their machine.
+      - name: Verify
+        run: npm run verify
+
+      - name: Confirm the working tree is clean
+        run: git diff --exit-code
+
+  spec:
+    name: Specification structure
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install specification dependencies
+        run: pip install python-docx
+
+      - name: Build the specification
+        run: python docs/src/build_spec.py
+
+      # Verifies TOC, PAGE/NUMPAGES, header, footer tagline and updateFields.
+      # A rebuild that silently drops a field would otherwise ship unnoticed.
+      - name: Verify specification structure
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'docs/src')
+          from build_spec import check
+          raise SystemExit(check('AJO-ng-Complete-Product-Technical-Specification.docx'))
+          "
+
+      - name: Confirm the specification is current
+        run: |
+          if ! git diff --quiet -- \
+            AJO-ng-Complete-Product-Technical-Specification.docx; then
+            echo "The committed specification is stale. Rebuild and commit it:"
+            echo "  python docs/src/build_spec.py"
+            exit 1
+          fi

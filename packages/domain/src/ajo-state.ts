@@ -151,10 +151,15 @@ export function transition(
   }
 }
 
+/**
+ * Create an Ajo in `DRAFT`.
+ *
+ * `totalRounds` is the member count: rounds equal members, so a ten-member
+ * Ajo runs ten rounds. It is validated as a member count rather than as an
+ * arbitrary round count, which is what keeps the two from drifting apart.
+ */
 export function createAjo(totalRounds: number, now: Date = new Date()): AjoState {
-  if (!Number.isSafeInteger(totalRounds) || totalRounds < 2) {
-    throw new AjoRuleError(`an Ajo needs at least 2 rounds, received ${totalRounds}`);
-  }
+  assertValidMemberCount(totalRounds);
   return { status: 'DRAFT', roundNumber: 0, totalRounds, since: now };
 }
 

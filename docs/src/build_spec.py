@@ -92,6 +92,7 @@ def build(out_path: str) -> dict:
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     builder.save(out_path)
+    _normalise_zip(out_path)
 
     return {
         "path": out_path,
@@ -99,6 +100,41 @@ def build(out_path: str) -> dict:
         "errors": errors,
         "blocks": len(builder.doc.element.body),
     }
+
+
+# A fixed DOS timestamp for every zip entry. The zip format cannot store a year
+# before 1980, and 1980-01-01 is the earliest value it can represent, so it is
+# both the canonical "no real time" constant and a valid one.
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _normalise_zip(path: str) -> None:
+    """Rewrite a DOCX with deterministic zip metadata.
+
+    python-docx stamps each zip entry with the wall-clock time of the build, so
+    two builds of identical content produce different bytes. That makes it
+    impossible to tell "the committed specification is stale" apart from "somebody
+    rebuilt it", which is exactly the distinction CI needs to make. Entries are
+    also written in a stable order and with a fixed compression level, so an
+    unchanged spec always rebuilds to an identical file.
+    """
+    with zipfile.ZipFile(path) as src:
+        entries = [
+            (info.filename, info.compress_type, src.read(info.filename))
+            for info in sorted(src.infolist(), key=lambda i: i.filename)
+        ]
+
+    tmp = f"{path}.tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+        for name, compress_type, payload in entries:
+            info = zipfile.ZipInfo(filename=name, date_time=_ZIP_EPOCH)
+            info.compress_type = compress_type
+            # The external attributes are what mark an entry as a regular file;
+            # without them a reader may treat the part as a directory.
+            info.external_attr = 0o600 << 16
+            dst.writestr(info, payload)
+
+    os.replace(tmp, path)
 
 
 def check(path: str) -> int:
