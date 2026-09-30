@@ -565,10 +565,12 @@ Answers change the design. Chase them early.
 
 1. **Read the spec.** Skim §1 (PRD), §9 (schema), §11 (API) before building. 238k words
    generated from source has never been reviewed by a human.
-2. **Create the three roles** and their grants. Everything else is done: the working `ajo`
-   database is now on the same source of truth as `migrations/` and its ledger is intact.
-   `ajo_app` deliberately does not own tables, so RLS holds, and that is only true once the
-   grants exist.
+2. ~~**Create the three roles** and their grants.~~ Done in `eb35903`: `scripts/bootstrap_roles.sql`
+   creates them, `096_rls_write_policies` restores the two self-owned write paths the split
+   removed, and seven cases assert the owner is neither superuser nor `BYPASSRLS` while
+   `ajo_app` sees 1 of 3 users where the owner sees 3. **The five money, ledger and risk tables
+   are still closed to writes by design** — see the item above. Nothing else in this list
+   depends on them being open.
 3. **Redis** is the last piece of local infrastructure still missing — needed for rate
    limiting, idempotency locks and the outbox worker. PostgreSQL is done and CI-verified.
 4. **E2 identity**, then **E3 collection flow** with the mock provider.
