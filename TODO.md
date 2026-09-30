@@ -173,9 +173,32 @@ The counts are the database's own, read back from `pg_class`, `pg_index` and `pg
 All 40 tables are in `migrations/`, adopted from the existing schema and verified: CI builds a
 database from the migration files alone and asserts the invariants against it (`npm run test:db`).
 
+The working `ajo` database has been reconciled with that source of truth, rather than being
+recreated, so its append-only ledger and audit history were never rewritten. `000`-`070` were
+recorded as **baselined** after `scripts/compare_schemas.py` proved the live database already
+matched them object for object; `080` and `090` were then applied for real. A clean build from
+`migrations/` and the live `ajo` now agree on all 1641 catalogued objects across 10 categories,
+and all 13 ledger postings and 42 audit rows are intact.
+
+The comparison is deliberately strict, and being strict found something. An earlier version of
+`compare_schemas.py` skipped the whole `public` schema when fingerprinting functions, on the
+assumption that only extension internals lived there. That assumption was wrong: it hid
+`public._t1_decode(uuid)`, a pg_dump helper that had leaked into the adopted database's `public`
+schema and had no dependents. The filter now excludes extension members by extension membership
+rather than by schema name, compares function bodies rather than just signatures, and also
+compares trigger enabled state, policy roles and constraint validation. `095_pgdump_artifacts`
+drops the stray helper, so the two databases agree with no ignore list at all. Backup of the pre-change state:
+`/tmp/opencode/preserve/ajo_before_baseline.dump`.
+
 Enforced by the database, not just by the domain:
 
-- `ajos_position_count_within_bounds` — 5 to 20, with `position_count` defaulting to 10
+- `ajos_position_count_within_bounds` — 5 to 20, with `position_count` defaulting to 10.
+  Added `NOT VALID` on purpose: the adopted database holds one three-member Ajo ("Test Ajo")
+  whose append-only ledger cannot be removed. `NOT VALID` enforces the rule on every INSERT
+  and UPDATE while grandfathering that one row, rather than inventing two members and two
+  rounds of history that never happened. The legacy Ajo is consequently frozen, which is the
+  honest outcome — an Ajo of three can be retired but not made valid. Retiring it and running
+  `VALIDATE CONSTRAINT` is the follow-up.
 - `app.materialize_organizer_membership()` — the creator is bound to position 1, so a
   ten-member Ajo is one organiser and nine invitees
 - `app.assert_organizer_is_member()` — a deferred constraint trigger refusing to commit an
@@ -527,10 +550,10 @@ Answers change the design. Chase them early.
 
 1. **Read the spec.** Skim §1 (PRD), §9 (schema), §11 (API) before building. 238k words
    generated from source has never been reviewed by a human.
-2. **Create the three roles** and their grants. Everything else in the schema is in place;
+2. **Create the three roles** and their grants. Everything else is done: the working `ajo`
+   database is now on the same source of truth as `migrations/` and its ledger is intact.
    `ajo_app` deliberately does not own tables, so RLS holds, and that is only true once the
-   grants exist. Then apply the 12 migrations to the working `ajo` database and record the
-   pre-existing objects as the baseline rather than re-running them over the top.
+   grants exist.
 3. **Redis** is the last piece of local infrastructure still missing — needed for rate
    limiting, idempotency locks and the outbox worker. PostgreSQL is done and CI-verified.
 4. **E2 identity**, then **E3 collection flow** with the mock provider.

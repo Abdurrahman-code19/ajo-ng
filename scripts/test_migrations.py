@@ -185,6 +185,42 @@ SELECT position_count FROM ajos WHERE name = 'defaulted';
     return "omitting position_count yields 10, so the rule cannot be bypassed"
 
 
+@case("a pre-existing Ajo below 5 is grandfathered, not rejected")
+def _grandfathered(db: str) -> str:
+    """
+    NOT VALID is deliberate, so it is pinned here.
+
+    The database the schema was adopted from contains one three-member Ajo whose
+    append-only ledger cannot be removed. Adding the constraint NOT VALID keeps
+    that row while enforcing the rule on everything after it. If someone
+    "tidies" this into a plain ADD CONSTRAINT, the migration starts failing on
+    any database that has that history, and this case is what notices.
+    """
+    out = psql(
+        db,
+        "SELECT convalidated FROM pg_constraint "
+        "WHERE conname = 'ajos_position_count_within_bounds';",
+    )
+    if "f" not in out:
+        raise Failure(
+            "expected the constraint to be NOT VALID so a pre-existing "
+            f"three-member Ajo can be grandfathered, got convalidated: {out.strip()[:120]}"
+        )
+
+    # NOT VALID must not weaken the rule for anything written from now on.
+    for bad in (3, 4, 21):
+        must_fail(
+            db,
+            f"post-migration position_count={bad}",
+            transaction(_organizer(db, f"grand-{bad}", positions=bad)),
+            expect="ajos_position_count_within_bounds",
+        )
+    return (
+        "the constraint is NOT VALID, so a legacy three-member Ajo survives, "
+        "while every new Ajo is still held to 5 to 20"
+    )
+
+
 @case("the creator occupies one of the positions")
 def _creator(db: str) -> str:
     out = must_succeed(

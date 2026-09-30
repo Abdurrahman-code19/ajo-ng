@@ -8,8 +8,6 @@
 -- `ON CONFLICT DO NOTHING` so the migration is safe to re-run against a
 -- database that was seeded by hand during development.
 
-BEGIN;
-
 -- contribution_frequencies: 4 row(s)
 -- How often contributions fall due. Rounds always equal members, so a frequency sets the gap between rounds rather than the number of them.
 INSERT INTO public.contribution_frequencies (id, code, label, interval_count, interval_unit, is_active, sort_order)
@@ -97,4 +95,3 @@ INSERT INTO public.platform_settings (key, value, value_type, description, is_se
   ('sms_reserved_for', '["money_critical", "security_critical"]', 'json', 'CANONICAL.md section 8: SMS is reserved for money-critical and security events.', 'f', NULL)
 ON CONFLICT DO NOTHING;
 
-COMMIT;

@@ -1,0 +1,19 @@
+-- Drops a pg_dump helper that leaked into the application schema.
+--
+-- `public._t1_decode(uuid)` decodes a uuidv7 back into a timestamp. pg_dump
+-- creates one of these on itself while restoring such a column, and it is
+-- supposed to live in `pg_temp` and vanish with the session. In the database
+-- the schema was adopted from, it is sitting in `public` instead: the dump that
+-- seeded that database did not schema-qualify it, so it was created where the
+-- restoring session's search_path pointed.
+--
+-- It is not application code. Nothing references it -- no function, view,
+-- trigger or rule depends on it -- and it is not created by any other migration
+-- here, so a database built from these files does not have it. Left in place it
+-- is both a namespace collision waiting for the next dump and a difference that
+-- `scripts/compare_schemas.py` is right to report, because a public function
+-- that the migrations do not create is exactly what that script exists to catch.
+--
+-- IF EXISTS because a clean build never had it. A real database that never
+-- received the artifact should not fail to migrate over the absence.
+DROP FUNCTION IF EXISTS public._t1_decode(uuid);

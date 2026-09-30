@@ -16,6 +16,27 @@
 -- a ten-member Ajo is one organiser and nine invitees. That half of the rule is
 -- enforced by app.materialize_organizer_membership() and is not expressible as
 -- a CHECK, because it spans `ajos` and `ajo_members` in two tables.
+--
+-- The constraint is added NOT VALID, deliberately.
+--
+-- The database this was adopted from contains one Ajo — "Test Ajo", three
+-- members, created before the 5-to-20 rule existed — whose ledger history is
+-- append-only and therefore cannot be removed without reversing entries that
+-- would themselves be a fiction. Validating the constraint against that row
+-- would fail the migration, and the alternatives were both worse: raising its
+-- position_count to 5 would claim two members and two rounds of history that
+-- never happened, and dropping it would destroy 13 postings.
+--
+-- NOT VALID is the mechanism Postgres provides for exactly this. The rule is
+-- enforced in full against every INSERT and UPDATE from here on; only the
+-- pre-existing row is grandfathered. The practical consequence is that the
+-- legacy Ajo is now frozen, because any UPDATE to it re-checks the constraint
+-- and is rejected. That is the correct outcome: an Ajo of three cannot be made
+-- valid, only retired.
+--
+-- To retire it, cancel it and post reversing entries, then run
+--   ALTER TABLE public.ajos VALIDATE CONSTRAINT ajos_position_count_within_bounds;
+-- once no row predating this migration remains.
 ALTER TABLE public.ajos
   DROP CONSTRAINT IF EXISTS ajos_position_count_check;
 
@@ -24,7 +45,7 @@ ALTER TABLE public.ajos
 
 ALTER TABLE public.ajos
   ADD CONSTRAINT ajos_position_count_within_bounds
-  CHECK (position_count BETWEEN 5 AND 20);
+  CHECK (position_count BETWEEN 5 AND 20) NOT VALID;
 
 COMMENT ON COLUMN public.ajos.position_count IS
   'Members in the Ajo, between 5 and 20, defaulting to 10. The creator occupies '

@@ -71,7 +71,9 @@ checksums them and refuses to proceed if one changes after being applied.
 python3 scripts/migrate.py --db <name>            # apply pending migrations
 python3 scripts/migrate.py --db <name> --status   # what is applied and what is pending
 python3 scripts/migrate.py --db <name> --check    # fail if any applied file has drifted
+python3 scripts/migrate.py --db <name> --baseline <prefix>   # adopt an existing schema
 python3 scripts/test_migrations.py                # build a scratch DB and assert the invariants
+python3 scripts/compare_schemas.py --a <x> --b <y>          # diff two databases
 ```
 
 `npm run test:db` is the same thing. CI runs it against a real Postgres service
@@ -83,6 +85,24 @@ Things that will bite you:
 - **Connection.** The scripts read `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` and
   fall back to `sudo -n -u postgres` only when those are unset. Set them in CI; do
   not hardcode a connection.
+- **Each migration is one transaction.** The runner hands the file to `psql
+  --single-transaction`, so a failure rolls the whole file back and leaves the
+  database as it was. This is why the files contain no `BEGIN`/`COMMIT` and why
+  `seed_reference_data.py` does not emit them. A file that genuinely cannot run
+  in a transaction opts out with a `-- no-transaction` marker, and says so in the
+  runner output.
+- **Baselining is for databases that have the schema but no history.**
+  `--baseline 080` builds everything before `080` into a throwaway database,
+  fingerprints both with `compare_schemas.py`, and only records the rows if they
+  match object for object. It refuses on any difference, and it refuses again if
+  the target already records some of those migrations, because a partial history
+  means something the runner cannot guess. Recorded rows carry
+  `baselined = true` and `duration_ms = 0`, so the ledger never claims a
+  migration ran when it was only verified.
+- **The prefix boundary is a sort order, not a string match.** `--baseline 080`
+  means *everything sorting before `080`*, leaving `080` and `090` pending. A
+  "does not start with the prefix" filter gets this wrong, because it sweeps in
+  everything that is not `080` — including `090`, which sorts after it.
 - **Never edit an applied migration.** The checksum in `app.schema_migrations`
   will no longer match and every deployment will halt. Add a new file.
 - **To regenerate after a schema change**, run

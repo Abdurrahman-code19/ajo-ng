@@ -159,8 +159,9 @@ def main() -> int:
         "-- `ON CONFLICT DO NOTHING` so the migration is safe to re-run against a",
         "-- database that was seeded by hand during development.",
         "",
-        "BEGIN;",
-        "",
+        # No BEGIN or COMMIT. The runner wraps each file in a transaction, and a
+        # COMMIT in here would end that transaction early and leave the rest of
+        # the file to run outside it.
     ]
 
     total = 0
@@ -190,7 +191,6 @@ def main() -> int:
         total += len(rows)
         print(f"  {table}: {len(rows)} rows")
 
-    body.append("COMMIT;")
     body.append("")
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)

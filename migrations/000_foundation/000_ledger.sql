@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS app.schema_migrations (
   version     text        PRIMARY KEY,
   checksum    text        NOT NULL,
   applied_at  timestamptz NOT NULL DEFAULT now(),
-  duration_ms integer     NOT NULL
+  duration_ms integer     NOT NULL,
+  baselined   boolean     NOT NULL DEFAULT false
 );
 
 COMMENT ON TABLE app.schema_migrations IS
@@ -29,3 +30,8 @@ COMMENT ON COLUMN app.schema_migrations.checksum IS
   'Full sha256 of the file contents, hex encoded.';
 COMMENT ON COLUMN app.schema_migrations.duration_ms IS
   'How long the migration took, so a regression is visible in the log.';
+COMMENT ON COLUMN app.schema_migrations.baselined IS
+  'True when the row was recorded by --baseline rather than by running the file. '
+  'A baselined row asserts that the schema was verified to already match the '
+  'migration, not that this runner executed it. Both are legitimate states and '
+  'the difference matters when asking what a given database has actually run.';
