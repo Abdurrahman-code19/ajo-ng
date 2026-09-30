@@ -90,11 +90,11 @@ ledger later.
 - [x] Pre-commit hook blocking unverified pushes (`.githooks/pre-commit`)
 - [x] CI workflow on push and pull request (`.github/workflows/ci.yml`) — `verify` job and
       `spec` job, with `concurrency` cancelling superseded runs
+- [x] CI green on the real remote — run 36763233139, both jobs `success`
 - [x] Reproducible specification build — `_normalise_zip()` pins zip entry timestamps, so
       an unchanged spec rebuilds byte-identically and the CI staleness gate is meaningful
 
-**Note:** the specification's §23.3 still shows E1-11 → E1-14 as *To do*. They are built.
-That table needs updating — see *Spec maintenance* at the bottom.
+**Note:** §23.3 and §22.2 have been reconciled with the code. See *Spec maintenance*.
 
 ---
 
@@ -471,11 +471,14 @@ Every phase inherits these. They are not a phase.
 
 The specification is not self-updating, and drift is how a spec stops being trustworthy.
 
-- [ ] Update `§23.3` E1-11 → E1-14 to **Done** — built, spec still says *To do*
-- [ ] Update `§22.2` test count from 44 to **61**
-- [ ] `§22.2` "Technical specification document: In progress" → **Complete**
-- [ ] Add a status column to the legal checklist that reflects reality
-- [ ] Rebuild the DOCX after any spec edit, and commit it
+- [x] Update `§23.3` E1-11 → E1-14 to **Done** — verified, all four read `Done`
+- [x] Update `§22.2` test count — 44 → 61 → **70**, kept in step with `npm test`
+- [x] `§22.2` "Technical specification document: In progress" → **Complete**
+- [x] Add a status column to the legal checklist that reflects reality — `§24` carries a
+      `Status` column, and all fifteen items correctly read **Outstanding**
+- [x] Rebuild the DOCX after any spec edit, and commit it — now enforced by CI, which fails
+      when the committed DOCX differs from a fresh rebuild
+- [x] Reconcile `§22.2` with the member-count rule so the roadmap and the DDL agree
 
 ---
 

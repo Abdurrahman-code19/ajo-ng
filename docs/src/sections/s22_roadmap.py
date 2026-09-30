@@ -31,9 +31,9 @@ BLOCKS = [
         ["Canonical business and financial specification", "Complete", "Single source of truth for terms, rules, states, and entities"],
         ["Money primitive", "Complete", "Branded integer-kobo type; exact arithmetic; no floating point"],
         ["Append-only double-entry ledger", "Complete", "Balanced entries, reversal-only correction, computed balances"],
-        ["Ajo lifecycle state machine", "Complete", "All transitions, the 5-day enrollment window, position lock"],
+        ["Ajo lifecycle state machine", "Complete", "All transitions, the 5-day enrollment window, position lock, and the 5-to-20 member bound"],
         ["FinancialProvider abstraction", "Complete", "Interface plus a production-guarded mock"],
-        ["Adversarial domain tests", "Complete", "61 tests covering the money, ledger, fee arithmetic, and state machine"],
+        ["Adversarial domain tests", "Complete", "70 tests covering the money, ledger, fee arithmetic, member-count bounds, and state machine"],
         ["Technical specification document", "Complete", "26 sections; the generated DOCX is committed alongside this table"],
     ]},
 
