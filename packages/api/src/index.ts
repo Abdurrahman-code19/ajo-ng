@@ -8,6 +8,7 @@
  */
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
+import { createAccessTokenPair } from './access-token.js';
 import { createPool } from './db.js';
 import { createVerificationSender } from './mailer.js';
 import { createFixedWindowLimiter } from './rate-limit.js';
@@ -21,6 +22,11 @@ async function main(): Promise<void> {
     windowMs: config.registration.windowMs,
   });
 
+  // Built before the app, and awaited, so a malformed key fails the boot instead
+  // of the first login. `jose`'s imports are async, which is the reason this is
+  // a promise and not a constructor call.
+  const { signer, verifier } = await createAccessTokenPair(config.signingKey);
+
   const app = await buildApp({
     config,
     pool,
@@ -29,6 +35,8 @@ async function main(): Promise<void> {
     // is not configured, so a deploy cannot log verification tokens by accident.
     // See `mailer.ts`.
     mailer: createVerificationSender(config.environment, devLogger, config.mail),
+    signer,
+    verifier,
   });
 
   // Registering the shutdown hooks before `listen` means a process that is

@@ -40,9 +40,47 @@ ownership to `ajo_migrator` and grants execution, which is what makes a
 | `PGUSER` `PGPASSWORD` | **required** | The `ajo_api` login, not the migration role. No default: a guessed credential is a guess |
 | `REDIS_URL` | **required** | The rate limiter fails closed if Redis is unreachable |
 | `MAIL_RELAY_URL` `MAIL_RELAY_TOKEN` `MAIL_FROM` | in production | All three or none; half-configured is refused at boot |
+| `ACCESS_TOKEN_PRIVATE_KEY` `ACCESS_TOKEN_PUBLIC_KEY` | in production | Ed25519 pair, both or neither. Without them the API signs with a key generated at boot, which every restart and every extra instance invalidates differently |
 | `PORT` `HOST` `LOG_LEVEL` | optional | Default `3000`, `0.0.0.0`, `info` |
 | `REGISTRATION_RATE_LIMIT` `REGISTRATION_WINDOW_MS` | optional | Default 5 per hour per address |
+| `LOGIN_RATE_LIMIT` `LOGIN_WINDOW_MS` | optional | Default 10 per 15 minutes, counted per address **and** per account |
+| `MAX_SESSIONS` | optional | Default 5, per 12.4.3 |
 | `PGPOOL_MAX` | optional | Default 10 |
+
+## The access-token key
+
+Access tokens are EdDSA (Ed25519) JWTs, 15 minutes long, as 12.4.1 requires.
+The key is the one piece of deployment state that has to be *shared* rather than
+per-instance, and the failure when it is not is the reason this section exists:
+
+```
+openssl genpkey -algorithm ed25519 -out private.pem
+openssl pkey -in private.pem -pubout -out public.pem
+```
+
+Put the contents in `ACCESS_TOKEN_PRIVATE_KEY` and `ACCESS_TOKEN_PUBLIC_KEY` in
+your secret store. The private half is PKCS#8 and the public half SPKI; the API
+rejects anything else at boot rather than at the first login.
+
+With both unset and `NODE_ENV` not `production`, the API generates a pair at boot
+and logs that it did. That is fine for one process on a laptop and wrong for a
+deployment, because each instance generates a *different* key: a member's token
+is accepted by the instance that minted it and rejected by every other, so a load
+balancer produces logouts that no single log line explains. Production therefore
+refuses to start without a configured key.
+
+Two consequences worth planning for:
+
+- **Key rotation is a logout.** A new key means existing access tokens fail
+  verification within 15 minutes, and clients recover by refreshing. Because the
+  refresh token is a separate database-backed secret, rotation does not sign
+  anybody out. Running two keys side by side is not supported — the verifier
+  holds exactly one.
+- **The private key is in the process.** It signs every access token the platform
+  issues, so treat the API deployment as holding it: anyone who can reach
+  `ACCESS_TOKEN_PRIVATE_KEY` can mint a token for any `users.id`. The database
+  enforces the same point from the other side — a valid token is necessary but not
+  sufficient, and every query still runs under the member's own RLS policies.
 
 Copy `.env.example` and fill it in. Keep the real `.env` out of version control;
 `.dockerignore` excludes it so it cannot be baked into a layer, where it would

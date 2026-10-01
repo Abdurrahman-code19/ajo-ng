@@ -231,12 +231,32 @@ Enforced by the database, not just by the domain:
 
 ### Identity — E2
 
-- [ ] `E2-01` Registration with email verification and consent capture
+- [x] `E2-01` Registration with email verification and consent capture
 - [ ] `E2-02` BVN verification and liveness flow — the BVN is never stored in full
-- [ ] `E2-03` Phone normalisation to E.164 and uniqueness (`BR-030` one identity, one account)
+- [x] `E2-03` Phone normalisation to E.164 and uniqueness (`BR-030` one identity, one account)
 - [ ] `E2-04` Account states: pending, active, frozen, suspended, dormant, closed
 - [ ] `E2-05` Profile management and self-service data export
-- [ ] `E2-06` Login, refresh rotation, reuse detection
+- [x] `E2-06` Login, refresh rotation, reuse detection
+
+  Routes `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`,
+  `GET /auth/sessions`, `DELETE /auth/sessions/:id`. EdDSA access tokens at 15
+  minutes; the refresh token is opaque, hashed, and rotated on every use, with
+  the spent-token ledger that makes a replay distinguishable from a forgery.
+
+  Three things in here are unfinished, deliberately and with the reason:
+
+  - `security.login_new_device` and `security.suspicious_token_reuse` are
+    recorded in `audit_logs` but not *delivered*. There is no notification
+    template or dispatcher on the platform yet, and writing one before 12.4.2's
+    threat model settles would be guessing at the contract.
+  - Refresh replacement reuses the 30-day window, so a session that is refreshed
+    every 29 days can live indefinitely. The absolute limit (90 days) is enforced
+    against `sessions.created_at` and is the real bound; if 12.4.3 is read as
+    requiring the refresh window to be non-sliding as well, that is a change to
+    `app.claim_refresh_token` and not to the API.
+  - `12.4.3`'s five-session cap evicts the oldest; the spec does not say whether a
+    sixth sign-in should warn first. It does not, and asking a member to confirm a
+    sign-in is the kind of friction that teaches people to click through prompts.
 - [ ] `E2-07` MFA — SMS OTP for sensitive actions, TOTP for staff
 - [ ] `E2-08` Step-up authentication framework
 - [ ] `E2-09` Device management and revocation

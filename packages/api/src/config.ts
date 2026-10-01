@@ -9,6 +9,7 @@
  * NOSUPERUSER and holds only `ajo_app`, so a wrong guess is a connection refusal
  * and not a privilege escalation -- but it is still better to say so at boot.
  */
+import { generateEphemeralSigningKey } from './access-token.js';
 import type { MailRelayConfig } from './mailer.js';
 
 export interface Config {
@@ -46,6 +47,36 @@ export interface Config {
     /** Attempts allowed per window, per client address. */
     readonly rateLimit: number;
     readonly windowMs: number;
+  };
+  readonly login: {
+    /**
+     * Attempts allowed per window, per client address and per account.
+     *
+     * Two budgets rather than one, because they defend against different things.
+     * The per-address limit bounds one host spraying many addresses, which is a
+     * credential-stuffing list. The per-account limit bounds a distributed spray
+     * at one member, which no single-address limit can see -- 12.8 calls this out
+     * as "failed logins from multiple IPs/ASNs".
+     */
+    readonly rateLimit: number;
+    readonly windowMs: number;
+    /** 12.4.3: five sessions, oldest evicted. */
+    readonly maxSessions: number;
+  };
+  /**
+   * The access-token signing key, and how it was obtained.
+   *
+   * `source` is not decoration. A key generated at boot is fine for development
+   * and catastrophic for production, where it means every restart invalidates
+   * every session and -- worse -- every instance generates a *different* one, so
+   * a member's token is only accepted by the instance that minted it and a load
+   * balancer silently logs people out. The composition root branches on this
+   * field rather than on `environment`, so there is one place that knows.
+   */
+  readonly signingKey: {
+    readonly privateKeyPem: string;
+    readonly publicKeyPem: string;
+    readonly source: 'configured' | 'ephemeral';
   };
 }
 
@@ -104,12 +135,74 @@ function loadMail(env: NodeJS.ProcessEnv): MailRelayConfig | undefined {
   };
 }
 
+/**
+ * The signing key, and the rule about which one is allowed.
+ *
+ * Three states, all of them decided here so the rest of the process never asks
+ * whether the key is trustworthy:
+ *
+ *   * both set -- `configured`, the only state production accepts;
+ *   * neither set -- `ephemeral`, refused outright when `NODE_ENV=production`;
+ *   * one set -- a mistake, caught here.
+ *
+ * The half-configured case is the same argument as the mailer. An operator who
+ * set the private key and forgot the public one would otherwise boot, and the
+ * failure would surface as "the verifier rejects every token this process just
+ * signed", which is a confusing way to learn about a missing variable.
+ *
+ * The production refusal is the important one, and it is a refusal rather than a
+ * warning because an ephemeral key in a multi-instance deployment produces
+ * intermittent logouts that no log line explains. See
+ * `generateEphemeralSigningKey` for the mechanism; the gate belongs here so that
+ * "is this production" is decided in exactly one place.
+ */
+const SIGNING_VARIABLES = ['ACCESS_TOKEN_PRIVATE_KEY', 'ACCESS_TOKEN_PUBLIC_KEY'] as const;
+
+function loadSigningKey(
+  env: NodeJS.ProcessEnv,
+  environment: string,
+): Config['signingKey'] {
+  const set = SIGNING_VARIABLES.filter((name) => {
+    const value = env[name];
+    return value !== undefined && value !== '';
+  });
+
+  if (set.length === 1) {
+    const missing = SIGNING_VARIABLES.filter((name) => !set.includes(name));
+    throw new Error(
+      `the access-token key is half configured: ${missing.join(' and ')} not set. ` +
+        'Set both ACCESS_TOKEN_PRIVATE_KEY and ACCESS_TOKEN_PUBLIC_KEY, or neither.',
+    );
+  }
+
+  if (set.length === 2) {
+    return {
+      privateKeyPem: env['ACCESS_TOKEN_PRIVATE_KEY'] as string,
+      publicKeyPem: env['ACCESS_TOKEN_PUBLIC_KEY'] as string,
+      source: 'configured',
+    };
+  }
+
+  if (environment === 'production') {
+    throw new Error(
+      'ACCESS_TOKEN_PRIVATE_KEY and ACCESS_TOKEN_PUBLIC_KEY are not set, and ' +
+        'NODE_ENV is production. The API refuses to generate its own key here: ' +
+        'every instance would sign with a different one and members would be ' +
+        'logged out at random. Generate an Ed25519 pair and set both variables.',
+    );
+  }
+
+  return { ...generateEphemeralSigningKey(), source: 'ephemeral' };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const environment = env['NODE_ENV'] ?? 'development';
+
   return {
     host: env['HOST'] ?? '0.0.0.0',
     port: env['PORT'] === undefined ? 3000 : integer(env['PORT'], 'PORT'),
     logLevel: env['LOG_LEVEL'] ?? 'info',
-    environment: env['NODE_ENV'] ?? 'development',
+    environment,
     database: {
       host: env['PGHOST'] ?? '127.0.0.1',
       port: env['PGPORT'] === undefined ? 5432 : integer(env['PGPORT'], 'PGPORT'),
@@ -132,5 +225,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
           ? 60 * 60 * 1000
           : integer(env['REGISTRATION_WINDOW_MS'], 'REGISTRATION_WINDOW_MS'),
     },
+    login: {
+      rateLimit:
+        env['LOGIN_RATE_LIMIT'] === undefined ? 10 : integer(env['LOGIN_RATE_LIMIT'], 'LOGIN_RATE_LIMIT'),
+      windowMs:
+        env['LOGIN_WINDOW_MS'] === undefined
+          ? 15 * 60 * 1000
+          : integer(env['LOGIN_WINDOW_MS'], 'LOGIN_WINDOW_MS'),
+      maxSessions:
+        env['MAX_SESSIONS'] === undefined ? 5 : integer(env['MAX_SESSIONS'], 'MAX_SESSIONS'),
+    },
+    signingKey: loadSigningKey(env, environment),
   };
 }

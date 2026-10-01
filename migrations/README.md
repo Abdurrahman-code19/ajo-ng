@@ -55,6 +55,7 @@ its own foreign keys by hand without a great deal of care. The result is
 | `100_audit_row_actor_type` | maps the `app.actor_type` policy vocabulary onto the different `audit_logs.actor_type` vocabulary |
 | `101_claim_token_visibility` | lets the claim function's owner see the token it is about to consume |
 | `102_token_lock_policy` | the `USING` clause the claim function's `FOR UPDATE` needs, because `FOR UPDATE` applies UPDATE policies |
+| `103_login_refresh` | login, refresh rotation, the spent-token ledger that makes replay observable, and the narrow migrator grants the two unauthenticated functions need |
 
 Deferred objects come last because they reference things created above them.
 

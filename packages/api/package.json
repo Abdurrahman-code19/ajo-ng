@@ -20,6 +20,7 @@
     "@node-rs/argon2": "^2.0.2",
     "fastify": "^5.2.1",
     "ioredis": "^5.4.2",
+    "jose": "^6.2.12",
     "libphonenumber-js": "^1.11.18",
     "pg": "^8.13.1"
   },

@@ -21,8 +21,14 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
+import type { Pool } from 'pg';
 import { buildApp } from '../src/app.js';
+import {
+  createAccessTokenPair,
+  generateEphemeralSigningKey,
+} from '../src/access-token.js';
 import { createPool } from '../src/db.js';
+import { hashToken } from '../src/identity.js';
 import { allowAllLimiter, createFixedWindowLimiter, type RateLimiter } from '../src/rate-limit.js';
 import type { Config } from '../src/config.js';
 import type { VerificationSender } from '../src/mailer.js';
@@ -49,7 +55,39 @@ function testConfig(): Config {
     // never on the path. See CapturingMailer.
     mail: undefined,
     registration: { rateLimit: 3, windowMs: 60_000 },
+    login: { rateLimit: 50, windowMs: 60_000, maxSessions: 5 },
+    // A fixed key per process, generated once. Generated per test would be fine
+    // for signing, but a test that signs with one and verifies with another would
+    // then pass for an unrelated reason, and the failure would be a confusing
+    // "every token is invalid" rather than "you mixed the keys up".
+    signingKey: { ...generateEphemeralSigningKey(), source: 'ephemeral' },
   };
+}
+
+/**
+ * The app, with its key pair already built.
+ *
+ * A helper rather than three call sites spelling out `createAccessTokenPair`
+ * because the pair has to match: the routes sign with `signer` and verify with
+ * `verifier`, and a test that passes a signer from one key and a verifier from
+ * another produces 401s that look exactly like a correct rejection.
+ */
+async function buildTestApp(
+  overrides: Partial<Parameters<typeof buildApp>[0]> = {},
+): Promise<FastifyInstance> {
+  const keys = createAccessTokenPair(testConfig().signingKey);
+  const { signer, verifier } = await keys;
+  const built = await buildApp({
+    config: testConfig(),
+    pool: pool as Pool,
+    limiter: allowAllLimiter(),
+    mailer: new CapturingMailer(),
+    signer,
+    verifier,
+    ...overrides,
+  });
+  await built.ready();
+  return built;
 }
 
 /** Captures what would have been emailed, so a test can use the token. */
@@ -118,8 +156,7 @@ before(async () => {
   pool = createPool(config.database);
   admin = adminPool();
   mailer = new CapturingMailer();
-  app = await buildApp({ config, pool, limiter: allowAllLimiter(), mailer });
-  await app.ready();
+  app = await buildTestApp({ config, pool, limiter: allowAllLimiter(), mailer });
 });
 
 after(async () => {
@@ -516,13 +553,12 @@ describe('rate limiting', { skip: HAVE_REDIS ? false : 'Redis is not reachable' 
       limit: 3,
       windowMs: 60_000,
     });
-    const limited = await buildApp({
+    const limited = await buildTestApp({
       config: testConfig(),
       pool,
       limiter,
       mailer: new CapturingMailer(),
     });
-    await limited.ready();
 
     try {
       // The limiter keys on the socket address, which for `inject` is a fixed
@@ -559,13 +595,12 @@ describe('rate limiting', { skip: HAVE_REDIS ? false : 'Redis is not reachable' 
       limit: 10,
       windowMs: 60_000,
     });
-    const degraded = await buildApp({
+    const degraded = await buildTestApp({
       config: testConfig(),
       pool,
       limiter: broken,
       mailer: new CapturingMailer(),
     });
-    await degraded.ready();
 
     try {
       const response = await degraded.inject({
@@ -578,5 +613,506 @@ describe('rate limiting', { skip: HAVE_REDIS ? false : 'Redis is not reachable' 
       await degraded.close();
       await broken.close().catch(() => undefined);
     }
+  });
+});
+
+/**
+ * Registers a member, verifies the address, and returns their credentials.
+ *
+ * A helper because the setup is three calls and every test in this file would
+ * otherwise repeat it -- and a test that registers but forgets to verify would
+ * then be asserting login behaviour for a `pending_verification` account while
+ * believing it was asserting it for a usable one.
+ */
+async function loginableMember(prefix: string): Promise<{
+  email: string;
+  password: string;
+  userId: string;
+}> {
+  const password = 'a sufficiently long passphrase';
+  const email = uniqueEmail(prefix);
+  const created = await post(validBody({ email, password }));
+  assert.equal(created.statusCode, 201, created.body);
+  const userId = (created.json() as { userId: string }).userId;
+
+  const token = mailer.sent.at(-1)?.token as string;
+  const verified = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/verify-email',
+    payload: { token },
+  });
+  assert.equal(verified.statusCode, 200, verified.body);
+
+  return { email, password, userId };
+}
+
+const signIn = (email: string, password: string, over: Record<string, unknown> = {}) =>
+  app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/login',
+    payload: { email, password, deviceLabel: 'laptop', platform: 'web', ...over },
+  });
+
+/** Pulls the refresh token back out of the `Set-Cookie` the route set. */
+function refreshCookieOf(response: LightMyRequestResponse): string {
+  const header = response.headers['set-cookie'];
+  const raw = Array.isArray(header) ? header.join(',') : String(header ?? '');
+  const match = /ajo_refresh=([^;]+)/.exec(raw);
+  assert.ok(
+    match,
+    `no refresh cookie: status ${response.statusCode}, body ${response.body}`,
+  );
+  return match[1] as string;
+}
+
+const withCookie = (token: string) => ({ cookie: `ajo_refresh=${token}` });
+
+const withBearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+describe('login', () => {
+  it('exchanges a password for an access token, a session and a cookie', async () => {
+    const member = await loginableMember('login');
+
+    const response = await signIn(member.email, member.password);
+    assert.equal(response.statusCode, 200, response.body);
+
+    const body = response.json() as {
+      accessToken: string;
+      tokenType: string;
+      userId: string;
+      sessionId: string;
+      accountStatus: string;
+    };
+    assert.equal(body.tokenType, 'Bearer');
+    assert.equal(body.userId, member.userId);
+    assert.equal(body.accountStatus, 'active', 'a verified member is active');
+
+    // The cookie carries every attribute 12.4.1 names. Asserted as a whole
+    // because the failure is silent: a cookie missing `HttpOnly` is still a
+    // working cookie, and the bug is only visible to JavaScript.
+    const cookie = String(response.headers['set-cookie']);
+    for (const attribute of ['HttpOnly', 'Secure', 'SameSite=Strict']) {
+      assert.ok(cookie.includes(attribute), `the refresh cookie must be ${attribute}: ${cookie}`);
+    }
+    assert.ok(!cookie.includes('accessToken'), 'the access token must not be a cookie');
+
+    // The token verifies and names this member and this session.
+    const decoded = JSON.parse(
+      Buffer.from(body.accessToken.split('.')[1] as string, 'base64url').toString(),
+    ) as { sub: string; sid: string };
+    assert.equal(decoded.sub, member.userId);
+    assert.equal(decoded.sid, body.sessionId);
+
+    // And the session is a real row, with the token stored hashed.
+    const session = await admin.query(
+      'SELECT id::text, device_label, platform, refresh_expires_at FROM sessions WHERE id = $1',
+      [body.sessionId],
+    );
+    assert.equal(session.rows[0].device_label, 'laptop');
+    assert.equal(session.rows[0].platform, 'web');
+    assert.ok(
+      new Date(session.rows[0].refresh_expires_at).getTime() > Date.now(),
+      'a new session has a future refresh expiry',
+    );
+  });
+
+  it('gives the same answer for a wrong password and an unknown address', async () => {
+    const member = await loginableMember('enum');
+
+    const wrongPassword = await signIn(member.email, 'not the password');
+    const unknownAddress = await signIn(uniqueEmail('nobody'), 'not the password');
+
+    // Byte-for-byte identical apart from nothing: the whole point is that an
+    // attacker cannot tell which addresses exist by reading the response.
+    assert.equal(wrongPassword.statusCode, unknownAddress.statusCode);
+    assert.equal(wrongPassword.body, unknownAddress.body);
+    assert.equal(wrongPassword.statusCode, 401);
+  });
+
+  it('tolerates the case of the address, because citext does', async () => {
+    const member = await loginableMember('case');
+    const shouted = member.email.toUpperCase();
+
+    const response = await signIn(shouted, member.password);
+    assert.equal(response.statusCode, 200, response.body);
+  });
+
+  it('refuses a revoked credential rather than checking the password first', async () => {
+    // Not yet implemented -- a member whose credential row is withdrawn must not
+    // be able to log in, and the check has to be the *only* difference. Stated
+    // here so the behaviour is pinned if the column ever gains a meaning.
+    const member = await loginableMember('revoked');
+    await admin.query('DELETE FROM user_credentials WHERE user_id = $1', [member.userId]);
+
+    const response = await signIn(member.email, member.password);
+    assert.equal(response.statusCode, 401, response.body);
+  });
+
+  it('replaces the session on a device it has used before, rather than duplicating it', async () => {
+    // 12.4.3: "If the member signs in from a device they have used before, that
+    // session is replaced, not duplicated." The database refuses the duplicate
+    // either way -- `sessions_one_active_per_device` is a partial unique index --
+    // so without the replacement statement this is a 500 rather than a sign-in.
+    const member = await loginableMember('same-device');
+
+    const first = await signIn(member.email, member.password, { deviceLabel: 'laptop' });
+    const second = await signIn(member.email, member.password, { deviceLabel: 'laptop' });
+    assert.equal(second.statusCode, 200, second.body);
+
+    const firstId = (first.json() as { sessionId: string }).sessionId;
+    const secondId = (second.json() as { sessionId: string }).sessionId;
+    assert.notEqual(secondId, firstId);
+
+    // One row for that device, and the old one revoked rather than deleted.
+    // The cast is on the FILTER, not just the first count: `count(*)` is bigint,
+    // `count(*) FILTER (...)` is bigint whatever you cast around the outside of
+    // it, and `pg` hands a bigint back as a *string*. Asserted with `equal`
+    // rather than `deepEqual` so the two types cannot quietly drift apart again.
+    const rows = await admin.query(
+      `SELECT count(*)::int AS total,
+              (count(*) FILTER (WHERE revoked_at IS NOT NULL))::int AS revoked,
+              max(revoked_reason) AS reason
+         FROM sessions
+        WHERE user_id = $1 AND device_label = 'laptop'`,
+      [member.userId],
+    );
+    assert.equal(rows.rows[0].total, 2, 'the first row is evidence and is kept');
+    assert.equal(rows.rows[0].revoked, 1);
+    assert.equal(rows.rows[0].reason, 'replaced');
+
+    // And the replaced session's token no longer works, without that counting as
+    // a theft against the member's other sessions.
+    const stale = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(refreshCookieOf(first)),
+    });
+    assert.equal(stale.statusCode, 401, stale.body);
+  });
+
+  it('keeps at most five sessions, evicting the oldest', async () => {
+    const member = await loginableMember('five');
+
+    const sessionIds: string[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      // Six *distinct* devices. With a repeated label each login would replace
+      // the previous session through `sessions_one_active_per_device` and the cap
+      // would never be reached, so the case would pass without ever evicting
+      // anything.
+      const response = await signIn(member.email, member.password, { deviceLabel: `device-${i}` });
+      assert.equal(response.statusCode, 200, response.body);
+      sessionIds.push((response.json() as { sessionId: string }).sessionId);
+    }
+
+    const live = await admin.query(
+      'SELECT count(*)::int AS n FROM sessions WHERE user_id = $1 AND revoked_at IS NULL',
+      [member.userId],
+    );
+    assert.equal(live.rows[0].n, 5, '12.4.3 caps the list at five');
+
+    // The first is the one that went, and it is revoked rather than deleted --
+    // a revoked row is the evidence 12.4.2 needs.
+    const evicted = await admin.query(
+      'SELECT revoked_at IS NOT NULL AS revoked, revoked_reason FROM sessions WHERE id = $1',
+      [sessionIds[0]],
+    );
+    assert.equal(evicted.rows[0].revoked, true);
+    assert.equal(evicted.rows[0].revoked_reason, 'superseded');
+  });
+});
+
+describe('refresh', () => {
+  it('rotates the token and issues a new access token', async () => {
+    const member = await loginableMember('refresh');
+    const login = await signIn(member.email, member.password);
+    const first = refreshCookieOf(login);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(first),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+
+    const second = refreshCookieOf(response);
+    assert.notEqual(second, first, 'rotation must change the token');
+
+    // The successor is the only live one, and the consumed one is on the ledger.
+    const token = await admin.query(
+      `SELECT count(*)::int AS n FROM sessions
+        WHERE user_id = $1 AND refresh_token_hash = decode($2, 'hex') AND revoked_at IS NULL`,
+      [member.userId, hashToken(first).toString('hex')],
+    );
+    assert.equal(token.rows[0].n, 0, 'the old token must not still be live');
+
+    const spent = await admin.query(
+      'SELECT count(*)::int AS n FROM session_rotated_tokens WHERE token_hash = decode($1, \'hex\')',
+      [hashToken(first).toString('hex')],
+    );
+    assert.equal(spent.rows[0].n, 1, 'the consumed token must be on the spent ledger');
+  });
+
+  it('revokes every session when a spent token comes back', async () => {
+    // 12.4.2's actual requirement, and the reason the ledger exists: the second
+    // use of a rotated token means a real device and an attacker hold the same
+    // lineage, so everything the member has goes.
+    const member = await loginableMember('reuse');
+    const phone = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    // A second device, so "every session" means more than the one being stolen.
+    await signIn(member.email, member.password, { deviceLabel: 'laptop' });
+    const stolen = refreshCookieOf(phone);
+
+    // The attacker rotates the stolen token first, so it becomes a *spent* token
+    // in the database. That is the only way to reach the reuse branch, and it is
+    // why a plain replay of a never-used token is just an unknown token.
+    const rotated = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(stolen),
+    });
+    assert.equal(rotated.statusCode, 200, rotated.body);
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(stolen),
+    });
+    assert.equal(replay.statusCode, 401, 'a spent token must be refused');
+
+    // Everything is gone, including the session the attacker was using.
+    const sessions = await admin.query(
+      'SELECT count(*)::int AS n FROM sessions WHERE user_id = $1 AND revoked_at IS NULL',
+      [member.userId],
+    );
+    assert.equal(sessions.rows[0].n, 0, 'every session must be revoked');
+
+    // And the attacker's own successor no longer works.
+    const attacker = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(refreshCookieOf(rotated)),
+    });
+    assert.equal(attacker.statusCode, 401, 'the attacker is cut off too');
+
+    const reasons = await admin.query(
+      'SELECT DISTINCT revoked_reason FROM sessions WHERE user_id = $1',
+      [member.userId],
+    );
+    assert.deepEqual(reasons.rows.map((r) => r.revoked_reason), ['refresh_token_reuse']);
+
+    const audit = await admin.query(
+      `SELECT count(*)::int AS n FROM audit_logs
+        WHERE action = 'session.refresh_token_reuse'
+          AND after_state ->> 'user_id' = $1`,
+      [member.userId],
+    );
+    assert.equal(audit.rows[0].n, 1, 'the theft must be recorded');
+  });
+
+  it('gives one of two concurrent refreshes the token and the other a 401', async () => {
+    // The claim I could not make in the database suite, because `psql -c` cannot
+    // express two overlapping transactions and a sequential test passes with or
+    // without the lock. This is the test that actually exercises it: both
+    // requests are in flight at once, so the second one finds the session row
+    // locked by the first.
+    //
+    // The expectation is *not* "one succeeds and one is politely refused". 12.4.2
+    // is explicit that a concurrent second use is indistinguishable from theft
+    // and gets the same response, and pretending otherwise is the kind of
+    // refinement that reintroduces the ambiguity the whole design removes.
+    const member = await loginableMember('race');
+    const login = await signIn(member.email, member.password);
+    const token = refreshCookieOf(login);
+
+    const attempt = () =>
+      app.inject({ method: 'POST', url: '/api/v1/auth/refresh', headers: withCookie(token) });
+
+    const [first, second] = await Promise.all([attempt(), attempt()]);
+    const codes = [first.statusCode, second.statusCode].sort();
+    assert.deepEqual(codes, [200, 401], `got ${codes.join(',')}`);
+
+    // Exactly one successor exists, so neither caller ended up holding a second
+    // valid token -- which is the property the lock protects.
+    const live = await admin.query(
+      'SELECT count(*)::int AS n FROM sessions WHERE user_id = $1 AND revoked_at IS NULL',
+      [member.userId],
+    );
+    assert.equal(live.rows[0].n, 0, 'the race is resolved as theft, so the lineage is closed');
+  });
+
+  it('refuses an unknown or absent token, identically', async () => {
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie('f'.repeat(64)),
+    });
+    const absent = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh' });
+
+    assert.equal(unknown.statusCode, 401);
+    assert.equal(absent.statusCode, 401);
+    assert.equal(unknown.body, absent.body);
+  });
+});
+
+describe('the authenticated session routes', () => {
+  /**
+   * One coherent session: the access token and the refresh cookie from the *same*
+   * login.
+   *
+   * Which sounds obvious and was not. Logging in twice and pairing the first
+   * response's access token with the second response's cookie produces two
+   * sessions, and then "log out" revokes one while the cookie still refreshes the
+   * other -- a failure that looks exactly like logout not working. Logout acts on
+   * the session named by the access token's signed `sid`, so the token and the
+   * cookie have to belong to the same login for the test to mean anything.
+   */
+  async function signedIn(prefix: string) {
+    const member = await loginableMember(prefix);
+    const response = await signIn(member.email, member.password, { deviceLabel: 'laptop' });
+    const body = response.json() as { accessToken: string; sessionId: string };
+    return {
+      ...member,
+      accessToken: body.accessToken,
+      sessionId: body.sessionId,
+      refreshToken: refreshCookieOf(response),
+    };
+  }
+
+  it('lists only the member\'s own live sessions, and marks the current one', async () => {
+    const member = await signedIn('list');
+    const second = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    assert.equal(second.statusCode, 200, second.body);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/auth/sessions',
+      headers: withBearer(member.accessToken),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+
+    const { sessions } = response.json() as {
+      sessions: { id: string; deviceLabel: string; isCurrent: boolean }[];
+    };
+    assert.equal(sessions.length, 2);
+    const mine = sessions.filter((s) => s.isCurrent);
+    assert.equal(mine.length, 1, 'exactly one session is the current one');
+    assert.equal(mine[0]?.id, member.sessionId);
+    assert.deepEqual(
+      sessions.map((s) => s.deviceLabel).sort(),
+      ['laptop', 'phone'],
+    );
+  });
+
+  it('revokes a session and answers 204 either way, so ids cannot be probed', async () => {
+    const member = await signedIn('revoke');
+    const other = await signedIn('revoke-other');
+
+    const own = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/auth/sessions/${member.sessionId}`,
+      headers: withBearer(member.accessToken),
+    });
+    assert.equal(own.statusCode, 204, own.body);
+
+    const revoked = await admin.query('SELECT revoked_reason FROM sessions WHERE id = $1', [
+      member.sessionId,
+    ]);
+    assert.equal(revoked.rows[0].revoked_reason, 'signed_out');
+
+    // Somebody else's session: 204, and unchanged. A 404 here would tell the
+    // caller that this id exists.
+    const foreign = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/auth/sessions/${other.sessionId}`,
+      headers: withBearer(member.accessToken),
+    });
+    assert.equal(foreign.statusCode, 204, foreign.body);
+    const untouched = await admin.query('SELECT revoked_at FROM sessions WHERE id = $1', [
+      other.sessionId,
+    ]);
+    assert.equal(untouched.rows[0].revoked_at, null, 'another member\'s session is untouched');
+
+    // A syntactically valid id that does not exist, for the same reason.
+    const imaginary = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/auth/sessions/${randomUUID()}`,
+      headers: withBearer(member.accessToken),
+    });
+    assert.equal(imaginary.statusCode, 204, imaginary.body);
+  });
+
+  it('ends the current session on logout, and clears the cookie', async () => {
+    const member = await signedIn('logout');
+    const cookie = member.refreshToken;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: { ...withBearer(member.accessToken), ...withCookie(cookie) },
+    });
+    assert.equal(response.statusCode, 204, response.body);
+    assert.match(String(response.headers['set-cookie']), /Max-Age=0/);
+
+    const revoked = await admin.query(
+      'SELECT revoked_at IS NOT NULL AS revoked FROM sessions WHERE id = $1',
+      [member.sessionId],
+    );
+    assert.equal(revoked.rows[0].revoked, true);
+
+    // The access token still verifies, which is the 15-minute window 12.4.1
+    // accepts. The refresh token does not, which is the control that matters.
+    const refreshed = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(cookie),
+    });
+    assert.equal(refreshed.statusCode, 401);
+  });
+
+  it('refuses every session route without a token, and never hints why', async () => {
+    for (const request of [
+      { method: 'GET' as const, url: '/api/v1/auth/sessions' },
+      { method: 'POST' as const, url: '/api/v1/auth/logout' },
+      { method: 'DELETE' as const, url: `/api/v1/auth/sessions/${randomUUID()}` },
+    ]) {
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 401, `${request.method} ${request.url}`);
+      assert.equal(response.body, JSON.stringify({ error: 'unauthenticated' }));
+      assert.match(String(response.headers['www-authenticate']), /Bearer/);
+    }
+  });
+
+  it('refuses a token that is not a token, and one from another key', async () => {
+    const member = await signedIn('bearer');
+
+    for (const header of ['Bearer', 'Bearer ', 'Basic abc', 'Bearer a b', 'bearer abc']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/sessions',
+        headers: { authorization: header },
+      });
+      assert.equal(response.statusCode, 401, `Authorization: ${header}`);
+    }
+
+    // A well-formed JWT signed by a key this process does not hold.
+    const stranger = await createAccessTokenPair(generateEphemeralSigningKey());
+    const forged = await stranger.signer.issue({
+      userId: member.userId,
+      sessionId: member.sessionId,
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/auth/sessions',
+      headers: withBearer(forged),
+    });
+    assert.equal(response.statusCode, 401, response.body);
+  });
+
+  it('refuses an unknown field on the login body, so a typo is not ignored', async () => {
+    const member = await loginableMember('typo');
+    const response = await signIn(member.email, member.password, {
+      passwrod: member.password,
+    } as unknown as Record<string, unknown>);
+    assert.equal(response.statusCode, 400, response.body);
   });
 });

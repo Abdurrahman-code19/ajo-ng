@@ -7,7 +7,7 @@
  * alternative -- a module that reads `process.env` on import -- makes every test
  * that touches it a test that mutates global state.
  */
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { Config } from './config.js';
 import type { RateLimiter } from './rate-limit.js';
@@ -15,6 +15,9 @@ import { ValidationError } from './identity.js';
 import { RegistrationConflict, register } from './register.js';
 import { VerificationError, verifyEmailToken } from './verify-email.js';
 import type { VerificationSender } from './mailer.js';
+import type { AccessTokenSigner, AccessTokenVerifier } from './access-token.js';
+import { registerSessionRoutes } from './session-routes.js';
+import { UnauthenticatedError, unauthenticated } from './auth.js';
 
 export interface AppDependencies {
   readonly config: Config;
@@ -22,10 +25,22 @@ export interface AppDependencies {
   readonly limiter: RateLimiter;
   /** Where the verification token goes. Never into the HTTP response. */
   readonly mailer: VerificationSender;
+  /**
+   * Access-token minting and verification.
+   *
+   * Two collaborators rather than one object holding the private key, because
+   * the routes that only verify -- everything behind an access token -- never
+   * need the ability to sign. Keeping them separate means a bug in a
+   * read-only route cannot be turned into "mint a token for an arbitrary `sub`",
+   * and it is why `createAccessTokenPair` builds the verifier from the public
+   * key.
+   */
+  readonly signer: AccessTokenSigner;
+  readonly verifier: AccessTokenVerifier;
 }
 
 export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> {
-  const { config, pool, limiter, mailer } = deps;
+  const { config, pool, limiter, mailer, signer, verifier } = deps;
   const app = Fastify({
     logger: { level: config.logLevel },
     ajv: {
@@ -88,8 +103,56 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
     return { status: 'ok', database: 'up', rateLimiter: 'up' };
   });
 
+  /**
+   * One error handler, so a refusal is written once.
+   *
+   * The only case that needs new behaviour is `UnauthenticatedError`: the
+   * authentication hook throws it to stop a request entering a route with no
+   * identity, and it has to come out as a 401 with `WWW-Authenticate` rather than
+   * as Fastify's default 500. Everything else is delegated with its own status
+   * code preserved -- in particular schema violations, which Fastify has already
+   * tagged 400, and which must not be flattened into a 500 by a handler that
+   * decided to be tidy.
+   *
+   * The 500 body is deliberately generic. Fastify's default includes
+   * `error.message`, and for a database error that message is the SQL -- table
+   * names, column names, sometimes a constraint and a fragment of a value. That
+   * is a schema disclosure handed to an unauthenticated caller, so it is not
+   * passed through.
+   */
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof UnauthenticatedError) {
+      return unauthenticated(reply);
+    }
+
+    if (error.validation !== undefined) {
+      return reply.code(400).send({
+        error: 'bad_request',
+        message: 'The request did not match the expected shape.',
+      });
+    }
+
+    const status =
+      typeof error.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500;
+    if (status >= 500) {
+      // Logged with the real error, sent without it. The asymmetry is the point:
+      // the operator needs the SQL, the caller does not.
+      request.log.error({ err: error }, 'request failed');
+      return reply.code(500).send({
+        error: 'internal_error',
+        message: 'The request could not be completed.',
+      });
+    }
+
+    return reply.code(status).send({
+      error: 'request_failed',
+      message: error.message,
+    });
+  });
+
   registerAuthRoutes(app, pool, limiter, mailer, config);
   registerVerifyEmailRoute(app, pool, limiter, config);
+  registerSessionRoutes(app, { config, pool, limiter, signer, verifier });
   return app;
 }
 

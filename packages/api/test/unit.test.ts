@@ -18,6 +18,12 @@ import {
   verifyPassword,
 } from '../src/identity.js';
 import { loadConfig } from '../src/config.js';
+import {
+  AccessTokenError,
+  createAccessTokenPair,
+  generateEphemeralSigningKey,
+} from '../src/access-token.js';
+import { SignJWT, importPKCS8 } from 'jose';
 import { createVerificationSender } from '../src/mailer.js';
 import { uuidv7 } from '../src/uuid.js';
 
@@ -236,5 +242,197 @@ describe('the mail relay configuration', () => {
       /MAIL_RELAY_TOKEN and MAIL_FROM/,
     );
     assert.throws(() => loadConfig({ ...base, MAIL_FROM: 'no-reply@example.ng' }), /MAIL_RELAY_URL/);
+  });
+});
+
+// At module scope, not inside `describe`, because `describe`'s callback cannot be
+// async and the key pair has to be built before any of the tests run. Top-level
+// await is fine here: the test file is a module.
+const tokenKeys = generateEphemeralSigningKey();
+const { signer, verifier } = await createAccessTokenPair(tokenKeys);
+
+describe('the access token', () => {
+  const claims = { userId: '3f2504e0-4f89-41d3-9a0c-0305e82c3301', sessionId: '9c858901-8a57-4791-81fe-4c455b099bc9' };
+  const now = new Date('2026-01-01T00:00:00Z');
+
+  it('round-trips the member and the session it was minted for', async () => {
+    const token = await signer.issue(claims, now);
+    assert.deepEqual(await verifier.verify(token, now), claims);
+  });
+
+  it('is EdDSA over a compact JWT, which is what 12.4.1 asks for', async () => {
+    // The header is not a secret and is not encrypted, so asserting on it is free
+    // and pins the algorithm to the spec. `jose` will not emit anything else, and
+    // the point of the assertion is that a future change to RS256 would fail here
+    // rather than in a client's decoder.
+    const token = await signer.issue(claims, now);
+    const [rawHeader] = token.split('.');
+    const header = JSON.parse(Buffer.from(rawHeader as string, 'base64url').toString()) as {
+      alg: string;
+      typ: string;
+    };
+    assert.equal(header.alg, 'EdDSA');
+    assert.equal(header.typ, 'JWT');
+  });
+
+  it('carries the member and the session, and carries no authority', async () => {
+    // Three claims only. A token that named a role or an account state would be a
+    // decision recorded at login and obeyed for 15 minutes after the decision was
+    // reversed, so the absence is the property -- there is nothing in here that
+    // RLS could be argued out of.
+    const token = await signer.issue(claims, now);
+    const payload = JSON.parse(
+      Buffer.from(token.split('.')[1] as string, 'base64url').toString(),
+    ) as Record<string, unknown>;
+    assert.equal(payload['sub'], claims.userId);
+    assert.equal(payload['sid'], claims.sessionId);
+    assert.ok('jti' in payload, 'a token needs an id so two minted in the same second differ');
+    for (const forbidden of ['role', 'email', 'status', 'is_email_verified', 'permissions']) {
+      assert.ok(!(forbidden in payload), `the token must not carry ${forbidden}`);
+    }
+  });
+
+  it('is accepted right up to its last second and refused in the next one', async () => {
+    const token = await signer.issue(claims, now);
+    const lastGood = new Date(now.getTime() + (15 * 60 - 1) * 1000);
+    await verifier.verify(token, lastGood);
+
+    const firstBad = new Date(now.getTime() + 15 * 60 * 1000);
+    await assert.rejects(verifier.verify(token, firstBad), AccessTokenError);
+  });
+
+  it('refuses a token signed by another key, without saying so', async () => {
+    // The other half of `jose`'s value: a verifier built from a different key must
+    // reject. The *same error* as an expired token is the part that matters -- a
+    // caller that can distinguish "wrong signature" from "expired" has a free
+    // validity check on a token they stole.
+    const other = await createAccessTokenPair(generateEphemeralSigningKey());
+    const forged = await other.signer.issue(claims, now);
+
+    const fromOurs = assert.rejects(verifier.verify(forged, now), AccessTokenError);
+    const fromExpired = assert.rejects(
+      verifier.verify(await signer.issue(claims, now), new Date(now.getTime() + 3600_000)),
+      AccessTokenError,
+    );
+    await Promise.all([fromOurs, fromExpired]);
+  });
+
+  it('refuses the alg-none and HS256 shapes a hand-rolled verifier can be talked into', async () => {
+    // Constructed here rather than with `jose`, because `jose` will not mint them:
+    // the point is what the *verifier* does when handed one. `alg: none` with the
+    // signature segment removed, and an HS256 token signed with the public key --
+    // the classic confusion attack, which works against any verifier that reads
+    // `alg` and picks a verifier from it.
+    const header = (alg: string) =>
+      Buffer.from(JSON.stringify({ alg, typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(
+      JSON.stringify({
+        sub: claims.userId,
+        sid: claims.sessionId,
+        iss: 'ajo-api',
+        aud: 'ajo-app',
+        exp: Math.floor(now.getTime() / 1000) + 900,
+      }),
+    ).toString('base64url');
+
+    const noneToken = `${header('none')}.${payload}.`;
+    await assert.rejects(verifier.verify(noneToken, now), AccessTokenError);
+
+    const hs256 = await new SignJWT({ sid: claims.sessionId })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(claims.userId)
+      .setIssuer('ajo-api')
+      .setAudience('ajo-app')
+      .setExpirationTime(Math.floor(now.getTime() / 1000) + 900)
+      .sign(Buffer.from(tokenKeys.publicKeyPem));
+    await assert.rejects(verifier.verify(hs256, now), AccessTokenError);
+  });
+
+  it('refuses a token with no session, because a member with no session is not a session', async () => {
+    const noSession = await new SignJWT({})
+      .setProtectedHeader({ alg: 'EdDSA' })
+      .setSubject(claims.userId)
+      .setIssuer('ajo-api')
+      .setAudience('ajo-app')
+      .setIssuedAt(Math.floor(now.getTime() / 1000))
+      .setExpirationTime(Math.floor(now.getTime() / 1000) + 900)
+      .sign(await importPKCS8(tokenKeys.privateKeyPem, 'EdDSA'));
+
+    await assert.rejects(verifier.verify(noSession, now), AccessTokenError);
+  });
+
+  it('refuses a token minted for another audience', async () => {
+    // A token this platform signed, for something else. Only the audience check
+    // stands between it and acceptance, which is why the audience is configured
+    // rather than assumed.
+    const foreign = await new SignJWT({ sid: claims.sessionId })
+      .setProtectedHeader({ alg: 'EdDSA' })
+      .setSubject(claims.userId)
+      .setIssuer('ajo-api')
+      .setAudience('some-other-service')
+      .setIssuedAt(Math.floor(now.getTime() / 1000))
+      .setExpirationTime(Math.floor(now.getTime() / 1000) + 900)
+      .sign(await importPKCS8(tokenKeys.privateKeyPem, 'EdDSA'));
+
+    await assert.rejects(verifier.verify(foreign, now), AccessTokenError);
+  });
+});
+
+describe('the signing key configuration', () => {
+  const base = { PGUSER: 'ajo_api', PGPASSWORD: 'p', REDIS_URL: 'redis://127.0.0.1:6379' };
+  const pair = generateEphemeralSigningKey();
+
+  it('is read when both halves are set', () => {
+    const config = loadConfig({
+      ...base,
+      ACCESS_TOKEN_PRIVATE_KEY: pair.privateKeyPem,
+      ACCESS_TOKEN_PUBLIC_KEY: pair.publicKeyPem,
+    });
+    assert.equal(config.signingKey.source, 'configured');
+    assert.equal(config.signingKey.privateKeyPem, pair.privateKeyPem);
+  });
+
+  it('is generated for development, and says that it was', () => {
+    // The `source` field is what the composition root and the logs read, so an
+    // operator can see a development key in a non-development log line.
+    const config = loadConfig({ ...base, NODE_ENV: 'development' });
+    assert.equal(config.signingKey.source, 'ephemeral');
+    assert.match(config.signingKey.privateKeyPem, /^-----BEGIN PRIVATE KEY-----/);
+    assert.match(config.signingKey.publicKeyPem, /^-----BEGIN PUBLIC KEY-----/);
+  });
+
+  it('is refused outright in production rather than generated', () => {
+    // The failure this prevents is not theoretical: two instances would each
+    // generate a different key, so a member's token would be accepted by one and
+    // rejected by the other, and a load balancer would log people out at random.
+    assert.throws(
+      () => loadConfig({ ...base, NODE_ENV: 'production' }),
+      /NODE_ENV is production/,
+    );
+  });
+
+  it('is refused when half configured, naming the missing half', () => {
+    assert.throws(
+      () => loadConfig({ ...base, ACCESS_TOKEN_PRIVATE_KEY: pair.privateKeyPem }),
+      /ACCESS_TOKEN_PUBLIC_KEY not set/,
+    );
+  });
+});
+
+describe('the login limits', () => {
+  const base = { PGUSER: 'ajo_api', PGPASSWORD: 'p', REDIS_URL: 'redis://127.0.0.1:6379' };
+
+  it('default to the five sessions 12.4.3 fixes', () => {
+    assert.equal(loadConfig(base).login.maxSessions, 5);
+  });
+
+  it('are read from the environment', () => {
+    const config = loadConfig({
+      ...base,
+      LOGIN_RATE_LIMIT: '4',
+      LOGIN_WINDOW_MS: '60000',
+      MAX_SESSIONS: '2',
+    });
+    assert.deepEqual(config.login, { rateLimit: 4, windowMs: 60_000, maxSessions: 2 });
   });
 });
