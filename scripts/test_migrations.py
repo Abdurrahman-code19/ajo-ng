@@ -802,6 +802,641 @@ def _self_insert(db: str) -> str:
         "five money, ledger and risk tables remain closed"
     )
 
+
+# ---------------------------------------------------------------------------
+# Login, refresh rotation, and reuse detection. Migration 103.
+#
+# The cases below are grouped by the property they defend, and each one is a
+# statement 12.4 makes rather than an implementation detail. The common shape is
+# worth naming, because it is what 101 and 102 were about: the login flow is the
+# first thing in this codebase that runs with *no* identity, and every function
+# it depends on therefore executes as its owner with no GUC set. A self-only
+# policy matches nothing, the function returns zero rows, and zero rows is the
+# documented "wrong password" answer -- so a missing grant here does not fail
+# loudly, it fails as a platform where nobody can log in.
+# ---------------------------------------------------------------------------
+
+
+def _loginable(
+    db: str,
+    email: str,
+    status: str = "active",
+    verified: bool = True,
+) -> str:
+    """
+    A member with a credential row, and therefore a member who can log in.
+
+    Committed, not rolled back: the refresh cases rotate real tokens and assert on
+    what a *second* transaction sees, which a rollback would undo along with the
+    state under test.
+
+    The Argon2id hash is a syntactically valid PHC string with a deliberately
+    wrong digest. Nothing here verifies a password -- that is Argon2's job and it
+    lives in the API, which is the only process that has the library. What the
+    database has to guarantee is that the hash reaches the caller intact and that
+    nothing else can read it, and a real hash would not test either any better.
+    """
+    must_succeed(
+        db,
+        "loginable fixture",
+        f"""
+        INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+        VALUES ('login-{email}', '{email}', '{status}', {str(verified).lower()})
+        ON CONFLICT DO NOTHING;
+        INSERT INTO user_credentials (user_id, argon2_hash)
+        SELECT id, '$argon2id$v=19$m=19456,t=2,p=1$ZmFrZXNhbHRzb21lc2FsdA$ZmFrZWhhc2hoYXNoZmFrZWhhc2hoYXNoZmFrZWg'
+          FROM users WHERE email = '{email}'
+        ON CONFLICT DO NOTHING;
+        """,
+    )
+    return email
+
+
+def _open_session(
+    db: str,
+    email: str,
+    token_hex: str = "a1a1a1",
+    expires_in: str = "30 days",
+    device: str = "laptop",
+) -> str:
+    """
+    A live session row with a known refresh token hash, owned by `email`.
+
+    Written as the connection's own role rather than as the member because the
+    point of several cases below is what the *member's* role can do to a session,
+    and building the fixture through the same path the test is about would let a
+    broken fixture mask a broken policy.
+
+    `device` is a parameter rather than a constant because
+    `sessions_one_active_per_device` makes (user_id, platform, device_label)
+    unique among unrevoked sessions -- so a member cannot hold two active sessions
+    for the same device, and a fixture that wanted two would collide on the index
+    rather than on anything it was testing. That index is also why "log in again
+    on the device you are already on" has to revoke the old session rather than
+    add a second one.
+    """
+    must_succeed(
+        db,
+        f"session fixture for {email} on {device}",
+        f"""
+        INSERT INTO sessions (user_id, refresh_token_hash, device_label, platform,
+                              refresh_expires_at)
+        SELECT id, decode('{token_hex}', 'hex'), '{device}', 'web',
+               now() + interval '{expires_in}'
+          FROM users WHERE email = '{email}';
+        """,
+    )
+    return token_hex
+
+
+@case("a login can read the hash it needs, and nothing else can")
+def _login_lookup(db: str) -> str:
+    """
+    `app.verify_login_credential` is the whole reason 103 exists, and it has two
+    halves that pull in opposite directions.
+
+    It has to return a password hash -- Argon2id cannot be verified in the
+    database, so the hash has to reach the process that owns the library. And
+    `user_credentials` deliberately has no SELECT policy for any application
+    role, which is what stops a bug in a route from reading hashes out of the
+    table it just wrote to.
+
+    Both are asserted here, because either one alone passes for the wrong reason.
+    A function that returns the hash but is reachable with a broader grant is a
+    hole; a function that returns nothing leaves every login on the platform
+    failing, and reporting "wrong password" for a correct one.
+    """
+    _loginable(db, "login-ok@example.ng")
+
+    # The hash reaches its caller. Asserted on the *value*, not on the row count:
+    # a function that returned the right number of rows with an empty hash would
+    # satisfy a count and break every login.
+    got = must_succeed(
+        db,
+        "look up a known member",
+        "SELECT argon2_hash FROM app.verify_login_credential('login-ok@example.ng');",
+    )
+    if "$argon2id$" not in got:
+        raise Failure(
+            "verify_login_credential did not return the Argon2id hash, so the "
+            f"API has nothing to verify against: {got.strip()[:200]}"
+        )
+
+    # The status comes back with it, because the two decisions are made together
+    # and a caller that could not see the status would have to guess.
+    state = must_succeed(
+        db,
+        "read the account state with the credential",
+        "SELECT status, is_email_verified FROM app.verify_login_credential('login-ok@example.ng');",
+    )
+    if "active" not in state or "t" not in state:
+        raise Failure(
+            f"the credential came back without the account state: {state.strip()[:200]}"
+        )
+
+    # And an unknown address is an empty set, not an exception. Raising here
+    # would let the API distinguish "no such member" from "no credential row" --
+    # a user-enumeration oracle on an unauthenticated endpoint.
+    unknown = must_succeed(
+        db,
+        "look up an unknown address",
+        "SELECT count(*) FROM app.verify_login_credential('nobody-at-all@example.ng');",
+    )
+    if not unknown.strip().startswith("0"):
+        raise Failure(
+            "verify_login_credential returned a row for an unknown address, so a "
+            f"caller could tell accounts apart: {unknown.strip()[:200]}"
+        )
+
+    # Case-insensitivity is the half that is easy to get wrong and invisible when
+    # it is wrong: registration lowercases before it writes, so an address stored
+    # with capitals and presented in lower case is the same member, and a
+    # comparison that disagreed with the uniqueness check would create an account
+    # that exists and cannot be logged into.
+    #
+    # Stored through the same fixture as every other member, deliberately. The
+    # function's FROM clause is `user_credentials JOIN users`, so a users row
+    # without a credential returns nothing -- and a case that inserted only the
+    # user would have been asserting that a member with no password cannot log
+    # in, which is true and is not the property under test.
+    _loginable(db, "Mixed.Case@Example.NG")
+    if not must_succeed(
+        db,
+        "look up a mixed-case address in lower case",
+        "SELECT count(*) FROM app.verify_login_credential('mixed.case@example.ng');",
+    ).strip().startswith("1"):
+        raise Failure(
+            "login is case-sensitive in a way registration is not, so this "
+            "member has an account and cannot reach it"
+        )
+
+    return (
+        "the hash and the account state reach the verifier, an unknown address "
+        "is an empty set, and the lookup agrees with registration on case"
+    )
+
+
+@case("the application role still cannot read a password hash")
+def _hash_still_closed(db: str) -> str:
+    """
+    The counterweight to the case above, and the one that would catch a future
+    "just grant SELECT so the login code is simpler".
+
+    `user_credentials` gained a policy for `ajo_migrator` in 103. If that policy
+    had been written for `ajo_app`, or with no role at all, every hash in the
+    table would become readable by any code path in the API -- including the one
+    that wrote them.
+    """
+    _loginable(db, "login-closed@example.ng")
+    owner = uid(db, "login-closed@example.ng")
+
+    seen = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            "login-closed@example.ng",
+            "SELECT count(*) FROM user_credentials;",
+        ),
+    )
+    if seen != "0":
+        raise Failure(
+            f"ajo_app read {seen} credential rows. Migration 103 granted the "
+            "migrator, not the application role, and the difference is the whole "
+            "point of the table."
+        )
+
+    # The same for `users`, which also gained a migrator policy. An application
+    # role must still see exactly one user row: its own.
+    _loginable(db, "login-other@example.ng")
+    visible = scalar(
+        db,
+        as_role(db, "ajo_app", "login-closed@example.ng", "SELECT count(*) FROM users;"),
+    )
+    if visible != "1":
+        raise Failure(
+            f"ajo_app sees {visible} users while impersonating one member, so "
+            "users_select_by_migrator leaked to the application role"
+        )
+
+    # And the spent-token ledger is closed too. A member can rotate their own
+    # token without ever seeing which hashes have been spent, which is what makes
+    # a token hash useless if the table is disclosed.
+    spent = scalar(
+        db,
+        as_role(
+            db, "ajo_app", "login-closed@example.ng", "SELECT count(*) FROM session_rotated_tokens;"
+        ),
+    )
+    if spent != "0":
+        raise Failure(f"ajo_app read {spent} spent-token rows")
+
+    del owner
+    return (
+        "ajo_app sees no credential row, one user row, and no spent tokens, "
+        "while the migrator reads all three"
+    )
+
+
+@case("a rotation leaves one live token and one spent record")
+def _rotation_single_use(db: str) -> str:
+    """
+    What a rotation has to leave behind, which is the state the reuse case then
+    reads.
+
+    Two things, and both are asserted because either alone passes for the wrong
+    reason. The successor has to be the *live* token, or a rotation that did not
+    take effect would still look like a success. And the token that was just
+    spent has to be in `session_rotated_tokens`, or the next use of it is
+    indistinguishable from a forgery and 12.4.2's theft response never fires.
+
+    This deliberately does **not** claim to test concurrency. Every statement here
+    runs and settles in sequence, so a rolled-back first claim would leave the
+    second reading the same live row and both would report `rotated` -- which is
+    also what a missing `FOR UPDATE` produces under a real race. Two genuinely
+    overlapping transactions cannot be expressed through `psql -c`, and asserting
+    the lock this way would be a test that passes whether or not the lock exists.
+    The race is asserted in `packages/api/test/integration.test.ts` instead, where
+    two real requests overlap. What is pinned here is the schema half: that a
+    rotation is durable, single-valued, and leaves the evidence behind.
+    """
+    email = _loginable(db, "login-rotate@example.ng")
+    token = _open_session(db, email, "b1b1b1")
+    successor = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+
+    first = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('{successor}', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=True,
+        ),
+    )
+    if first != "rotated":
+        raise Failure(
+            f"the first use of a live token reported {first!r} rather than "
+            "'rotated', so the case below is not testing reuse"
+        )
+
+    # Committed, so the successor is real and the spent hash is really spent. A
+    # rolled-back rotation would leave the fixture's original token live, and the
+    # two checks below would then be reading the wrong state.
+    live = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{email}' AND s.refresh_token_hash = decode('{successor}', 'hex');",
+    )
+    if live != "1":
+        raise Failure(
+            f"the successor is the live token on {live} sessions; exactly one is "
+            "correct, and zero means the rotation did not take effect"
+        )
+
+    # The old token is gone from the live column -- that is what "rotated" means --
+    # and present in the spent ledger, which is what makes its next use detectable.
+    spent = scalar(
+        db,
+        f"SELECT count(*) FROM session_rotated_tokens r "
+        f"JOIN users u ON u.id = r.user_id "
+        f"WHERE u.email = '{email}' AND r.token_hash = decode('{token}', 'hex');",
+    )
+    if spent != "1":
+        raise Failure(
+            f"the spent token is recorded {spent} times; a rotation that does not "
+            "record the token it consumed makes reuse undetectable"
+        )
+
+    still_live = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{email}' AND s.refresh_token_hash = decode('{token}', 'hex');",
+    )
+    if still_live != "0":
+        raise Failure(
+            f"the consumed token is still the live token on {still_live} sessions, "
+            "so rotating did not replace it"
+        )
+
+    return (
+        "a rotation makes the successor the single live token and records the "
+        "consumed one in the spent ledger"
+    )
+
+
+@case("a used refresh token is theft, and it revokes every session")
+def _reuse_detection(db: str) -> str:
+    """
+    The control 12.4.2 is built on.
+
+    Rotating a token destroys the evidence that it was ever valid, which is why
+    103 adds `session_rotated_tokens`. Without that table a replayed token and a
+    forged one are the same event -- a lookup miss -- and there is nothing to act
+    on. With it, a replay is observable, and the spec's response is the strongest
+    one available: the whole lineage goes, and so does everything else the member
+    holds.
+
+    The second half is the part that limits the damage and the part a test has to
+    pin. Revoking only the replayed lineage would leave an attacker who took two
+    tokens holding the second one.
+    """
+    email = _loginable(db, "login-reuse@example.ng")
+    other = _loginable(db, "login-reuse-2@example.ng")
+    token = _open_session(db, email, "d1d1d1")
+
+    # A second session on the same member, so "every session" means more than the
+    # one the stolen token came from.
+    # A second session on the same member, on a *different* device, so "every
+    # session" means more than the one the stolen token came from. It has to be a
+    # different device because `sessions_one_active_per_device` is unique over
+    # (user_id, platform, device_label) among unrevoked rows -- a fixture wanting
+    # two would collide on that index rather than on anything under test.
+    _open_session(db, email, "d2d2d2", expires_in="30 days", device="phone")
+    _open_session(db, other, "d3d3d3", expires_in="30 days")
+
+    def run(commit: bool = False) -> str:
+        return as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('d4d4d4', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=commit,
+        )
+
+    # Committed, so the rotation is real and the second call genuinely presents a
+    # spent token. Rolled back, both calls would read the same untouched live row
+    # and both would answer `rotated` -- the same output a missing spent-token
+    # ledger produces, which is the failure this case exists to catch.
+    if scalar(db, run(commit=True)) != "rotated":
+        raise Failure("the first use of a live token did not rotate it, so the case is not testing reuse")
+
+    # Second use of the same token. This is the event. Committed, because the
+    # response to it is the revocation, and a rolled-back detection would report
+    # `reused` correctly while leaving every session open -- the assertion below
+    # would then fail having proved the detection fires but not that it protects.
+    outcome = scalar(db, run(commit=True))
+    if outcome != "reused":
+        raise Failure(
+            f"a spent token reported {outcome!r} rather than 'reused', which "
+            "means reuse is not detectable and 12.4.2's theft response never fires"
+        )
+
+    remaining = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{email}' AND s.revoked_at IS NULL;",
+    )
+    if remaining != "0":
+        raise Failure(
+            f"{remaining} of the member's sessions survived a confirmed token "
+            "theft; 12.4.2 requires all of them invalidated"
+        )
+
+    # And another member is untouched, because "all sessions" means this member's.
+    survivor = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{other}' AND s.revoked_at IS NULL;",
+    )
+    if survivor != "1":
+        raise Failure(
+            f"the revocation reached another member's session ({survivor} left); "
+            "the response is per-member, not global"
+        )
+
+    # The event is recorded. 12.10 lists token-reuse detection as something that
+    # must be retained, and an audit trail nobody wrote is a question a member
+    # cannot be answered months later.
+    logged = scalar(
+        db,
+        "SELECT count(*) FROM audit_logs "
+        "WHERE action = 'session.refresh_token_reuse';",
+    )
+    if logged == "0":
+        raise Failure(
+            "a confirmed token theft wrote no audit row, so 12.10's record does "
+            "not exist and the detection is invisible after the fact"
+        )
+
+    return (
+        "a spent token reports reuse, revokes all 2 of that member's sessions "
+        "and no one else's, and writes an audit row"
+    )
+
+
+@case("refresh tokens expire, and idle and absolute limits are separate rules")
+def _session_timeouts(db: str) -> str:
+    """
+    12.4.3's three limits, which are three different rules and not one.
+
+    They are asserted separately because they are enforced by different
+    comparisons against different columns, and a single "expiry works" case would
+    pass with all three collapsed into one. Idle is measured from `last_active_at`
+    and absolute from `created_at`: a member who uses the app daily still loses the
+    session at 90 days, and one who vanishes for a fortnight loses it at 14 with
+    the absolute clock nowhere near.
+    """
+    checks: list[tuple[str, str, str]] = []
+
+    # Distinct token hashes per iteration, because `sessions_refresh_token_hash`
+    # is globally UNIQUE -- a shared literal would collide on that index on the
+    # second iteration and the case would fail for a reason that has nothing to do
+    # with timeouts.
+    for index, (label, mutate) in enumerate(
+        (
+            ("expired", "refresh_expires_at = now() - interval '1 minute'"),
+            ("idle", "last_active_at = now() - interval '15 days'"),
+            ("absolute", "created_at = now() - interval '91 days'"),
+        )
+    ):
+        email = _loginable(db, f"login-{label}@example.ng")
+        token = _open_session(db, email, f"e{index}e{index}e{index}", expires_in="30 days")
+        must_succeed(
+            db,
+            f"age the {label} session",
+            # `SET column` cannot be qualified with the table alias in PostgreSQL,
+            # so the alias appears on the table and the column stands alone.
+            f"UPDATE sessions AS s SET {mutate} "
+            f"FROM users u WHERE u.id = s.user_id AND u.email = '{email}';",
+        )
+        outcome = scalar(
+            db,
+            as_role(
+                db,
+                "ajo_app",
+                email,
+                f"""SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                        decode('{token}', 'hex'), decode('e2e2e2', 'hex'),
+                        now(), now() + interval '30 days')), 'no-row');""",
+                # Committed, because the revocation these refusals perform is the
+                # thing the last check in this case looks for. Rolled back, every
+                # outcome above would still be `unknown` -- the token is refused
+                # either way -- while `revoked_reason` came back empty, and the
+                # case would fail having proved nothing about the revocation.
+                commit=True,
+            ),
+        )
+        checks.append((label, outcome, token))
+
+    for label, outcome, _ in checks:
+        if outcome == "rotated":
+            raise Failure(
+                f"a {label}-expired session still rotated, so a bearer secret "
+                "past its limit is still accepted"
+            )
+        if outcome != "unknown":
+            raise Failure(
+                f"a {label}-expired session reported {outcome!r}; it should be "
+                "refused the same way a forged token is"
+            )
+
+    # Each refusal revokes the session rather than leaving it to be retried, so
+    # the row explains itself months later instead of being an inert active
+    # session with an old timestamp.
+    email = "login-idle@example.ng"
+    reason = scalar(
+        db,
+        f"SELECT s.revoked_reason FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{email}';",
+    )
+    if not reason.strip():
+        raise Failure("a timed-out session was not revoked, or was revoked without a reason")
+
+    return (
+        "an expired, a 15-day-idle and a 91-day-old session are all refused, "
+        f"and the idle one is revoked with reason {reason.strip()!r}"
+    )
+
+
+@case("a session is a member's own row to write and to revoke")
+def _session_rls(db: str) -> str:
+    """
+    103 adds INSERT and UPDATE policies to `sessions`, which had only SELECT and
+    DELETE, and both are needed by the login flow: creating a session on login is
+    a write, and revoking one is a write.
+
+    The refusal half matters more than the acceptance half, and it is the half
+    that is easy to skip: a self-owned policy with a missing `USING` clause is not
+    permissive, it is inert, and every revocation silently affects nothing while
+    reporting success. So this asserts a member can revoke their own session and
+    *cannot* revoke somebody else's.
+    """
+    mine = _loginable(db, "login-rls-mine@example.ng")
+    theirs = _loginable(db, "login-rls-theirs@example.ng")
+    theirs_id = uid(db, theirs)
+    _open_session(db, mine, "f1f1f1")
+    _open_session(db, theirs, "f2f2f2")
+
+    # `sessions_one_active_per_device` is a partial unique index over
+    # (user_id, platform, device_label) where not revoked, so a second session on
+    # the same member and device label has to revoke the first rather than sit
+    # next to it. That is the "log in again on the device you are already on"
+    # case, and it is the common one.
+    must_succeed(
+        db,
+        "revoke a member's own session",
+        as_role(
+            db,
+            "ajo_app",
+            mine,
+            "UPDATE sessions SET revoked_at = now(), revoked_reason = 'member_revoked' "
+            "WHERE user_id = app.request_user_id() AND revoked_at IS NULL;",
+            commit=True,
+        ),
+    )
+    still_open = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{mine}' AND s.revoked_at IS NULL;",
+    )
+    if still_open != "0":
+        raise Failure(
+            f"{still_open} of the member's own sessions survived their own "
+            "revocation, so sessions_update_own is not doing anything"
+        )
+
+    # The other direction, and the one an attacker would try. The target id is a
+    # literal rather than a subquery, and that is the whole reason the assertion
+    # means anything: `users` is FORCE RLS with a self-only SELECT policy, so
+    # `(SELECT id FROM users WHERE email = ...)` run as `ajo_app` returns NULL,
+    # the `WHERE` matches no rows, and the UPDATE changes nothing for a reason
+    # that has nothing to do with the session policy. `uid` reads the id outside
+    # the role switch for precisely this trap.
+    #
+    # And it is asserted on the *effect* rather than on an error, because an UPDATE
+    # under a `USING` clause that matches no visible row updates nothing and
+    # reports success. That is not a gap in the policy -- it is what row-level
+    # security is for: a member learns nothing about the existence of a session
+    # that is not theirs, which is why "no such row" and "not your row" have to be
+    # the same answer. A test that expected `row-level security` here would be
+    # asserting a stronger guarantee than the database makes, and would pass only
+    # because the fixture used a NULL subquery.
+    must_succeed(
+        db,
+        "attempt to revoke somebody else's session",
+        as_role(
+            db,
+            "ajo_app",
+            mine,
+            "UPDATE sessions SET revoked_at = now(), revoked_reason = 'forged' "
+            f"WHERE user_id = '{theirs_id}';",
+        ),
+    )
+    untouched = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{theirs}' AND s.revoked_at IS NULL;",
+    )
+    if untouched != "1":
+        raise Failure(
+            f"the other member's session was revoked by {mine!r} "
+            f"({untouched} still open). A forged revocation is the worst thing "
+            "this policy could allow, and it is what the case is here to catch."
+        )
+
+    # And a member cannot open a session attributed to somebody else. This one
+    # *does* raise, because there is no row to be invisible: `sessions_insert_own`
+    # is a `WITH CHECK` and there is no existing row for it to fail quietly
+    # against. Same reason for the literal id -- a subquery would make the check
+    # reject a NULL and the write would never be attempted for another member.
+    must_fail(
+        db,
+        "open a session for somebody else",
+        as_role(
+            db,
+            "ajo_app",
+            mine,
+            "INSERT INTO sessions (user_id, refresh_token_hash, device_label, platform) "
+            f"VALUES ('{theirs_id}', decode('f3f3f3', 'hex'), 'laptop', 'web');",
+        ),
+        expect="row-level security",
+    )
+
+    # Reading one's own sessions is what 12.4.3's device management needs, and it
+    # is the pre-existing SELECT policy rather than anything 103 added. Asserted
+    # here so the pair is tested together: a member lists their devices and
+    # revokes one, and sees nobody else's.
+    seen = scalar(
+        db,
+        as_role(db, "ajo_app", mine, "SELECT count(*) FROM sessions;"),
+    )
+    if seen != "1":
+        raise Failure(
+            f"a member sees {seen} sessions, expected their own 1. Device "
+            "management lists devices, so this has to be bounded."
+        )
+
+    return (
+        "a member revokes their own session, is refused somebody else's and the "
+        "one others', and still lists exactly their own"
+    )
+
+
 @case("the ledger stays balanced and append-only")
 def _ledger(db: str) -> str:
     # The invariant: at least two postings whose signed amounts sum to zero. The
