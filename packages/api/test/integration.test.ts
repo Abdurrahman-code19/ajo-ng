@@ -45,6 +45,9 @@ function testConfig(): Config {
       max: 5,
     },
     redis: { url: process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379' },
+    // No relay: the tests inject a capturing sender instead, so the transport is
+    // never on the path. See CapturingMailer.
+    mail: undefined,
     registration: { rateLimit: 3, windowMs: 60_000 },
   };
 }

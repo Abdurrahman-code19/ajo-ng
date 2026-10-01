@@ -1,0 +1,33 @@
+# Build context exclusions.
+#
+# `.dockerignore` rather than relying on a pre-build `git clean`, because the
+# build context is what gets sent to the daemon: a 400 MB `node_modules` that is
+# excluded here never leaves the machine, and a stale one can never shadow the
+# `npm ci` in the Dockerfile.
+
+node_modules
+**/node_modules
+**/dist
+**/build-test
+**/*.tsbuildinfo
+
+.git
+.github
+.gitignore
+.githooks
+
+# Secrets. `.env.example` is kept on purpose; `.env` must never be baked into a
+# layer, where it survives in the image history even if a later step deletes it.
+.env
+.env.*
+!.env.example
+
+__pycache__
+**/__pycache__
+*.py[cod]
+
+*.docx
+~$*.docx
+brand
+docs
+scripts

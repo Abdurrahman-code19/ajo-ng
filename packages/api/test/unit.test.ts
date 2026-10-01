@@ -17,6 +17,7 @@ import {
   normaliseNigerianPhone,
   verifyPassword,
 } from '../src/identity.js';
+import { loadConfig } from '../src/config.js';
 import { createVerificationSender } from '../src/mailer.js';
 import { uuidv7 } from '../src/uuid.js';
 
@@ -166,17 +167,74 @@ describe('uuidv7', () => {
 describe('the verification sender guards production', () => {
   const sink = { info: (): void => undefined };
 
-  it('refuses to hand back the logging sender in production', () => {
+  it('refuses to construct in production with no relay', () => {
     // The failure this prevents is silent and hands over accounts: the logging
     // sender writes the plaintext token to stdout, so a deploy with no transport
     // would publish every verification link. Refusing at construction means the
     // process does not start, which is loud.
-    assert.throws(() => createVerificationSender('production', sink), /email transport/i);
+    assert.throws(() => createVerificationSender('production', sink), /MAIL_RELAY_URL/);
   });
 
-  it('gives the logging sender everywhere else', async () => {
-    const sender = createVerificationSender('development', sink);
-    // Constructed, and usable enough to accept a message without throwing.
+  it('uses the relay in production when one is configured', async () => {
+    // The check that the production sender is not the logging sender: the
+    // logging sender's only observable effect is the log line, so asserting the
+    // line is absent is the assertion.
+    const logged: object[] = [];
+    const spy = { info: (fields: object): void => void logged.push(fields) };
+
+    const sender = createVerificationSender('production', spy, {
+      url: 'http://127.0.0.1:1/never-reached',
+      token: 'relay-secret',
+      from: 'no-reply@example.ng',
+    });
+
+    // Rejected because nothing listens there, which is the other property: a
+    // relay failure is a failure rather than a silent success.
+    await assert.rejects(() =>
+      sender.sendVerificationToken({ to: 'a@b.ng', userId: 'x', token: 't' }),
+    );
+    assert.equal(logged.length, 0, 'the production sender logged the token');
+  });
+
+  it('gives the logging sender outside production', async () => {
+    const logged: object[] = [];
+    const sender = createVerificationSender('development', {
+      info: (fields: object): void => void logged.push(fields),
+    });
     await sender.sendVerificationToken({ to: 'a@b.ng', userId: 'x', token: 't' });
+    assert.equal(logged.length, 1, 'the development sender did not log');
+  });
+});
+
+describe('the mail relay configuration', () => {
+  const base = { PGUSER: 'ajo_api', PGPASSWORD: 'p', REDIS_URL: 'redis://127.0.0.1:6379' };
+
+  it('is absent when nothing is set, which is a valid development state', () => {
+    assert.equal(loadConfig(base).mail, undefined);
+  });
+
+  it('is read when all three variables are set', () => {
+    const config = loadConfig({
+      ...base,
+      MAIL_RELAY_URL: 'https://relay.example.ng/send',
+      MAIL_RELAY_TOKEN: 'secret',
+      MAIL_FROM: 'no-reply@example.ng',
+    });
+    assert.deepEqual(config.mail, {
+      url: 'https://relay.example.ng/send',
+      token: 'secret',
+      from: 'no-reply@example.ng',
+    });
+  });
+
+  it('refuses a half-configured relay, naming what is missing', () => {
+    // Without this, an operator who set the URL and forgot the token would boot
+    // into a sender that authenticates as nobody and fails on the first signup --
+    // in production, discovered by a member.
+    assert.throws(
+      () => loadConfig({ ...base, MAIL_RELAY_URL: 'https://relay.example.ng/send' }),
+      /MAIL_RELAY_TOKEN and MAIL_FROM/,
+    );
+    assert.throws(() => loadConfig({ ...base, MAIL_FROM: 'no-reply@example.ng' }), /MAIL_RELAY_URL/);
   });
 });

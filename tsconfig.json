@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // A solution file: `tsc --build` with no arguments reads this, and the
+  // references make it build every package in dependency order. It was missing,
+  // so `npm run build` failed with TS5083 for anyone who ran it -- the typecheck
+  // and test scripts named their projects explicitly, which is why nothing
+  // noticed until the image build needed a single entry point.
+  "files": [],
+  "references": [{ "path": "packages/domain" }, { "path": "packages/api" }]
+}

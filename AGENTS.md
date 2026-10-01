@@ -144,6 +144,34 @@ Things that will bite you:
   `DEFERRABLE INITIALLY DEFERRED` constraint trigger on `ajos` refuses to commit
   an Ajo whose organiser is not a member.
 
+## The API
+
+- **`tsconfig.json` at the root is a solution file**, and it is the reason
+  `npm run build` works. `tsc --build` with no arguments reads it; without it you
+  get `TS5083`. Add a package by adding a reference there. `npm run typecheck`
+  names each project explicitly, so it will not catch a package you forgot to
+  reference — nothing builds it.
+- **The verification token exists in plaintext in exactly one process, for the
+  duration of one request.** It is hashed before the insert; the plaintext reaches
+  the mailer and nothing else. Never let it reach a log, an error message, a URL
+  query string, or an error tracker. `createLoggingSender` is for local
+  development and `createVerificationSender` throws rather than hand it back under
+  `NODE_ENV=production`. Do not weaken that gate to make a deploy start.
+- **The mail relay is provider-agnostic on purpose.** One authenticated HTTP POST
+  with a timeout, and a named-vendor adapter is a thin function over it. Picking a
+  vendor inside `mailer.ts` would be an architectural decision made by accident. A
+  relay failure throws, and the message carries the HTTP status only.
+- **`MAIL_RELAY_URL`, `MAIL_RELAY_TOKEN` and `MAIL_FROM` are all-or-nothing**, and
+  `loadMail` names the missing one. A half-configured relay fails on the first
+  signup in production, which is discovered by a member.
+- **`trustProxy` is off and stays off unless a reverse proxy overwrites
+  `X-Forwarded-For`.** The rate limiter keys on `request.ip`; trust that header
+  from a client that can set it and anyone picks their own key, which removes the
+  only bound on the unauthenticated signup path.
+- **A new environment variable goes in three places**: `config.ts`,
+  `.env.example`, and `docs/deployment.md`. Two of the three is a trap for whoever
+  deploys after you.
+
 ## The money rules
 
 These are not negotiable, and they are encoded in `packages/domain/src/money.ts`

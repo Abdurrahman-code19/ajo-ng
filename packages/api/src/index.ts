@@ -25,9 +25,10 @@ async function main(): Promise<void> {
     config,
     pool,
     limiter,
-    // Refuses to construct in production until a real transport exists, so a
-    // deploy cannot log verification tokens by accident. See `mailer.ts`.
-    mailer: createVerificationSender(config.environment, devLogger),
+    // Returns the HTTP relay in production and refuses to construct at all if one
+    // is not configured, so a deploy cannot log verification tokens by accident.
+    // See `mailer.ts`.
+    mailer: createVerificationSender(config.environment, devLogger, config.mail),
   });
 
   // Registering the shutdown hooks before `listen` means a process that is
