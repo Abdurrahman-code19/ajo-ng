@@ -220,13 +220,15 @@ DECLARE
   v_expires    timestamptz;
   v_created    timestamptz;
   v_last_seen  timestamptz;
+  v_revoked_at timestamptz;
+  v_deleted_at timestamptz;
   v_reason     text;
 BEGIN
   -- 12.4.3: a family is a session, so a rotated token is evidence about the
-  -- session it belonged to. Looked up without the `revoked_at IS NULL` filter,
-  -- because a revoked session whose token comes back is the strongest possible
-  -- reuse signal there is, and filtering it out here would make it look like a
-  -- forgery.
+  -- session it belonged to. Looked up *without* a `revoked_at IS NULL` filter, so
+  -- that a revoked session whose token comes back is still found rather than
+  -- looking like a forgery. It is then refused, just below, by an explicit check
+  -- rather than by the filter.
   --
   -- `FOR UPDATE` is what makes single use true, and the predicate not carrying
   -- `revoked_at IS NULL` is the same statement seen from the other side: the
@@ -241,8 +243,20 @@ BEGIN
   -- unhandled unique violation -- a 500 rather than the 401 the caller should get,
   -- and a rolling one is a worse way to learn that two devices are using the same
   -- lineage than a log line that says so.
-  SELECT s.id, s.user_id, s.refresh_expires_at, s.created_at, s.last_active_at
-    INTO v_session_id, v_user_id, v_expires, v_created, v_last_seen
+  -- `revoked_at` and `deleted_at` are selected as well as the timestamps, and
+  -- they are checked below. The reason is not tidiness: it is that 12.4.2's
+  -- theft response *revokes every session the member holds*, and this row is one
+  -- of them. Without the check, the attacker who triggered the detection is
+  -- holding the newest token in the lineage -- the successor their own rotation
+  -- produced -- and it would still be accepted afterwards, because the lookup
+  -- below matches on the token hash alone and never asks whether the session is
+  -- still alive. Detection would then close every door except the one the
+  -- attacker is standing in. The API test that found this asserts exactly that:
+  -- the attacker's successor must also be refused.
+  SELECT s.id, s.user_id, s.refresh_expires_at, s.created_at, s.last_active_at,
+         s.revoked_at, s.deleted_at
+    INTO v_session_id, v_user_id, v_expires, v_created, v_last_seen,
+         v_revoked_at, v_deleted_at
     FROM public.sessions s
    WHERE s.refresh_token_hash = p_token_hash
      FOR UPDATE;
@@ -294,6 +308,26 @@ BEGIN
     END IF;
 
     -- Never issued. Same answer as a spent token, to the caller.
+    RETURN;
+  END IF;
+
+  -- The session this token belongs to is already closed. Refuse, and say nothing
+  -- else.
+  --
+  -- The temptation is to treat this as theft, because a live token for a revoked
+  -- session is anomalous. It is not, and calling it theft would be actively
+  -- harmful. Three ordinary paths produce it: the member signed out and a stale
+  -- client refreshed afterwards; the session was evicted by the five-session cap;
+  -- the session was replaced by a later login on the same device. In all three
+  -- the member is the victim of a slow client, and revoking *every* session they
+  -- hold -- plus an audit row naming them as the source of a breach -- would
+  -- punish a legitimate member for a timer.
+  --
+  -- The real theft case, the attacker's successor after a detection, arrives
+  -- here too, and is refused by the same line. That is the point: the token stops
+  -- working, which is what protects the member, and no false accusation is
+  -- recorded on the way.
+  IF v_revoked_at IS NOT NULL OR v_deleted_at IS NOT NULL THEN
     RETURN;
   END IF;
 

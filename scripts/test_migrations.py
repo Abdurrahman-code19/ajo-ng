@@ -1223,9 +1223,38 @@ def _reuse_detection(db: str) -> str:
             "not exist and the detection is invisible after the fact"
         )
 
+    # The successor the attacker's own rotation produced must also be refused.
+    #
+    # This is the assertion that was missing, and the API suite found it: the
+    # lookup above matches on the token hash alone, so after the revocation the
+    # newest token in the lineage still resolved to a row -- a row that was now
+    # revoked. Detection therefore closed every session except the one the
+    # attacker was standing in. Revoking is only the control if the token stops
+    # working, and "the row is revoked" is not the same claim as "the token is
+    # refused".
+    successor = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            """SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('d4d4d4', 'hex'), decode('d5d5d5', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=True,
+        ),
+    )
+    if successor != "no-row":
+        raise Failure(
+            f"the attacker's successor token reported {successor!r} after the "
+            "theft was detected; 12.4.2's revocation has to stop the token "
+            "itself, not only mark the row, or the attacker's own session "
+            "survives the response meant to evict it"
+        )
+
     return (
         "a spent token reports reuse, revokes all 2 of that member's sessions "
-        "and no one else's, and writes an audit row"
+        "and no one else's, writes an audit row, and stops the successor too"
     )
 
 
@@ -1307,9 +1336,63 @@ def _session_timeouts(db: str) -> str:
     if not reason.strip():
         raise Failure("a timed-out session was not revoked, or was revoked without a reason")
 
+    # A session that was signed out is refused too -- and refused *without* an
+    # accusation. This is the case the `revoked_at IS NULL` filter being absent
+    # from the lookup creates, and both halves of the answer are deliberate:
+    #
+    #   * the token must not work, because the member signed out and a stale
+    #     client is still holding it;
+    #   * it must not be reported as `reused`, because a member who signs out and
+    #     whose phone wakes up and refreshes is not an attacker. Calling it
+    #     theft would revoke every other session they hold and write an audit row
+    #     naming them as a breach.
+    #
+    # So the answer is `no-row`, which the API turns into the same 401 as any
+    # other refusal, and no other session is touched.
+    signed_out = _loginable(db, "login-signedout@example.ng")
+    stale = _open_session(db, signed_out, "c1c1c1", expires_in="30 days")
+    _open_session(db, signed_out, "c2c2c2", expires_in="30 days", device="phone")
+    must_succeed(
+        db,
+        "sign the first session out",
+        f"UPDATE sessions AS s SET revoked_at = now(), revoked_reason = 'signed_out' "
+        f"FROM users u WHERE u.id = s.user_id AND u.email = '{signed_out}' "
+        f"AND s.refresh_token_hash = decode('{stale}', 'hex');",
+    )
+    stale_outcome = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            signed_out,
+            """SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('c1c1c1', 'hex'), decode('c3c3c3', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=True,
+        ),
+    )
+    if stale_outcome != "no-row":
+        raise Failure(
+            f"a signed-out session's token reported {stale_outcome!r}; a member "
+            "who signed out and whose stale client refreshed must be refused "
+            "quietly, not recorded as a token theft"
+        )
+    still_open = scalar(
+        db,
+        f"SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id "
+        f"WHERE u.email = '{signed_out}' AND s.revoked_at IS NULL;",
+    )
+    if still_open != "1":
+        raise Failure(
+            f"a stale refresh after signing out left {still_open} live sessions "
+            "where 1 was expected; refusing a signed-out token must not revoke the "
+            "member's other sessions as if it were a breach"
+        )
+
     return (
-        "an expired, a 15-day-idle and a 91-day-old session are all refused, "
-        f"and the idle one is revoked with reason {reason.strip()!r}"
+        "an expired, a 15-day-idle and a 91-day-old session are all refused, a "
+        f"revoked one is refused quietly, and the idle one is revoked with "
+        f"reason {reason.strip()!r}"
     )
 
 
