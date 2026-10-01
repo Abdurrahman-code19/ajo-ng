@@ -84,6 +84,69 @@ jobs:
       - name: Test schema invariants
         run: python scripts/test_migrations.py
 
+  api:
+    name: API against a real database
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Postgres and Redis, because the API's two load-bearing claims are made to
+    # the database and to Redis. Postgres is where the rules live (RLS, the audit
+    # trigger, the token table), and Redis is the only thing bounding the signup
+    # write path. A mocked either one would test the mock.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ajo
+          POSTGRES_PASSWORD: ajo
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - '6379:6379'
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: ajo
+      PGPASSWORD: ajo
+      REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Builds `ajo_api_test` from the migration files, bootstraps the three
+      # roles, compiles the API, and runs the integration suite as `ajo_api` --
+      # NOSUPERUSER and NOBYPASSRLS -- so the RLS assertions are not vacuous.
+      # `--no-redis` is deliberately not passed: with the service above, the
+      # rate-limit cases run, and skipping them would leave the signup write
+      # path's only bound unverified.
+      - name: Run the API test suite
+        run: python scripts/test_api.py
+
   spec:
     name: Specification structure
     runs-on: ubuntu-latest

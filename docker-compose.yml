@@ -1,0 +1,59 @@
+# The two things the API cannot be developed or tested without.
+#
+# Postgres is not a convenience here: the product's rules live in constraints,
+# triggers and row-level security, so "run it against SQLite" is not an option.
+# Redis is not a cache: the registration rate limit is the only thing bounding
+# an unauthenticated write path into the identity table, so it is load bearing.
+#
+# The API process itself is not a service here. It runs on the host with
+# `npm run dev` in packages/api, which keeps the edit-reload loop short and lets
+# `npm run test:api` reach the same containers. If a containerised API is wanted
+# later it needs its own image, and that is a decision about deployment rather
+# than about development.
+#
+#   docker compose up -d
+#   npm run test:api
+#
+# `npm run test:api` needs nothing exported: it points the suite at these
+# containers itself. Running the API by hand needs the role the bootstrap
+# creates, which is deliberately not the owner above:
+#
+#   PGHOST=127.0.0.1 PGDATABASE=ajo \
+#   PGUSER=ajo_api PGPASSWORD=local-dev-only \
+#   REDIS_URL=redis://127.0.0.1:6379 npm run dev
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ajo
+      POSTGRES_PASSWORD: ajo
+      # The API connects as `ajo_api`, created by the role bootstrap, but
+      # `test_migrations.py` and `migrate.py` connect as the owner.
+      POSTGRES_DB: ajo
+    ports:
+      - '5432:5432'
+    volumes:
+      - ajo-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ajo -d ajo']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    # No persistence: the only state is rate-limit counters, and a restart that
+    # forgets them is a restart that lets one more request through. Persisting
+    # them would be a way to make a development container matter more than the
+    # production one, where the counters are not expected to survive either.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ajo-postgres:
