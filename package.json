@@ -11,10 +11,12 @@
   ],
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --noEmit -p packages/domain/tsconfig.json && tsc --noEmit -p packages/domain/tsconfig.test.json",
+    "typecheck": "tsc --noEmit -p packages/domain/tsconfig.json && tsc --noEmit -p packages/domain/tsconfig.test.json && tsc --noEmit -p packages/api/tsconfig.json && tsc --noEmit -p packages/api/tsconfig.test.json",
     "test": "tsc -p packages/domain/tsconfig.test.json && node --test packages/domain/build-test/test/",
+    "test:unit:api": "tsc -p packages/api/tsconfig.test.json && node --test packages/api/build-test/test/unit.test.js",
     "test:db": "python3 scripts/test_migrations.py",
-    "verify": "npm run typecheck && npm test",
+    "test:api": "python3 scripts/test_api.py",
+    "verify": "npm run typecheck && npm test && npm run test:unit:api",
     "prepare": "bash scripts/install-hooks.sh",
     "postinstall": "bash scripts/install-hooks.sh"
   },

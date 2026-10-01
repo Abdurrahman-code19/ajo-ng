@@ -18,6 +18,53 @@
 -- The three roles are NOLOGIN. They are not accounts; they are bundles of
 -- privilege that a real login role is granted. No human or process logs in as
 -- any of them.
+--
+-- `ajo_api` is that login role, and it is the reason the split means anything.
+-- A NOLOGIN bundle cannot be connected to, so something has to hold it in order
+-- for the API to reach the database at all. If that something were a superuser,
+-- every policy in 9.6 would be decorative again -- which is exactly the mistake
+-- 9.13 warns about, and exactly what the earlier database cases were doing while
+-- they passed vacuously. `ajo_api` is NOSUPERUSER, NOBYPASSRLS, holds only
+-- `ajo_app`, and reaches it with SET LOCAL ROLE inside a transaction. The
+-- privilege the process actually runs with is therefore the one the policies
+-- were written for.
+--
+-- The membership is what does the work, and the direction is one-way: `ajo_app`
+-- gains nothing from knowing this role exists.
+--
+-- Local development only. The password is a fixed placeholder so a fresh clone
+-- runs without setup, and that is safe *only* because the role is
+-- NOSUPERUSER and holds nothing but `ajo_app`; it would be indefensible on a
+-- real deployment, where the password comes from the environment and this role
+-- is not created at all. Do not copy the password into any deployment config.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ajo_api') THEN
+    CREATE ROLE ajo_api LOGIN PASSWORD 'local-dev-only' NOSUPERUSER NOBYPASSRLS
+      NOCREATEDB NOCREATEROLE NOREPLICATION;
+  END IF;
+END
+$$;
+
+ALTER ROLE ajo_api NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+-- Guarded rather than bare, so a second run is silent. A plain GRANT succeeds
+-- every time and says so every time, and a bootstrap that prints a notice on
+-- every run trains the reader to ignore its output -- which is how the
+-- non-idempotent CREATE POLICY below survived being run twice.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_auth_members am
+      JOIN pg_roles member ON member.oid = am.member
+      JOIN pg_roles granted ON granted.oid = am.roleid
+     WHERE member.rolname = 'ajo_api'
+       AND granted.rolname = 'ajo_app'
+  ) THEN
+    GRANT ajo_app TO ajo_api;
+  END IF;
+END
+$$;
 
 \set ON_ERROR_STOP on
 
@@ -264,6 +311,14 @@ COMMENT ON SCHEMA app IS
 -- `ledger_transactions`, `ledger_postings`, `risk_events` -- are left without
 -- one, which means they are unwritable by a non-owner. That is deliberate and
 -- is argued in `migrations/096_rls_write_policies/001_self_row_inserts.sql`.
+-- The DROP is not defensiveness against a stale policy, it is the only way this
+-- statement is repeatable. `CREATE POLICY` has no OR REPLACE, so the first form
+-- of this file ran once and every run after it aborted on "policy already
+-- exists" -- in a script whose header claims it is safe to run repeatedly, and
+-- whose value depends entirely on being run against every database. Re-running
+-- it had quietly become impossible, and the only reason that was caught is that
+-- a later run was piped through a grep for errors on a live database.
+DROP POLICY IF EXISTS audit_logs_insert_by_trigger ON public.audit_logs;
 CREATE POLICY audit_logs_insert_by_trigger ON public.audit_logs
   FOR INSERT
   TO ajo_migrator

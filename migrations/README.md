@@ -49,8 +49,34 @@ its own foreign keys by hand without a great deal of care. The result is
 | `090_reference_data` | frequencies, roles, channels, document types, settings |
 | `095_pgdump_artifacts` | drops a pg_dump helper that leaked into `public` |
 | `096_rls_write_policies` | self-owned `INSERT` policies for `users` and `profiles`, and the record of why the five money, ledger and risk tables stay closed |
+| `097_registration` | credentials, email-verification tokens, consent evidence, and the policies for the signup write path |
+| `098_email_verification_claim` | the atomic token-claim function |
+| `099_consent_function_fixes` | the consent function records the audit id without needing a `RETURNING` read it is not allowed |
+| `100_audit_row_actor_type` | maps the `app.actor_type` policy vocabulary onto the different `audit_logs.actor_type` vocabulary |
+| `101_claim_token_visibility` | lets the claim function's owner see the token it is about to consume |
+| `102_token_lock_policy` | the `USING` clause the claim function's `FOR UPDATE` needs, because `FOR UPDATE` applies UPDATE policies |
 
 Deferred objects come last because they reference things created above them.
+
+## The two vocabularies called `actor_type`
+
+`100` fixes the one bug in the adopted schema that the API was the first caller to
+reach. `app.actor_type` is a GUC whose values are `anon` and `member`, and the RLS
+policies compare against `member`. `audit_logs.actor_type` is a column whose CHECK
+constraint allows `user`, `system`, `service` and `webhook`. `app.audit_row()`
+passed the first straight into the second, so every audited write made with an
+identity violated the constraint. The migration suite never set the GUC, so it
+had always passed on the `service` default; the API is the first caller that sets
+it. The mapping lives in `audit_row()` rather than in the API because the GUC
+value is what the policies require.
+
+`101` and `102` are the same lesson in a different place. `app.claim_email_
+verification_token` runs with no identity -- the account being verified has no
+session -- so the self-only SELECT policy matched nothing and the function
+returned "invalid token" for every token. It then needed a second policy because
+`SELECT ... FOR UPDATE` applies UPDATE policies as well as SELECT ones, and the
+existing UPDATE policy had only a `WITH CHECK`. Both policies are scoped to
+`ajo_migrator`, the function's owner; no application role can read the table.
 
 ## Rules
 
