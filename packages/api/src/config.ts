@@ -13,6 +13,14 @@ export interface Config {
   readonly host: string;
   readonly port: number;
   readonly logLevel: string;
+  /**
+   * `NODE_ENV`, defaulted rather than required.
+   *
+   * It is the one place a decision about "is this production" is made. The
+   * mailer gate reads it; nothing else branches on it, so there is exactly one
+   * definition of production in the process.
+   */
+  readonly environment: string;
   readonly database: {
     readonly host: string;
     readonly port: number;
@@ -55,6 +63,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     host: env['HOST'] ?? '0.0.0.0',
     port: env['PORT'] === undefined ? 3000 : integer(env['PORT'], 'PORT'),
     logLevel: env['LOG_LEVEL'] ?? 'info',
+    environment: env['NODE_ENV'] ?? 'development',
     database: {
       host: env['PGHOST'] ?? '127.0.0.1',
       port: env['PGPORT'] === undefined ? 5432 : integer(env['PGPORT'], 'PGPORT'),

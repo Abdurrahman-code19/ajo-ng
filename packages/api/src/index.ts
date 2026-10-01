@@ -9,7 +9,7 @@
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { createPool } from './db.js';
-import { createLoggingSender } from './mailer.js';
+import { createVerificationSender } from './mailer.js';
 import { createFixedWindowLimiter } from './rate-limit.js';
 
 async function main(): Promise<void> {
@@ -25,7 +25,9 @@ async function main(): Promise<void> {
     config,
     pool,
     limiter,
-    mailer: createLoggingSender(devLogger),
+    // Refuses to construct in production until a real transport exists, so a
+    // deploy cannot log verification tokens by accident. See `mailer.ts`.
+    mailer: createVerificationSender(config.environment, devLogger),
   });
 
   // Registering the shutdown hooks before `listen` means a process that is

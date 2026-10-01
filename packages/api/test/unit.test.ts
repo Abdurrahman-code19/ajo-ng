@@ -17,6 +17,7 @@ import {
   normaliseNigerianPhone,
   verifyPassword,
 } from '../src/identity.js';
+import { createVerificationSender } from '../src/mailer.js';
 import { uuidv7 } from '../src/uuid.js';
 
 describe('normaliseNigerianPhone', () => {
@@ -159,5 +160,23 @@ describe('uuidv7', () => {
   it('is unique across many calls in the same millisecond', () => {
     const ids = Array.from({ length: 5_000 }, () => uuidv7(1_700_000_000_000));
     assert.equal(new Set(ids).size, 5_000);
+  });
+});
+
+describe('the verification sender guards production', () => {
+  const sink = { info: (): void => undefined };
+
+  it('refuses to hand back the logging sender in production', () => {
+    // The failure this prevents is silent and hands over accounts: the logging
+    // sender writes the plaintext token to stdout, so a deploy with no transport
+    // would publish every verification link. Refusing at construction means the
+    // process does not start, which is loud.
+    assert.throws(() => createVerificationSender('production', sink), /email transport/i);
+  });
+
+  it('gives the logging sender everywhere else', async () => {
+    const sender = createVerificationSender('development', sink);
+    // Constructed, and usable enough to accept a message without throwing.
+    await sender.sendVerificationToken({ to: 'a@b.ng', userId: 'x', token: 't' });
   });
 });

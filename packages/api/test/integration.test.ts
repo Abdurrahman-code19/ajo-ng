@@ -34,6 +34,7 @@ function testConfig(): Config {
     host: '127.0.0.1',
     port: 0,
     logLevel: 'silent',
+    environment: 'test',
     database: {
       host: process.env['PGHOST'] ?? '127.0.0.1',
       port: Number(process.env['PGPORT'] ?? 5432),
@@ -429,6 +430,55 @@ describe('email verification', () => {
     const results = await Promise.all([verify(token), verify(token)]);
     const statuses = results.map((r) => r.statusCode).sort();
     assert.deepEqual(statuses, [200, 400], `expected one winner, got ${statuses.join(' and ')}`);
+  });
+
+  it('leaves the token unspent when activation fails, because they are one transaction', async () => {
+    // The bug this locks down: claiming the token and activating the account used
+    // to be two autocommitted statements. If the second failed, the first had
+    // already landed, leaving an account that could never be verified and a token
+    // that could not be retried. Fault injection is the only way to reach that
+    // branch deterministically: make the activation UPDATE raise, for one user.
+    const created = await post(validBody());
+    const userId = (created.json() as { userId: string }).userId;
+    const token = mailer.sent.at(-1)?.token as string;
+
+    await admin.query(
+      `CREATE FUNCTION _fault_fail_activation() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'fault injection: activation failed'; END $$;
+       CREATE TRIGGER _fault_fail_activation BEFORE UPDATE ON users
+         FOR EACH ROW WHEN (OLD.id = '${userId}'::uuid)
+         EXECUTE FUNCTION _fault_fail_activation();`,
+    );
+
+    try {
+      const response = await verify(token);
+      assert.equal(response.statusCode, 500, response.body);
+
+      // The claim must have rolled back with the activation.
+      const spent = await admin.query(
+        'SELECT consumed_at FROM email_verification_tokens WHERE user_id = $1',
+        [userId],
+      );
+      assert.equal(
+        spent.rows[0].consumed_at,
+        null,
+        'the token was spent by an activation that failed',
+      );
+
+      const user = await admin.query('SELECT status FROM users WHERE id = $1', [userId]);
+      assert.equal(user.rows[0].status, 'pending_verification');
+    } finally {
+      await admin.query(
+        `DROP TRIGGER IF EXISTS _fault_fail_activation ON users;
+         DROP FUNCTION IF EXISTS _fault_fail_activation();`,
+      );
+    }
+
+    // And the same token still works once the fault is gone -- which is the
+    // property the user actually cares about.
+    const retry = await verify(token);
+    assert.equal(retry.statusCode, 200, retry.body);
+    assert.deepEqual(retry.json(), { verified: true, alreadyVerified: false });
   });
 });
 
