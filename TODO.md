@@ -50,8 +50,9 @@ them:
 | | |
 |---|---|
 | Specification | Complete — 26 sections, ~238k words, 445 tables |
-| Database | **43 tables, 87 policies, 126 triggers** across 24 migration sets — built and enforced |
+| Database | **43 tables, 87 policies, 126 triggers** across 25 migration sets — built and enforced |
 | Ledger | **Writable.** Migration `105` recognises a provider-confirmed capture as two balanced entries, itemises the fee, and refuses a replay. Nothing had ever written to `ledger_transactions` before it. |
+| Provider events | **Settle themselves, asynchronously.** Migrations `106` and `107` record an unverified event, verify it as a separate auditable act, then lease it to a worker that matches the payment on `(provider, provider_reference)`, refuses to post on an amount or currency that is not what we instructed, and captures on a success. Still no HTTP endpoint. |
 | API | 81 integration tests green; auth, sessions, rate limiting, audit and security notifications shipped. Payments, Ajos, contributions and payouts still have no HTTP surface. |
 | Domain core | 2,018 lines, 84 tests passing, including a reusable provider contract suite |
 | Web / admin | Not started |
@@ -81,6 +82,10 @@ everybody learns to ignore.
 
 Verified: `npm run verify` → 70 domain + 37 API unit, 0 fail. `python3 scripts/test_api.py` →
 81/81. `python3 scripts/test_migrations.py` → 32/32.
+
+Those counts predate migrations `106` and `107`. Current: `npm run verify` → 37 API unit,
+0 fail; `npm test` → 84 domain, 0 fail; `python3 scripts/test_api.py` → 81/81;
+`python3 scripts/test_migrations.py` → 47/47.
 
 Not launch-ready, and the gap is not in the database. It is the payment provider, the HTTP
 surface over the money path, the frontend, and 15 legal items.
@@ -321,6 +326,17 @@ Enforced by the database, not just by the domain:
 > and a replay of the same capture moving nothing. The provider adapter, the signed webhook and
 > the HTTP endpoint that calls it are still the work below.
 
+> **Database side landed by migration `107`.** A verified, amount-matched event is now
+> settled by a worker rather than by the request handler: `app.claim_provider_event` leases
+> eligible events with `SKIP LOCKED` so concurrent workers neither queue behind each other nor
+> reclaim a live lease, and `app.settle_provider_event` matches the payment on
+> `(provider, provider_reference)`, refuses to post unless the amount matches
+> `charged_amount_kobo` and the currency matches the Ajo's, resolves the state through
+> `app.resolve_transfer_state`, and calls `app.post_collection_capture` only on a success. A
+> mismatch is escalated into a `failed` event carrying both figures for `E3-08`, never
+> silently accepted. The HTTP endpoint, the worker loop, per-IP rate limiting, 90-day replay
+> and collection initiation are still the work below.
+
 - [ ] `E3-02` `ProvidusFinancialProvider` adapter — **blocked on `E3-01`**
 - [x] `E3-03` Provider contract test suite — `packages/domain/test/provider-contract.ts`, one
       suite every adapter must pass: account lookup and retry, per-operation idempotency,
@@ -329,13 +345,15 @@ Enforced by the database, not just by the domain:
       failure surfacing. `MockFinancialProvider` passes it, so the adapter written in
       `E3-02` cannot quietly disagree with the money path.
 - [ ] `E3-04` Webhook verification, replay protection, idempotency, out-of-order handling —
-      the database half is migration `106`: unverified intake, an auditable separate
-      verification act that records its algorithm, the five-minute replay window, one row
-      per `provider_event_id` with `is_new` distinguishing a first sighting from a
-      redelivery, unknown event types ignored with a recorded reason, a gate that refuses
-      anything not verified and open, and terminal-state resolution. **Still to do:** the
-      HTTP endpoint, per-IP rate limiting, amount and reference reconciliation, and the
-      processing lease that calls `app.post_collection_capture`.
+      the database half is migrations `106` and `107`. `106` is intake: unverified intake, an
+      auditable separate verification act that records its algorithm, the five-minute replay
+      window, one row per `provider_event_id` with `is_new` distinguishing a first sighting
+      from a redelivery, unknown event types ignored with a recorded reason, a gate that
+      refuses anything not verified and open, and terminal-state resolution. `107` is
+      settlement: the claimed-and-leased queue, the provider-scoped reference match, the
+      amount and currency checks against what we actually instructed, contradiction handling,
+      and the capture itself. **Still to do:** the HTTP endpoint, per-IP rate limiting, 90-day
+      replay, and the worker loop that calls the claim.
 - [ ] `E3-05` Collection initiation and pending contribution flow
 - [ ] `E3-06` Fee calculation and capture posting — itemised, never a hidden line
 - [ ] `E3-07` Escrow and settlement account setup — **no member funds in operating accounts, ever**

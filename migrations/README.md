@@ -59,6 +59,7 @@ its own foreign keys by hand without a great deal of care. The result is
 | `104_security_notifications` | the security notification templates, the `audit_logs` trigger that enqueues both alarms in the revocation's own transaction, new-device recognition, and the drain/lease/mark functions the delivery worker calls |
 | `105_ledger_write_path` | the first writer for the two ledger tables: a balanced-entry primitive closed to `PUBLIC` and to `ajo_app`, the BR-021 capture that posts `contribution.received` then `fee.recognised`, the guard on `rounds.fee_collected_kobo`, and the migrator row policies both definer functions need |
 | `106_provider_event_intake` | provider-agnostic webhook intake: an unverified event recorded first, verification as a separate auditable act that names its algorithm, the five-minute replay window, one row per `provider_event_id` with `is_new` separating a first sighting from a redelivery, unknown event types ignored with a reason, a gate that refuses anything not verified and still open, and terminal-state resolution |
+| `107_provider_event_settlement` | the queue behind that intake: `app.claim_provider_event` leases verified events with `SKIP LOCKED` and stops at eight attempts, `app.settle_provider_event` matches the payment on `(provider, provider_reference)` and refuses to post unless the amount matches `charged_amount_kobo` and the currency matches the Ajo's, `app.defer_provider_event` applies the exponential backoff and the give-up, the provider's own `occurred_at` is kept rather than discarded, and `app.audit_row` learns to record `webhook` as an actor |
 
 Deferred objects come last because they reference things created above them.
 
@@ -114,6 +115,46 @@ privileges by calling the functions and watching them fail: this suite connects 
 postgres superuser, and a superuser can execute anything regardless of its grants. The
 grants are read out of `pg_proc` with `has_function_privilege`, and the first version of
 that case — which called them and watched — reported a `PUBLIC`-exposed resolver as closed.
+
+## What `107` adds, and the two decisions in it
+
+`106` can tell that an event arrived and that somebody verified it. It cannot move money,
+because nothing ever asked it to. `107` is the other half: a claimable queue and one
+function that settles a single claimed event.
+
+**The queue is a lease, and the claim is where the ceiling lives.** Section 13.5 wants a
+fast acknowledgement, so the HTTP handler verifies, persists and returns; the capture
+happens later, somewhere else. "Later" needs a claim, and a claim needs a lease so a worker
+that dies does not strand its event. `next_retry_at` carries both jobs — the lease when the
+event is `processing`, the backoff when it is `received` — because one column that is
+written by one function cannot disagree with itself.
+
+The ceiling is the part worth stating. `app.defer_provider_event` bounds its own retries,
+but only the paths that reach it are bounded, and an event whose settlement *raises* never
+reaches it: the caller's transaction rolls back, the event is still `processing`, and the
+next drain hands it out again. Nothing about attempt nine resolves a
+`payments_one_success_per_contribution` violation, so the claim files anything at eight
+attempts as `failed` on its way past. Without that, "stuck" and "waiting" are the same
+value in `status` and no query can tell them apart.
+
+**The amount is checked against `charged_amount_kobo`, not the contribution.** The provider
+collects the contribution *plus* the 2% fee, so a correct webhook for a ₦1,000 contribution
+says 102000 and not 100000. Checking against the contribution rejects every correct webhook
+in the system; checking against `charged_amount_kobo` accepts only the figure we actually
+instructed. `NULL` there means the pending payment never recorded what to expect, which is a
+gap in what we sent rather than a disagreement between two numbers, so it falls back to the
+contribution plus its fee — the same arithmetic `app.post_collection_capture` performs.
+
+Two smaller things `107` fixes that `106` left behind:
+
+- `106` recorded `received_at` and discarded the provider's own `occurred_at`, so every
+  timestamp in the queue was our clock. It now keeps both, and `settled_at` prefers the
+  provider's.
+- `audit_logs.actor_type` has always allowed `webhook`, and nothing could ever write it:
+  `app.audit_row()` mapped the GUC's two values onto two of the column's four and sent
+  everything else to `service`. The first money this system posts from a provider
+  confirmation would have been audited as indistinguishable from a cron job, on the one table
+  where the distinction is the whole point.
 
 ## The two vocabularies called `actor_type`
 

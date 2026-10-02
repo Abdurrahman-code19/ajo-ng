@@ -2184,9 +2184,17 @@ def _notification_delivery(db: str) -> str:
     # whether it did any work. Counting rows that exist instead would be 3 by
     # design -- the first drain created them -- and would fail for the right
     # behaviour having been the right behaviour.
+    #
+    # Scoped to this member, like everything else in this case. An earlier case's
+    # event can become eligible between the drain loop above and this call -- a
+    # lease expiring, a deferred row coming due -- and a global count then reports
+    # another case's work as this one re-sending its alarm. That is a real
+    # dependency on wall-clock time, and it fails on a fast machine more often
+    # than a slow one.
     again = scalar(
         db,
-        """SELECT count(*) FROM app.drain_security_notifications();""",
+        f"""SELECT count(*) FROM app.drain_security_notifications()
+             WHERE user_id = (SELECT id FROM users WHERE email = '{email}');""",
     )
     if again != "0":
         raise Failure(
@@ -3518,18 +3526,42 @@ def _provider_event_verification_gate(db: str) -> str:
         expect="has an unverified signature",
     )
 
-    # And the other way: verification cannot be recorded without saying how.
+    # And the other way: verification cannot be recorded without saying how, or
+    # without the values settlement matches on. Each argument is checked
+    # separately, because a function that only checks its first argument accepts
+    # a verification it cannot act on.
     must_fail(
         db,
         "verifying without naming an algorithm",
-        f"SELECT app.mark_provider_event_verified('{event_id}', NULL);",
+        f"SELECT app.mark_provider_event_verified('{event_id}', NULL, 'ref-1', 100, 'NGN', 'success');",
         expect="must record which algorithm verified it",
+    )
+
+    must_fail(
+        db,
+        "verifying without the reference it names",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', NULL, 100, 'NGN', 'success');",
+        expect="must record the provider reference",
+    )
+
+    must_fail(
+        db,
+        "verifying without the amount reported",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', 'ref-1', NULL, 'NGN', 'success');",
+        expect="must record the amount",
+    )
+
+    must_fail(
+        db,
+        "verifying without the state reported",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', 'ref-1', 100, 'NGN', NULL);",
+        expect="must record the state",
     )
 
     must_succeed(
         db,
         "verifying with the algorithm that did it",
-        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', 'ref-1', 100, 'NGN', 'success');",
     )
 
     if scalar(
@@ -3548,7 +3580,7 @@ def _provider_event_verification_gate(db: str) -> str:
     must_succeed(
         db,
         "verifying an already-verified event",
-        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', 'ref-1', 100, 'NGN', 'success');",
     )
 
     # And an event the database has never heard of is not a verification.
@@ -3589,7 +3621,7 @@ def _provider_event_unknown_type(db: str) -> str:
     must_succeed(
         db,
         "verifying an event type we do not implement",
-        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256', 'MOCK-000004', 200000, 'NGN', 'unknown');",
     )
 
     must_succeed(
@@ -3759,7 +3791,10 @@ def _provider_event_grants(db: str) -> str:
     """
     functions = (
         ("app.ingest_provider_event", "text, text, text, timestamptz, jsonb, timestamptz"),
-        ("app.mark_provider_event_verified", "uuid, text"),
+        ("app.mark_provider_event_verified", "uuid, text, text, bigint, text, public.payment_status"),
+        ("app.claim_provider_event", "integer, integer"),
+        ("app.settle_provider_event", "uuid"),
+        ("app.defer_provider_event", "uuid, text"),
         ("app.ignore_provider_event", "uuid, text"),
         ("app.assert_provider_event_verified", "uuid"),
         ("app.resolve_transfer_state", "public.payment_status, public.payment_status"),
@@ -3830,11 +3865,684 @@ def _provider_event_grants(db: str) -> str:
         )
 
     return (
-        "the application role and the API role that inherits it can call all five "
-        "intake functions, PUBLIC and the analytics role can call none of them, the "
+        "the application role and the API role that inherits it can call every one "
+        "of these intake and settlement functions, PUBLIC and the analytics role "
+        "can call none of them, the "
         "transfer-state resolver is closed to PUBLIC despite EXECUTE being granted "
         "there automatically at creation, and webhook_events carries the migrator "
         "policies the intake depends on"
+    )
+
+
+def _settle_ajo(group: int) -> str:
+    """One Ajo per settlement case, and with it one round and one contribution.
+
+    A shared Ajo does not work. `rounds_one_in_progress_per_ajo` is a unique index
+    on (ajo_id) where status = 'in_progress', so a second round on the same Ajo is
+    rejected -- and `ON CONFLICT DO NOTHING` reports success while inserting
+    nothing, which left four cases matching no payment at all and deferring.
+    """
+    return f"01b00000-0000-7000-8000-{group + 19:012d}"
+
+
+def _settle_round(group: int) -> str:
+    return f"01b00000-0000-7000-8000-{group:012d}"
+
+
+SETTLE_AJO = _settle_ajo(1)
+SETTLE_ROUND = _settle_round(1)
+
+
+def _pending_money_ajo(db: str, reference: str = "settle-ref-1", group: int = 1) -> str:
+    """
+    One member, one Ajo, one round, one contribution, and a payment that is
+    `pending` with a provider reference.
+
+    Separate from `_money_ajo` rather than a variation of it. That fixture's
+    payment is already `success`, and a second payment on the same contribution
+    would let a capture post a second `contribution.received` for one
+    contribution -- the round aggregates are derived from paid contributions, not
+    from payments, so the totals would double while the ledger looked internally
+    consistent. Two independent fixtures keep "this capture belongs to that
+    contribution" checkable.
+    """
+    ajo_id = _settle_ajo(group)
+    round_id = _settle_round(group)
+    # One member per group. The settlement cases commit real captures, and a capture
+    # queues notifications for the member; a single shared member let those pile up
+    # under a case of their own that counts what a drain owes one member.
+    member = f"settle-{group}@example.ng"
+    must_succeed(
+        db,
+        f"a pending payment on group {group} awaiting a webhook",
+        "\n".join(
+            [
+                "BEGIN;",
+                f"INSERT INTO users (auth_subject_id, email, status) "
+                f"VALUES ('settle-{group}', '{member}', 'active') "
+                "ON CONFLICT DO NOTHING;",
+                f"""INSERT INTO ajos (
+                      id, name, organizer_user_id, contribution_amount_kobo,
+                      frequency_id, enrollment_opens_at, enrollment_closes_at,
+                      total_rounds, currency, status, position_count
+                    ) SELECT '{ajo_id}', 'Settlement group {group}', u.id, 1000000,
+                      f.id, now() - interval '1 day', now() + interval '4 days',
+                      12, 'NGN', 'draft', 5
+                      FROM users u, contribution_frequencies f
+                     WHERE u.email = '{member}' AND f.code = 'weekly'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO ajo_positions (ajo_id, position_number)
+                    SELECT a.id, n FROM ajos a, generate_series(1, 5) AS n
+                     WHERE a.id = '{ajo_id}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO rounds (
+                      id, ajo_id, round_number, status, due_date, opens_at,
+                      closes_at, target_amount_kobo
+                    ) SELECT '{round_id}', a.id, 1, 'in_progress', current_date,
+                      now(), now() + interval '3 days', 1000000
+                      FROM ajos a WHERE a.id = '{ajo_id}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO contribution_schedules (
+                      round_id, ajo_id, due_date, expected_amount_kobo,
+                      expected_member_count, late_cutoff_at
+                    ) SELECT r.id, r.ajo_id, r.due_date, 1000000, 5,
+                      now() + interval '5 days'
+                      FROM rounds r WHERE r.id = '{round_id}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO contributions (
+                      schedule_id, member_id, position_id, ajo_id, round_id,
+                      user_id, amount_kobo, due_date
+                    ) SELECT s.id, m.id, m.position_id, s.ajo_id, s.round_id,
+                      m.user_id, 1000000, s.due_date
+                      FROM contribution_schedules s
+                      JOIN ajo_members m ON m.ajo_id = s.ajo_id
+                        AND m.user_id = (SELECT id FROM users
+                                          WHERE email = '{member}')
+                     WHERE s.round_id = '{round_id}'
+                    ON CONFLICT DO NOTHING;""",
+                # `charged_amount_kobo` and `fee_kobo` are generated from the
+                # contribution amount, so the amount the provider must confirm is
+                # 1020000 and not 1000000. Writing either column here is an error
+                # by design: the fee is derived, never supplied.
+                #
+                # The idempotency key is derived from the reference rather than
+                # hard-coded. It was 'idem-settle-1' at first, and since that
+                # column is unique a second call inserted nothing and reported
+                # success -- so later cases went on asserting against a payment
+                # that had never been created.
+                f"""INSERT INTO payments (
+                      contribution_id, channel_id, idempotency_key, provider,
+                      provider_reference, contribution_amount_kobo, status
+                    ) SELECT c.id, ch.id, 'idem-' || '{reference}', 'mock', '{reference}',
+                      1000000, 'pending'
+                      FROM contributions c, payment_channels ch
+                     WHERE c.round_id = '{round_id}' AND ch.code = 'bank_transfer'
+                    ON CONFLICT DO NOTHING;""",
+                "COMMIT;",
+            ]
+        ),
+    )
+    return reference
+
+
+def _verified_event(
+    db: str,
+    reference: str,
+    state: str = "success",
+    amount: int = 1020000,
+    currency: str = "NGN",
+    event_id: str = "evt-settle-1",
+    provider: str = "mock",
+) -> str:
+    """Ingest, verify and claim one provider event, returning its row id."""
+    row_id = scalar(
+        db,
+        f"""SELECT (e.event_id::text) AS joined
+              FROM app.ingest_provider_event(
+                '{provider}', '{event_id}', 'transfer.{state}', now(),
+                '{{"reference":"{reference}"}}'::jsonb) e;""",
+    )
+    must_succeed(
+        db,
+        f"verifying {event_id}",
+        f"""SELECT app.mark_provider_event_verified(
+              '{row_id}', 'HMAC-SHA256', '{reference}', {amount}, '{currency}',
+              '{state}'::public.payment_status);""",
+    )
+    must_succeed(
+        db,
+        f"claiming {event_id}",
+        f"""SELECT count(*) FROM app.claim_provider_event() WHERE id = '{row_id}';""",
+    )
+    return row_id
+
+
+@case("a verified, amount-matched webhook settles a pending payment")
+def _settlement_captures(db: str) -> str:
+    """
+    The whole point of 107, end to end in one path: an event arrives unverified,
+    its signature is checked by something that has the provider's secret, the
+    values are recorded, a worker claims it, and the money moves.
+
+    Asserted through the real functions rather than by writing the rows, because
+    the claim being worth anything is exactly the claim that this path is the only
+    way to reach the ledger from a webhook.
+    """
+    _pending_money_ajo(db)
+
+    before = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;"))
+    event_id = _verified_event(db, "settle-ref-1")
+
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{event_id}');")
+    if outcome != "captured":
+        raise Failure(f"settling a verified, matched success returned {outcome!r}")
+
+    # The payment is settled and linked to the event that settled it. The unique
+    # index on `webhook_event_id` is what stops one event settling two payments.
+    payment = scalar(
+        db,
+        f"""SELECT status::text || '|' || (webhook_event_id = '{event_id}')::text
+              FROM payments WHERE provider_reference = 'settle-ref-1';""",
+    )
+    if payment != "success|true":
+        raise Failure(f"the payment reads {payment}; expected success linked to the event")
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{event_id}';") != "processed":
+        raise Failure("the event was not marked processed after settling")
+
+    # And the ledger moved by exactly the two entries a capture makes.
+    added = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;")) - before
+    if added != 2:
+        raise Failure(f"settling one capture added {added} ledger entries, expected 2")
+
+    if scalar(db, f"SELECT status::text FROM contributions WHERE round_id = '{SETTLE_ROUND}';") != "paid":
+        raise Failure("the contribution is not paid after a verified, matched success")
+
+    # The event's own time is what gets stamped, not our arrival time: the column
+    # 106 validated and threw away, and 107 exists partly to keep it.
+    if scalar(
+        db,
+        f"SELECT (provider_completed_at IS NOT NULL)::text FROM payments "
+        f"WHERE provider_reference = 'settle-ref-1';",
+    ) != "true":
+        raise Failure("the payment has no provider completion time")
+
+    return (
+        "a verified, amount-matched success claimed by a worker settles the pending "
+        "payment, links the payment to the event, posts exactly the two ledger "
+        "entries and marks the contribution paid"
+    )
+
+
+@case("a webhook that reports the wrong amount is escalated, never posted")
+def _settlement_amount_must_match(db: str) -> str:
+    """
+    Spec §13.5: "The received amount, currency, and reference must match the
+    pending contribution. A mismatch is escalated to reconciliation, not silently
+    accepted."
+
+    The number that matters is `charged_amount_kobo` -- contribution plus the 2%
+    fee, 1020000 here -- not the contribution's own 1000000. Matching against the
+    contribution alone would reject every correct webhook in the system.
+    """
+    _pending_money_ajo(db)
+
+    before = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;"))
+    _pending_money_ajo(db, reference="settle-ref-amount", group=2)
+    event_id = _verified_event(
+        db, "settle-ref-amount", amount=1000000, event_id="evt-amount-wrong"
+    )
+
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{event_id}');")
+    if "amount mismatch" not in outcome:
+        raise Failure(
+            f"a webhook reporting 1000000 against a charge of 1020000 returned "
+            f"{outcome!r} instead of escalating"
+        )
+
+    if int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;")) != before:
+        raise Failure("a mismatched amount posted to the ledger")
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{event_id}';") != "failed":
+        raise Failure("a mismatched amount was not left in failed for reconciliation")
+
+    # The escalation has to carry both figures, or reconciliation cannot act on it.
+    detail = scalar(db, f"SELECT error_detail FROM webhook_events WHERE id = '{event_id}';")
+    if "1000000" not in detail or "1020000" not in detail:
+        raise Failure(f"the escalation does not carry both amounts: {detail!r}")
+
+    # And the payment is untouched: still pending, still unpaid.
+    if scalar(
+        db, "SELECT status::text FROM payments WHERE provider_reference = 'settle-ref-amount';"
+    ) != "pending":
+        raise Failure("a mismatched webhook changed the payment's status")
+
+    return (
+        "a webhook reporting the contribution amount where the charge was the "
+        "contribution plus fee is escalated with both figures on the row, posts "
+        "nothing, and leaves the payment pending"
+    )
+
+
+@case("a currency the Ajo does not collect is escalated")
+def _settlement_currency_must_match(db: str) -> str:
+    """The second half of the same rule, and the half a Nigerian-only schema is
+    most likely to skip because every row currently says NGN."""
+    _pending_money_ajo(db)
+
+    before = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;"))
+    _pending_money_ajo(db, reference="settle-ref-currency", group=3)
+    event_id = _verified_event(
+        db, "settle-ref-currency", currency="USD", event_id="evt-currency-wrong"
+    )
+
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{event_id}');")
+    if "currency mismatch" not in outcome:
+        raise Failure(f"a webhook in USD returned {outcome!r} instead of escalating")
+
+    if int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;")) != before:
+        raise Failure("a webhook in the wrong currency posted to the ledger")
+
+    if "USD" not in scalar(db, f"SELECT error_detail FROM webhook_events WHERE id = '{event_id}';"):
+        raise Failure("the currency escalation does not name the currency reported")
+
+    return (
+        "a webhook reporting a currency the Ajo does not collect is escalated with "
+        "both currencies named and posts nothing"
+    )
+
+
+@case("a webhook cannot settle before a worker has claimed it")
+def _settlement_requires_the_claim(db: str) -> str:
+    """
+    The lease is the only thing stopping two API instances settling one event, so
+    it has to be load-bearing: settling an event that nobody has claimed must be
+    refused, not quietly allowed.
+
+    Without this the claim is decoration -- a worker could call settle directly and
+    the `FOR UPDATE SKIP LOCKED` in the claim would protect nothing.
+    """
+    _pending_money_ajo(db)
+
+    row_id = scalar(
+        db,
+        """SELECT (e.event_id::text) AS joined
+             FROM app.ingest_provider_event(
+               'mock', 'evt-unclaimed', 'transfer.success', now(),
+               '{"reference":"settle-ref-1"}'::jsonb) e;""",
+    )
+    must_succeed(
+        db,
+        "verifying an unclaimed event",
+        f"""SELECT app.mark_provider_event_verified(
+              '{row_id}', 'HMAC-SHA256', 'settle-ref-1', 1020000, 'NGN', 'success');""",
+    )
+
+    must_fail(
+        db,
+        "settling an event nobody claimed",
+        f"SELECT app.settle_provider_event('{row_id}');",
+        expect="is not claimed for processing",
+    )
+
+    # An unverified event is never claimable in the first place, so it never
+    # reaches settle either.
+    unverified = scalar(
+        db,
+        """SELECT (e.event_id::text) AS joined
+             FROM app.ingest_provider_event(
+               'mock', 'evt-unverified', 'transfer.success', now(),
+               '{"reference":"settle-ref-1"}'::jsonb) e;""",
+    )
+    must_succeed(
+        db,
+        "claiming nothing while an unverified event waits",
+        "SELECT count(*) FROM app.claim_provider_event() WHERE signature_verified;",
+    )
+    must_fail(
+        db,
+        "settling an unverified event",
+        f"SELECT app.settle_provider_event('{unverified}');",
+        expect="unverified signature",
+    )
+
+    return (
+        "a verified but unclaimed event cannot be settled, and an unverified event "
+        "is never handed out by the claim at all -- so the lease, not convention, is "
+        "what serialises settlement"
+    )
+
+
+@case("a webhook for a reference we do not have waits instead of failing")
+def _settlement_waits_for_the_payment(db: str) -> str:
+    """
+    The provider can confirm a transfer faster than we finish writing the pending
+    payment that names it. Treating that race as a permanent failure drops a real
+    payment on the floor, so the event goes back on the queue with a backoff.
+
+    Bounded, though: unbounded retry on a reference that will never appear turns
+    one bad webhook into a permanent row somebody has to notice and clear.
+    """
+    _pending_money_ajo(db)
+
+    event_id = _verified_event(db, "settle-ref-never-arrives", event_id="evt-never-arrives")
+
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{event_id}');")
+    if "no matching payment" not in outcome:
+        raise Failure(f"an unmatched reference returned {outcome!r}")
+
+    status = scalar(
+        db,
+        f"""SELECT status::text || '|' || (next_retry_at > now())::text || '|'
+                  || (error_detail LIKE '%settle-ref-never-arrives%')::text
+              FROM webhook_events WHERE id = '{event_id}';""",
+    )
+    if status != "received|true|true":
+        raise Failure(
+            f"an unmatched event reads {status}; it should go back on the queue "
+            "with a backoff and the missing reference named"
+        )
+
+    # Backed off, so the claim does not hand it straight back out.
+    must_succeed(
+        db,
+        "claiming after a deferral",
+        f"SELECT count(*) FROM app.claim_provider_event() WHERE id = '{event_id}';",
+    )
+    if scalar(
+        db, f"SELECT status::text FROM webhook_events WHERE id = '{event_id}';"
+    ) != "received":
+        raise Failure("a deferred event was claimed again before its retry was due")
+
+    # Bounded in attempts as well as in time.
+    must_succeed(
+        db,
+        "giving up after too many attempts",
+        transaction(
+            f"""UPDATE webhook_events SET attempts = 8 WHERE id = '{event_id}';
+                SELECT app.defer_provider_event('{event_id}', 'still nothing');"""
+        ).replace("ROLLBACK;", "COMMIT;"),
+    )
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{event_id}';") != "failed":
+        raise Failure("an event retried eight times did not give up")
+
+    return (
+        "a reference with no matching payment goes back on the queue with an "
+        "exponential backoff and is not handed out again until it is due, and gives "
+        "up after eight attempts rather than retrying forever"
+    )
+
+
+@case("one provider's reference cannot settle another provider's payment")
+def _settlement_is_scoped_to_the_provider(db: str) -> str:
+    """
+    Two providers can legitimately hand out the same reference. Matching on the
+    reference alone would let one provider's webhook settle a payment another
+    provider was asked to collect -- which is the failure mode that makes a
+    multi-provider system unsafe rather than merely redundant.
+    """
+    _pending_money_ajo(db, reference="settle-ref-scope", group=4)
+
+    # A second provider's payment, same reference, different contribution.
+    must_succeed(
+        db,
+        "a second provider holding the same reference",
+        """INSERT INTO payments (
+             contribution_id, channel_id, idempotency_key, provider,
+             provider_reference, contribution_amount_kobo, status
+           )
+           SELECT c.id, ch.id, 'idem-settle-other', 'other_provider', 'settle-ref-scope',
+             500000, 'pending'
+             FROM contributions c, payment_channels ch
+            WHERE c.round_id = (SELECT c2.round_id FROM payments p
+                                   JOIN contributions c2 ON c2.id = p.contribution_id
+                                  WHERE p.provider = 'mock'
+                                    AND p.provider_reference = 'settle-ref-scope')
+              AND ch.code = 'bank_transfer';""",
+    )
+
+    # Scoped to mock's payment and measured either side of this case. Counting the
+    # ledger as a whole reads the first case's capture and reports it as this
+    # case's doing -- the same shared-database trap as before, in a test written
+    # specifically to check that nothing else moved.
+    def _mock_entries() -> int:
+        return int(
+            scalar(
+                db,
+                """SELECT count(*)::text FROM ledger_transactions t
+                     JOIN payments p ON p.id = t.payment_id
+                    WHERE p.provider = 'mock' AND p.provider_reference = 'settle-ref-scope';""",
+            )
+        )
+
+    before = _mock_entries()
+    event_id = _verified_event(
+        db, "settle-ref-scope", provider="other_provider", amount=510000,
+        event_id="evt-other-provider",
+    )
+
+    # This one is amount-matched for its own payment, so the scope test has to be
+    # about which row moves, not about the amount check catching it first.
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{event_id}');")
+    if _mock_entries() != before:
+        raise Failure("another provider's webhook settled a payment belonging to mock")
+
+    if scalar(
+        db,
+        "SELECT status::text FROM payments WHERE provider = 'mock' "
+        "AND provider_reference = 'settle-ref-scope';",
+    ) != "pending":
+        raise Failure("another provider's webhook settled mock's payment")
+
+    return (
+        "a webhook scoped to one provider leaves the same reference under another "
+        "provider unsettled, so a shared reference cannot cross providers"
+    )
+
+
+@case("a settled payment is not walked back by a later contradictory webhook")
+def _settlement_records_contradictions(db: str) -> str:
+    """
+    Spec §13.5 resolves out-of-order delivery by the terminal state. But "resolved"
+    is not the same as "not worth recording": the provider saying `failed` for a
+    transfer we have captured is a discrepancy a human has to look at, and if it is
+    filed as routine no-change it disappears.
+
+    So the state stands, the ledger is untouched, and the event carries both
+    figures for E3-08. This case exists because the first version of 107 checked
+    for the contradiction *after* the no-change branch, where
+    `resolve_transfer_state` had already guaranteed it could never be reached.
+    """
+    _pending_money_ajo(db, reference="settle-ref-contradiction", group=5)
+
+    first = _verified_event(
+        db, "settle-ref-contradiction", event_id="evt-settle-success"
+    )
+    must_succeed(db, "capturing the first success", f"SELECT app.settle_provider_event('{first}');")
+
+    before = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;"))
+    second = _verified_event(
+        db, "settle-ref-contradiction", state="failed", event_id="evt-settle-failed-later"
+    )
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{second}');")
+
+    if "contradiction" not in outcome:
+        raise Failure(
+            f"a failure arriving after a captured success returned {outcome!r}; "
+            "the state stands, but the contradiction has to be recorded"
+        )
+
+    if int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;")) != before:
+        raise Failure("a later contradictory webhook moved the ledger")
+
+    if scalar(
+        db, "SELECT status::text FROM payments WHERE provider_reference = 'settle-ref-contradiction';"
+    ) != "success":
+        raise Failure("a later failure walked back a captured payment")
+
+    detail = scalar(db, f"SELECT error_detail FROM webhook_events WHERE id = '{second}';")
+    if "success" not in detail or "failed" not in detail:
+        raise Failure(f"the contradiction does not record both states: {detail!r}")
+
+    # Processed, not failed: a third delivery would not resolve it, and retrying
+    # would re-report it forever.
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{second}';") != "processed":
+        raise Failure("the contradictory event was left retryable")
+
+    return (
+        "a failure arriving after a captured success leaves the payment and the "
+        "ledger exactly as they were, records both states on the event, and files it "
+        "as processed rather than retrying a contradiction forever"
+    )
+
+
+@case("a capture from a webhook is audited as a webhook")
+def _settlement_audits_the_actor(db: str) -> str:
+    """
+    `audit_logs.actor_type` has always allowed `webhook` and nothing could ever
+    write it: `app.audit_row()` mapped the GUC's two values onto two of the four
+    and sent everything else to `service`. So the first money this system posts
+    from a provider confirmation would have been filed as indistinguishable from a
+    cron job -- on the one table where the distinction is the whole point.
+    """
+    _pending_money_ajo(db, reference="settle-ref-untyped", group=6)
+    event_id = _verified_event(db, "settle-ref-untyped", event_id="evt-no-actor-type")
+
+    # Without the GUC set, the default path applies and this must NOT claim a
+    # webhook did it.
+    must_succeed(
+        db,
+        "settling without an actor type",
+        transaction(f"SELECT app.settle_provider_event('{event_id}');"),
+    )
+    default_actor = scalar(
+        db,
+        """SELECT COALESCE((
+             SELECT actor_type::text FROM audit_logs a
+               JOIN ledger_transactions t ON t.id = a.subject_id
+              WHERE a.subject_type = 'ledger_transaction'
+              ORDER BY a.created_at DESC LIMIT 1), 'none');""",
+    )
+    if default_actor == "webhook":
+        raise Failure("a settlement with no actor type was audited as a webhook")
+
+    _pending_money_ajo(db, reference="settle-ref-audited", group=7)
+    actor_event = _verified_event(db, "settle-ref-audited", event_id="evt-audited")
+    must_succeed(
+        db,
+        "settling as a webhook",
+        transaction(
+            f"""SELECT set_config('app.actor_type', 'webhook', false);
+                SELECT app.settle_provider_event('{actor_event}');"""
+        ).replace("ROLLBACK;", "COMMIT;"),
+    )
+
+    if scalar(
+        db,
+        """SELECT count(*)::text FROM audit_logs WHERE actor_type = 'webhook';""",
+    ) == "0":
+        raise Failure(
+            "nothing was audited as a webhook; the provider confirmation and the "
+            "settlement are indistinguishable from a background job in the trail"
+        )
+
+    return (
+        "a capture driven by a verified provider event is audited with "
+        "actor_type 'webhook', and one with no actor type set is not"
+    )
+
+
+@case("an event whose settlement raises is given up on, not retried forever")
+def _settlement_that_raises_is_bounded(db: str) -> str:
+    """
+    Retry bounds live in `app.defer_provider_event`, which only runs on the paths
+    that reach it. An event whose settlement *raises* never gets there: the caller's
+    transaction rolls back, the event is still `processing`, and the next drain
+    reclaims it.
+
+    The trigger is real rather than contrived. Two pending payments on one
+    contribution, both confirmed, is exactly what a double transfer produces, and
+    the second capture violates `payments_one_success_per_contribution` forever.
+    Nothing about attempt nine resolves it, so the ceiling belongs in the claim
+    and the exhausted row has to end up somewhere a person will find it.
+    """
+    _pending_money_ajo(db, reference="exhaust-first", group=8)
+
+    # A second pending payment on the same contribution, same provider, different
+    # reference. The fixture derives its idempotency key from the reference, so
+    # this is a real row and not a silent no-op.
+    must_succeed(
+        db,
+        "a second pending payment on the same contribution",
+        f"""INSERT INTO payments (
+             contribution_id, channel_id, idempotency_key, provider,
+             provider_reference, contribution_amount_kobo, status
+           )
+           SELECT c.id, ch.id, 'idem-exhaust-second', 'mock', 'exhaust-second',
+             1000000, 'pending'
+             FROM contributions c, payment_channels ch
+            WHERE c.round_id = '{_settle_round(8)}' AND ch.code = 'bank_transfer';""",
+    )
+
+    first = _verified_event(db, "exhaust-first", event_id="evt-exhaust-first")
+    must_succeed(
+        db,
+        "the first capture on that contribution",
+        # Committed, not rolled back like `transaction()` does by default: the
+        # whole case depends on the contribution being paid afterwards, and an
+        # unpaid contribution lets the second capture succeed where it must raise.
+        transaction(f"SELECT app.settle_provider_event('{first}');").replace(
+            "ROLLBACK;", "COMMIT;"
+        ),
+    )
+
+    # `_verified_event` ingests, verifies and claims, so the event starts claimed.
+    second = _verified_event(db, "exhaust-second", event_id="evt-exhaust-raises")
+
+    def _reclaim() -> str:
+        return scalar(
+            db,
+            f"SELECT count(*)::text FROM app.claim_provider_event() WHERE id = '{second}';",
+        )
+
+    # Every attempt raises the same way, and nothing about it is retried forever.
+    raised = 0
+    for _ in range(12):
+        outcome = scalar(db, f"SELECT app.settle_provider_event('{second}');")
+        if "payments_one_success_per_contribution" in outcome:
+            raised += 1
+
+        # The claim leased the event five minutes out, so the reclaim skips it --
+        # correct, and why this loop would otherwise stop after one attempt. The
+        # lease is fast-forwarded instead of slept through, which is the state a
+        # worker that died mid-settlement leaves behind.
+        must_succeed(
+            db,
+            "letting the lease expire",
+            f"""UPDATE webhook_events
+                   SET next_retry_at = now() - interval '1 second'
+                 WHERE id = '{second}';""",
+        )
+        if _reclaim() == "0":
+            break
+
+    if raised == 0:
+        raise Failure("the duplicate capture did not raise; nothing was bounded")
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{second}';") != "failed":
+        raise Failure(
+            "an event whose settlement kept raising was still claimable after "
+            f"{raised} attempts, so the queue would run it forever"
+        )
+
+    if "gave up" not in scalar(
+        db, f"SELECT error_detail FROM webhook_events WHERE id = '{second}';"
+    ):
+        raise Failure("the exhausted event did not say why it stopped")
+
+    return (
+        "a settlement that raises every time is claimed eight times and then filed "
+        "as failed with the reason, rather than staying processing forever"
     )
 
 
