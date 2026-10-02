@@ -1,16 +1,60 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { describe, it } from 'node:test';
-import { WebhookSignatureError } from '../src/financial-provider.js';
-import { MockFinancialProvider, ProductionGuardError } from '../src/mock-provider.js';
-import { naira } from '../src/money.js';
+import {
+  MockFinancialProvider,
+  ProductionGuardError,
+} from '../src/mock-provider.js';
+import { runProviderContract, type ProviderHarness } from './provider-contract.js';
+import type { TransferState } from '../src/financial-provider.js';
 
-const AMOUNT = naira(200_000);
+/**
+ * The mock adapter, held to the same contract as any real provider.
+ *
+ * Every assertion below runs through `runProviderContract`, which is the same
+ * suite a ProvidusUnity adapter will be given. If that adapter later changes
+ * behaviour the business logic depends on, it fails here rather than in
+ * production.
+ */
+const harness: ProviderHarness = {
+  build: () => MockFinancialProvider.create({ secret: 'contract-suite-secret' }),
+
+  signedWebhook: async (provider, reference, state = 'SUCCESS') => {
+    const mock = provider as MockFinancialProvider;
+    return mock.buildWebhook(reference, state);
+  },
+
+  // Signed under a different key rather than corrupted, so this exercises the
+  // failure a leaked or rotated secret produces -- which is the one an attacker
+  // actually achieves -- rather than a malformed header.
+  //
+  // The signature is computed directly rather than by asking a second mock to
+  // build the body: a second mock has never seen this transfer and would refuse.
+  // An earlier version of this harness signed the body with the *live* provider's
+  // own `sign`, which produced a perfectly valid signature and therefore tested
+  // nothing while appearing to work.
+  misSignedWebhook: async (provider, reference) => {
+    const live = provider as MockFinancialProvider;
+    const event = live.buildWebhook(reference, 'SUCCESS');
+    return {
+      ...event,
+      signatureHeader: createHmac('sha256', 'a-different-secret')
+        .update(event.rawBody, 'utf8')
+        .digest('hex'),
+    };
+  },
+};
+
+runProviderContract('MockFinancialProvider', harness);
 
 describe('MockFinancialProvider safety guards', () => {
   it('refuses to construct under NODE_ENV=production', () => {
     assert.throws(() => MockFinancialProvider.assertNotProduction('production'), ProductionGuardError);
-    assert.doesNotThrow(() => MockFinancialProvider.assertNotProduction('development'));
-    assert.doesNotThrow(() => MockFinancialProvider.assertNotProduction('test'));
+  });
+
+  it('constructs outside production', () => {
+    MockFinancialProvider.assertNotProduction('test');
+    assert.ok(MockFinancialProvider.create());
   });
 
   it('labels its output so it can never be mistaken for real money', () => {
@@ -24,114 +68,61 @@ describe('MockFinancialProvider safety guards', () => {
   });
 });
 
-describe('MockFinancialProvider idempotency', () => {
-  it('returns the same payout reference on retry', async () => {
-    const provider = MockFinancialProvider.create();
-    const command = {
-      idempotencyKey: 'payout:ajo1:1:m1',
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
-    };
-
-    const first = await provider.initiatePayout(command);
-    const retry = await provider.initiatePayout(command);
-
-    assert.equal(first.providerReference, retry.providerReference);
-  });
-
-  it('issues distinct references for distinct idempotency keys', async () => {
-    const provider = MockFinancialProvider.create();
-    const base = {
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
-    };
-    const a = await provider.initiatePayout({ ...base, idempotencyKey: 'payout:a' });
-    const b = await provider.initiatePayout({ ...base, idempotencyKey: 'payout:b' });
-    assert.notEqual(a.providerReference, b.providerReference);
-  });
-
-  it('surfaces retryable provider failures', async () => {
+describe('MockFinancialProvider failure injection', () => {
+  it('surfaces a simulated failure as retryable', async () => {
+    // The contract suite cannot dictate when a provider fails, so the mock's
+    // failure path is asserted here instead. This is the path the notification
+    // worker's own retry loop depends on, and it is the reason the mock accepts
+    // `failNext` at all.
     const provider = MockFinancialProvider.create({ failNext: 1 });
     await assert.rejects(
       () =>
-        provider.initiatePayout({
-          idempotencyKey: 'payout:retry',
-          destinationAccountNumber: '0000001',
-          amount: AMOUNT,
-          reference: 'AJO-1',
-          callbackUrl: 'https://example.test/hook',
+        provider.initiateCollection({
+          idempotencyKey: 'mock-fail-1',
+          accountNumber: '000000001',
+          amount: 1000 as never,
+          reference: 'AJO/MOCK/FAIL',
+          callbackUrl: 'https://example.ng/hooks',
         }),
-      /simulated provider failure/,
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as { retryable?: boolean }).retryable, true);
+        return true;
+      },
     );
+
+    // And the retry after the simulated outage succeeds, which is the whole
+    // point of the flag being true.
+    const transfer = await provider.initiateCollection({
+      idempotencyKey: 'mock-fail-1',
+      accountNumber: '000000001',
+      amount: 1000 as never,
+      reference: 'AJO/MOCK/FAIL',
+      callbackUrl: 'https://example.ng/hooks',
+    });
+    assert.ok(transfer.providerReference.startsWith('MOCK-'));
   });
 });
 
-describe('Webhook signature verification', () => {
-  it('accepts a correctly signed webhook', async () => {
-    const provider = MockFinancialProvider.create({ secret: 'test-secret' });
-    const transfer = await provider.initiatePayout({
-      idempotencyKey: 'payout:ajo1:1:m1',
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
+describe('MockFinancialProvider transfer states', () => {
+  it('builds a webhook in a requested state, so out-of-order delivery is testable', async () => {
+    // Spec §13.5 requires that "a success arriving after a failure for the same
+    // reference is resolved by the terminal state, not by arrival order". That
+    // rule is enforced above this seam, but it can only be exercised if the
+    // provider can be made to say either thing -- so the mock must be able to.
+    const provider = MockFinancialProvider.create();
+    const transfer = await provider.initiateCollection({
+      idempotencyKey: 'mock-states-1',
+      accountNumber: '000000001',
+      amount: 1000 as never,
+      reference: 'AJO/MOCK/STATES',
+      callbackUrl: 'https://example.ng/hooks',
     });
 
-    const event = provider.buildWebhook(transfer.providerReference, 'SUCCESS');
-    await assert.doesNotReject(() => provider.parseWebhook(event));
-  });
-
-  it('rejects a tampered body', async () => {
-    const provider = MockFinancialProvider.create({ secret: 'test-secret' });
-    const transfer = await provider.initiatePayout({
-      idempotencyKey: 'payout:ajo1:1:m1',
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
-    });
-    const event = provider.buildWebhook(transfer.providerReference, 'SUCCESS');
-
-    const tampered = { ...event, rawBody: event.rawBody.replace('SUCCESS', 'FAILED') };
-    await assert.rejects(() => provider.parseWebhook(tampered), WebhookSignatureError);
-  });
-
-  it('rejects an invalid signature', async () => {
-    const provider = MockFinancialProvider.create({ secret: 'test-secret' });
-    const transfer = await provider.initiatePayout({
-      idempotencyKey: 'payout:ajo1:1:m1',
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
-    });
-    const event = provider.buildWebhook(transfer.providerReference, 'SUCCESS');
-
-    await assert.rejects(
-      () => provider.parseWebhook({ ...event, signatureHeader: 'deadbeef' }),
-      WebhookSignatureError,
-    );
-  });
-
-  it('rejects a webhook signed with the wrong secret', async () => {
-    const honest = MockFinancialProvider.create({ secret: 'secret-a' });
-    const attacker = MockFinancialProvider.create({ secret: 'secret-b' });
-    const transfer = await honest.initiatePayout({
-      idempotencyKey: 'payout:ajo1:1:m1',
-      destinationAccountNumber: '0000001',
-      amount: AMOUNT,
-      reference: 'AJO-1',
-      callbackUrl: 'https://example.test/hook',
-    });
-    const event = honest.buildWebhook(transfer.providerReference, 'SUCCESS');
-
-    await assert.rejects(
-      () => attacker.parseWebhook(event),
-      WebhookSignatureError,
-    );
+    for (const state of ['PENDING', 'SUCCESS', 'FAILED', 'REVERSED', 'UNKNOWN'] as TransferState[]) {
+      const event = provider.buildWebhook(transfer.providerReference, state);
+      const parsed = await provider.parseWebhook(event);
+      assert.equal(parsed.state, state);
+    }
   });
 });

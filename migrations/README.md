@@ -58,8 +58,62 @@ its own foreign keys by hand without a great deal of care. The result is
 | `103_login_refresh` | login, refresh rotation, the spent-token ledger that makes replay observable, and the narrow migrator grants the two unauthenticated functions need |
 | `104_security_notifications` | the security notification templates, the `audit_logs` trigger that enqueues both alarms in the revocation's own transaction, new-device recognition, and the drain/lease/mark functions the delivery worker calls |
 | `105_ledger_write_path` | the first writer for the two ledger tables: a balanced-entry primitive closed to `PUBLIC` and to `ajo_app`, the BR-021 capture that posts `contribution.received` then `fee.recognised`, the guard on `rounds.fee_collected_kobo`, and the migrator row policies both definer functions need |
+| `106_provider_event_intake` | provider-agnostic webhook intake: an unverified event recorded first, verification as a separate auditable act that names its algorithm, the five-minute replay window, one row per `provider_event_id` with `is_new` separating a first sighting from a redelivery, unknown event types ignored with a reason, a gate that refuses anything not verified and still open, and terminal-state resolution |
 
 Deferred objects come last because they reference things created above them.
+
+## Why `106` stores an event before verifying it
+
+Section 13.5 says to verify the signature first and parse only after, and `106` does
+neither in that order. It records the raw body and the event name, then verifies as a
+separate call.
+
+The database cannot verify a provider HMAC. It has no access to the raw request body
+and no access to the provider's signing secret, so the only honest statement it can make
+about an incoming event is "this is what arrived". Handing that event a
+`signature_verified = true` on the way in would mean taking the caller's word for the one
+field the whole money path hangs on, and it would make the trusted state reachable by
+passing a boolean.
+
+So the event lands unverified, and verification is a second call that must name the
+algorithm which did it. That is strictly stronger than a boolean argument: it is
+recorded, it is auditable, an unverified event cannot be acted on even by accident, and a
+provider redelivering the same good webhook is verified again rather than refused. The
+HTTP layer computes the HMAC over the raw body and calls `app.mark_provider_event_verified`.
+
+What this costs is that the row exists before it is known to be genuine, so the endpoint
+that calls it needs per-IP rate limiting and a retention policy. That is stated in `E3-04`
+rather than left implicit.
+
+## Three things `106` got wrong first
+
+**`RAISE` has no type specifiers.** `'...past the %s replay window'` does not mean "string"
+there. `%` substitutes the next argument and the `s` is then emitted as a literal, so the
+error read `past the 5 minutess replay window`. `format()` has the type characters;
+`RAISE` does not, and it fails quietly — the message still arrives, just wrong. That is
+`format()`'s syntax mistaken for `RAISE`'s, and nothing else would ever have noticed.
+
+**A function is executable by `PUBLIC` whether or not the migration mentions it.**
+PostgreSQL grants `EXECUTE` on a new function to `PUBLIC` at creation. `106` originally
+left `assert_provider_event_verified` unmentioned on the grounds that it is `STABLE` and
+not `SECURITY DEFINER` so it needs no row policy — which is true, and unrelated. The
+question is who may call it, and the answer had been yes, anyone. Any role could ask about
+any event id and learn whether it exists and was verified. Not the money, but it is the
+shape of the table, and it is free to close.
+
+**A grant to `PUBLIC` does not survive a role bootstrap.** `resolve_transfer_state` reads
+no table and could safely be public, and it was granted that way at first. But
+`bootstrap_roles.sql` revokes `PUBLIC` from every function in the schema and then grants
+only `ajo_app`, so that grant would hold until the next role bootstrap and silently not
+after it — the same class of bug as `105`'s ledger primitive being reopened by a blanket
+grant. It is now `ajo_app` only, and the test asserts it stays closed to `PUBLIC` after a
+bootstrap has run.
+
+And the test that caught all three would have caught none of them if it had asserted
+privileges by calling the functions and watching them fail: this suite connects as the
+postgres superuser, and a superuser can execute anything regardless of its grants. The
+grants are read out of `pg_proc` with `has_function_privilege`, and the first version of
+that case — which called them and watched — reported a `PUBLIC`-exposed resolver as closed.
 
 ## The two vocabularies called `actor_type`
 

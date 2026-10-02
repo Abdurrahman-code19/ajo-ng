@@ -58,8 +58,19 @@ export class MockFinancialProvider implements FinancialProvider {
 
   readonly #secret: string;
   readonly #accounts = new Map<string, CollectionAccount>();
+  readonly #accountNumbers = new Map<string, string>();
   readonly #transfers = new Map<string, Transfer>();
-  readonly #idempotency = new Map<string, Transfer>();
+  // Two stores rather than one, and this is not tidiness.
+  //
+  // A single map keyed only by the caller's idempotency key is a global key
+  // space: `initiateCollection({idempotencyKey: 'k'})` followed by
+  // `initiatePayout({idempotencyKey: 'k'})` returns the *inbound* transfer for the
+  // payout. A payout that reports success and moves no money is the worst
+  // possible failure for this system to have, and it is reachable from an
+  // upstream bug that reuses a key. Transfers are therefore stored under a
+  // per-operation key, so a collection and a payout can never alias.
+  readonly #accountIdempotency = new Map<string, string>();
+  readonly #transferIdempotency = new Map<string, Transfer>();
   #failuresRemaining: number;
   #counter = 1;
   readonly #latencyMs: number;
@@ -109,10 +120,14 @@ export class MockFinancialProvider implements FinancialProvider {
     command: CreateCollectionAccountCommand,
   ): Promise<CollectionAccount> {
     await this.#maybeFail();
-    const existingKey = `acct:${command.idempotencyKey}`;
-    const prior = this.#idempotency.get(existingKey);
+    const prior = this.#accountIdempotency.get(command.idempotencyKey);
     if (prior !== undefined) {
-      const account = this.#accounts.get(prior.providerReference);
+      // Indexed by providerAccountId, not accountNumber. It used to be indexed
+      // by accountNumber and looked up by providerAccountId, so this branch
+      // never found anything and every retry quietly opened a second account --
+      // the exact opposite of what an idempotency key is for. The contract suite
+      // found it; the previous tests never retried a create.
+      const account = this.#accounts.get(prior);
       if (account !== undefined) {
         return account;
       }
@@ -125,19 +140,17 @@ export class MockFinancialProvider implements FinancialProvider {
       bankName: 'Mock Bank',
       status: 'PENDING_VERIFICATION',
     };
-    this.#accounts.set(account.accountNumber, account);
-    this.#idempotency.set(existingKey, {
-      providerReference: account.providerAccountId,
-      idempotencyKey: existingKey,
-      amount: 0 as Kobo,
-      state: 'SUCCESS',
-    });
+    this.#accounts.set(account.providerAccountId, account);
+    this.#accountNumbers.set(account.accountNumber, account.providerAccountId);
+    this.#accountIdempotency.set(command.idempotencyKey, account.providerAccountId);
     return account;
   }
 
   async verifyAccount(accountNumber: string): Promise<{ valid: boolean; accountName?: string }> {
     await this.#maybeFail();
-    const account = this.#accounts.get(accountNumber);
+    const providerAccountId = this.#accountNumbers.get(accountNumber);
+    const account =
+      providerAccountId === undefined ? undefined : this.#accounts.get(providerAccountId);
     if (account === undefined) {
       return { valid: false };
     }
@@ -153,12 +166,12 @@ export class MockFinancialProvider implements FinancialProvider {
   }
 
   async #transfer(idempotencyKey: string, amount: Kobo, prefix: string): Promise<Transfer> {
-    const existing = this.#idempotency.get(idempotencyKey);
+    // Scoped by operation. See the note on `#transferIdempotency`: a key that
+    // means "this collection" must not also mean "this payout".
+    const scopedKey = `${prefix}:${idempotencyKey}`;
+    const existing = this.#transferIdempotency.get(scopedKey);
     if (existing !== undefined) {
-      const transfer = this.#transfers.get(existing.providerReference);
-      if (transfer !== undefined) {
-        return transfer;
-      }
+      return existing;
     }
     await this.#maybeFail();
 
@@ -170,7 +183,7 @@ export class MockFinancialProvider implements FinancialProvider {
       settledAt: new Date(),
     };
     this.#transfers.set(transfer.providerReference, transfer);
-    this.#idempotency.set(idempotencyKey, transfer);
+    this.#transferIdempotency.set(scopedKey, transfer);
     return transfer;
   }
 

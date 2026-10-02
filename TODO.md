@@ -50,10 +50,10 @@ them:
 | | |
 |---|---|
 | Specification | Complete — 26 sections, ~238k words, 445 tables |
-| Database | **43 tables, 83 policies, 126 triggers** across 23 migration sets — built and enforced |
+| Database | **43 tables, 87 policies, 126 triggers** across 24 migration sets — built and enforced |
 | Ledger | **Writable.** Migration `105` recognises a provider-confirmed capture as two balanced entries, itemises the fee, and refuses a replay. Nothing had ever written to `ledger_transactions` before it. |
 | API | 81 integration tests green; auth, sessions, rate limiting, audit and security notifications shipped. Payments, Ajos, contributions and payouts still have no HTTP surface. |
-| Domain core | 2,018 lines, 70 tests passing |
+| Domain core | 2,018 lines, 84 tests passing, including a reusable provider contract suite |
 | Web / admin | Not started |
 | Mobile | Not started |
 | Legal | **0 of 15 items cleared** — gates launch independently of engineering |
@@ -151,6 +151,14 @@ cleared.**
       schedule, settlement behaviour — **or a documented decision to use a different provider**
 - [ ] Never invent ProvidusUnity behaviour. `MockFinancialProvider` refuses production use for
       exactly this reason.
+- **Nothing has been received from ProvidusUnity.** No sandbox specification, no API
+  documentation, no credentials, no callback or signature format, no fee schedule. This is
+  the current blocker on `E3-02` and on wiring `E3-04` to real money, and it is why
+  `E3-04` is deliberately provider-agnostic: it takes a `provider` name and a raw payload
+  and asserts nothing about either. The one behaviour it does have to guess — whether a
+  success after a failure for one reference settles or not — is marked provisional in
+  `TODO` and in `migrations/106_provider_event_intake/001_provider_event_intake.sql` and has
+  to be confirmed before it touches money.
 
 ---
 
@@ -292,9 +300,21 @@ Enforced by the database, not just by the domain:
 > and a replay of the same capture moving nothing. The provider adapter, the signed webhook and
 > the HTTP endpoint that calls it are still the work below.
 
-- [ ] `E3-02` `ProvidusFinancialProvider` adapter
-- [ ] `E3-03` Provider contract test suite
-- [ ] `E3-04` Webhook verification, replay protection, idempotency, out-of-order handling
+- [ ] `E3-02` `ProvidusFinancialProvider` adapter — **blocked on `E3-01`**
+- [x] `E3-03` Provider contract test suite — `packages/domain/test/provider-contract.ts`, one
+      suite every adapter must pass: account lookup and retry, per-operation idempotency,
+      idempotency keys that cannot be aliased across operations, raw-body signature
+      verification with a wrong-secret and a tampered-body negative, state mapping, and
+      failure surfacing. `MockFinancialProvider` passes it, so the adapter written in
+      `E3-02` cannot quietly disagree with the money path.
+- [ ] `E3-04` Webhook verification, replay protection, idempotency, out-of-order handling —
+      the database half is migration `106`: unverified intake, an auditable separate
+      verification act that records its algorithm, the five-minute replay window, one row
+      per `provider_event_id` with `is_new` distinguishing a first sighting from a
+      redelivery, unknown event types ignored with a recorded reason, a gate that refuses
+      anything not verified and open, and terminal-state resolution. **Still to do:** the
+      HTTP endpoint, per-IP rate limiting, amount and reference reconciliation, and the
+      processing lease that calls `app.post_collection_capture`.
 - [ ] `E3-05` Collection initiation and pending contribution flow
 - [ ] `E3-06` Fee calculation and capture posting — itemised, never a hidden line
 - [ ] `E3-07` Escrow and settlement account setup — **no member funds in operating accounts, ever**

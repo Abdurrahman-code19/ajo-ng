@@ -3366,6 +3366,478 @@ def _fee_aggregate_backfill(db: str) -> str:
                        capture_output=True)
 
 
+# ---------------------------------------------------------------------------
+# Provider event intake (spec 13.5).
+# ---------------------------------------------------------------------------
+
+@case("a redelivered provider event is stored once and is not a second event")
+def _provider_event_dedupe(db: str) -> str:
+    """
+    Spec 13.5: "`provider_event_id` is uniquely indexed. A duplicate delivery is
+    acknowledged and dropped, not reprocessed."
+
+    The word doing the work is "delivery". Providers redeliver constantly -- a
+    timeout on our side, a retry, an at-least-once queue between us. A
+    redelivery is ordinary traffic, so it is neither an error nor a second
+    event, and the return value has to say which one it is without the caller
+    having to diff the table.
+    """
+    event = (
+        "SELECT (e.event_id::text || '|' || e.is_new::text) AS joined "
+        "FROM app.ingest_provider_event("
+        "'mock', 'evt-dedupe-1', 'transfer.success', now(), "
+        "'{\"reference\":\"MOCK-000001\"}'::jsonb) e;"
+    )
+
+    first = scalar(db, event)
+    if "true" not in first:
+        raise Failure(
+            f"the first delivery returned {first!r}; the first sighting of an event "
+            "is new, and a caller that thinks otherwise drops real money on the floor"
+        )
+
+    second = scalar(db, event)
+    if "true" in second:
+        raise Failure(
+            "a redelivery was reported as new; the caller would then drive a second "
+            "capture for one transfer"
+        )
+
+    # Same id both times: not merely "not new", but the same row, so the caller
+    # can go and look at what happened to it.
+    if first.split("|")[0] != second.split("|")[0]:
+        raise Failure(
+            f"the redelivery returned a different event id: {first} then {second}"
+        )
+
+    if scalar(db, "SELECT count(*) FROM webhook_events;") != "1":
+        raise Failure("a redelivery created a second row")
+
+    return (
+        "the same provider event delivered twice yields one row and one id, the "
+        "second reported as not new, which is what stops one transfer driving two "
+        "captures"
+    )
+
+
+@case("a provider event older than the replay window is refused")
+def _provider_event_replay_window(db: str) -> str:
+    """
+    Spec 13.5: "Reject any event whose timestamp is more than 5 minutes old."
+
+    A signature does not expire. An attacker who captures one valid webhook can
+    present it for as long as the key lives, and the only thing that stops a
+    captured success being replayed forever is refusing it once it is old.
+
+    The boundary is tested from both sides, because "more than five minutes" is
+    easy to implement as "at least five minutes" and that rejects deliveries the
+    specification allows.
+    """
+    must_succeed(
+        db,
+        "an event four minutes old",
+        """SELECT app.ingest_provider_event(
+              'mock', 'evt-replay-ok', 'transfer.success', now() - interval '4 minutes',
+              '{"reference":"MOCK-000002"}'::jsonb);""",
+    )
+
+    must_succeed(
+        db,
+        "an event one second inside the window",
+        """SELECT app.ingest_provider_event(
+              'mock', 'evt-replay-edge', 'transfer.success', now() - interval '299 seconds',
+              '{"reference":"MOCK-000002"}'::jsonb);""",
+    )
+
+    must_fail(
+        db,
+        "an event six minutes old",
+        """SELECT app.ingest_provider_event(
+              'mock', 'evt-replay-stale', 'transfer.success', now() - interval '6 minutes',
+              '{"reference":"MOCK-000002"}'::jsonb);""",
+        expect="past the five-minute replay window",
+    )
+
+    # Refused at the door, so nothing was stored -- a replay that is rejected
+    # after being written is a replay that briefly existed.
+    if scalar(db, "SELECT count(*) FROM webhook_events WHERE provider_event_id = 'evt-replay-stale';") != "0":
+        raise Failure("a stale replay was stored before being refused")
+
+    # A missing timestamp is not an escape hatch. If it is NULL the freshness
+    # comparison is NULL, the test above would silently pass, and an event with no
+    # timestamp would be accepted forever.
+    must_fail(
+        db,
+        "an event with no timestamp",
+        """SELECT app.ingest_provider_event(
+              'mock', 'evt-replay-notime', 'transfer.success', NULL,
+              '{"reference":"MOCK-000002"}'::jsonb);""",
+        expect="must carry the time it occurred",
+    )
+
+    return (
+        "an event four minutes old and one at 299 seconds are accepted, one at six "
+        "minutes is refused and stored nowhere, and an event with no timestamp is "
+        "refused rather than treated as fresh forever"
+    )
+
+
+@case("only a signature-verified provider event may be acted on")
+def _provider_event_verification_gate(db: str) -> str:
+    """
+    Spec 13.5 requires parsing only after verification, and treating the webhook
+    as hostile input. Nothing that moves money may read an event whose signature
+    has not been checked.
+
+    The design point is that verification is a separate call rather than a
+    boolean argument. `ingest_provider_event` has no parameter that can set the
+    flag, so an event cannot arrive already trusted -- the honest state is the
+    only reachable one, and becoming trusted is an auditable act.
+    """
+    event_id = scalar(
+        db,
+        """SELECT (e.event_id::text) AS joined
+             FROM app.ingest_provider_event(
+               'mock', 'evt-verify-1', 'transfer.success', now(),
+               '{"reference":"MOCK-000003"}'::jsonb) e;""",
+    )
+
+    if scalar(
+        db, f"SELECT signature_verified::text FROM webhook_events WHERE id = '{event_id}';"
+    ) != "false":
+        raise Failure(
+            "an ingested event is not unverified; the stored state has to be the "
+            "honest one, or a caller could pass a boolean and be believed"
+        )
+
+    # Acting on it is refused, by name.
+    must_fail(
+        db,
+        "acting on an unverified event",
+        f"SELECT app.assert_provider_event_verified('{event_id}');",
+        expect="has an unverified signature",
+    )
+
+    # And the other way: verification cannot be recorded without saying how.
+    must_fail(
+        db,
+        "verifying without naming an algorithm",
+        f"SELECT app.mark_provider_event_verified('{event_id}', NULL);",
+        expect="must record which algorithm verified it",
+    )
+
+    must_succeed(
+        db,
+        "verifying with the algorithm that did it",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+    )
+
+    if scalar(
+        db, f"SELECT signature_verified::text FROM webhook_events WHERE id = '{event_id}';"
+    ) != "true":
+        raise Failure("the event was not marked verified")
+
+    must_succeed(
+        db,
+        "acting on a verified event",
+        f"SELECT app.assert_provider_event_verified('{event_id}');",
+    )
+
+    # Redelivery is verified again rather than refused. A provider sending the
+    # same good webhook twice must not look like an attack.
+    must_succeed(
+        db,
+        "verifying an already-verified event",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+    )
+
+    # And an event the database has never heard of is not a verification.
+    must_fail(
+        db,
+        "acting on an event that does not exist",
+        "SELECT app.assert_provider_event_verified(gen_random_uuid());",
+        expect="no provider event with id",
+    )
+
+    return (
+        "an ingested event is unverified and cannot be acted on, verification is "
+        "refused without an algorithm and is idempotent, a verified event passes the "
+        "gate, and an unknown event id is not a pass"
+    )
+
+
+@case("an event type we do not implement is ignored, not refused")
+def _provider_event_unknown_type(db: str) -> str:
+    """
+    Spec 13.5: "Unknown event types: Acknowledged, logged, and ignored -- never a
+    4xx, and never a crash."
+
+    The failure this prevents is a specific and embarrassing one: the provider
+    adds an event type, starts sending it, our handler 4xx's or throws, and the
+    provider retries the unhandleable event indefinitely -- turning a routine
+    provider-side addition into an outage on our side.
+    """
+    event_id = scalar(
+        db,
+        """SELECT (e.event_id::text) AS joined
+             FROM app.ingest_provider_event(
+               'mock', 'evt-unknown-type', 'merchant.dispute.opened', now(),
+               '{"reference":"MOCK-000004","reason":"fraud_review"}'::jsonb) e;""",
+    )
+
+    # Accepted on arrival, whatever it says. Ingest never inspects the type.
+    must_succeed(
+        db,
+        "verifying an event type we do not implement",
+        f"SELECT app.mark_provider_event_verified('{event_id}', 'HMAC-SHA256');",
+    )
+
+    must_succeed(
+        db,
+        "ignoring it with the reason recorded",
+        f"""SELECT app.ignore_provider_event(
+              '{event_id}', 'event type merchant.dispute.opened is not implemented');""",
+    )
+
+    # Parenthesised: `||` binds tighter than `<>`, so without them this compares
+    # the concatenated string to '' and returns a bare boolean instead of the two
+    # values being asserted on.
+    outcome = scalar(
+        db,
+        f"SELECT status::text || '|' || (processed_at IS NOT NULL)::text "
+        f"FROM webhook_events WHERE id = '{event_id}';",
+    )
+    if not outcome.startswith("ignored|true"):
+        raise Failure(
+            f"the ignored event reads {outcome}; an unexplained gap in a provider's "
+            "events is undiagnosable six months later unless the ignore is recorded"
+        )
+
+    # Ignored is terminal for acting on it.
+    must_fail(
+        db,
+        "acting on an event that was ignored",
+        f"SELECT app.assert_provider_event_verified('{event_id}');",
+        expect="cannot be acted on again",
+    )
+
+    return (
+        "an unimplemented event type is accepted, verified, ignored with its reason "
+        "and timestamp recorded, and refused for further action -- so a provider "
+        "adding an event type cannot turn into a retry storm against us"
+    )
+
+
+@case("a settled payment is never unsettled by a later message")
+def _terminal_state_resolution(db: str) -> str:
+    """
+    Spec 13.5: "Out-of-order delivery: A success arriving after a failure for the
+    same reference is resolved by the terminal state, not by arrival order."
+
+    Providers do not deliver in order. A `pending` and a `success` can arrive
+    minutes apart in either order, and a webhook for a transfer that already
+    settled can arrive after we have written ledger entries against it.
+
+    The invariant is that a terminal payment state is never left. The member has
+    been told something and the ledger has been written; a later message that
+    disagrees cannot take that back.
+    """
+    checks = {
+        # A settled transfer stays settled, whatever turns up afterwards.
+        ("success", "pending"): "success",
+        ("success", "unknown"): "success",
+        ("success", "failed"): "success",
+        ("failed", "success"): "failed",
+        ("failed", "pending"): "failed",
+        ("reversed", "success"): "reversed",
+        ("cancelled", "success"): "cancelled",
+        # An unsettled transfer is settled by a terminal arrival.
+        ("pending", "success"): "success",
+        ("initiated", "failed"): "failed",
+        ("initiated", "success"): "success",
+        # And two unsettled states progress normally, or nothing ever settles.
+        ("initiated", "pending"): "pending",
+        ("initiated", "unknown"): "initiated",
+        ("pending", "unknown"): "pending",
+        ("unknown", "success"): "success",
+    }
+
+    for (current, incoming), expected in checks.items():
+        actual = scalar(
+            db,
+            "SELECT app.resolve_transfer_state("
+            f"'{current}'::public.payment_status, '{incoming}'::public.payment_status)::text;",
+        )
+        if actual != expected:
+            raise Failure(
+                f"current {current} then {incoming} resolved to {actual}, expected "
+                f"{expected}"
+            )
+
+    # The case that matters most in production: a transfer that has already been
+    # captured cannot be walked back by a late webhook. This is asserted through
+    # the whole path rather than the pure function alone, because the function
+    # being right does not stop a caller asking the wrong question.
+    _money_ajo(db)
+
+    # Success, not failure. The contribution is already captured, so a second
+    # call is a replay and idempotency means it returns the original entries. The
+    # version of this case that asserted a failure here was asserting the wrong
+    # thing: it would have passed if idempotency had been removed *and* if the
+    # guard had rejected replays, which are opposite behaviours.
+    # Success, not failure. The contribution is already captured, so a second
+    # call is a replay and idempotency means it returns the original entries. The
+    # version of this case that asserted a failure here was asserting the wrong
+    # thing: it would have passed if idempotency had been removed *and* if the
+    # guard had rejected replays, which are opposite behaviours.
+    #
+    # Compared against the ids the first capture returned rather than against a
+    # count. Every case shares one database, so a global `count(*)` is a moving
+    # target -- this case is about its own two entries, not about the table.
+    first = _capture(db)
+
+    before = int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;"))
+    postings_before = int(scalar(db, "SELECT count(*)::text FROM ledger_postings;"))
+
+    replayed = scalar(
+        db,
+        """SELECT array_to_string(
+                  app.post_collection_capture(
+                    (SELECT id FROM payments WHERE idempotency_key = 'idem-money-1'),
+                    (SELECT id FROM users WHERE email = 'money-a@example.ng')),
+                  ',') AS joined;""",
+    )
+
+    if replayed != first:
+        raise Failure(
+            f"replaying the capture returned {replayed} but the original returned "
+            f"{first}; a settled contribution has to be answered by returning the "
+            "entries already written for it"
+        )
+
+    # Nothing was written. Measured either side of the replay, so the cases that
+    # share this database cannot move the number out from under the comparison.
+    if int(scalar(db, "SELECT count(*)::text FROM ledger_transactions;")) != before:
+        raise Failure(
+            "the ledger gained an entry when a settled contribution was replayed"
+        )
+    if int(scalar(db, "SELECT count(*)::text FROM ledger_postings;")) != postings_before:
+        raise Failure(
+            "the ledger postings gained entries when a settled contribution was "
+            "replayed"
+        )
+
+    # And the contribution is still settled, not walked back to pending.
+    if scalar(db, f"SELECT status::text FROM contributions WHERE round_id = '{MONEY_ROUND}';") != "paid":
+        raise Failure(
+            "a later message moved a settled contribution off paid; the ledger "
+            "would then disagree with the contribution it was written for"
+        )
+
+    return (
+        "every combination of settled and unsettled resolves to the terminal state "
+        "in whichever order it arrived, unknown never overwrites a known state, and "
+        "a settled contribution cannot be walked back"
+    )
+
+
+@case("provider event intake is reachable by the app and nobody else")
+def _provider_event_grants(db: str) -> str:
+    """
+    Migration 105 taught this the hard way: a blanket grant in the role bootstrap
+    silently reopened a primitive that the migration had closed, so the money path
+    was callable by the application role and nobody noticed until the test read the
+    grants back out of the catalogue.
+
+    The grants are therefore asserted rather than assumed. And they are asserted
+    with `has_function_privilege` rather than by calling the functions and watching
+    them fail: this suite connects as the postgres superuser, and a superuser can
+    execute any function regardless of its grants. A `must_fail` on a function the
+    superuser is calling proves nothing at all -- the first version of this case
+    did exactly that and passed a PUBLIC-exposed resolver on its way to the next
+    assertion.
+    """
+    functions = (
+        ("app.ingest_provider_event", "text, text, text, timestamptz, jsonb, timestamptz"),
+        ("app.mark_provider_event_verified", "uuid, text"),
+        ("app.ignore_provider_event", "uuid, text"),
+        ("app.assert_provider_event_verified", "uuid"),
+        ("app.resolve_transfer_state", "public.payment_status, public.payment_status"),
+    )
+
+    # `ajo_api` is in the matrix as *allowed*, and that is not an oversight:
+    # bootstrap_roles.sql makes it a member of `ajo_app`, so it inherits every
+    # app privilege by design and is the role the HTTP server connects as. The
+    # first version of this case asserted it could not call these functions, which
+    # would have meant either dropping the webhook handler's role or removing the
+    # inheritance the login path depends on.
+    for fn, args in functions:
+        for role, expected in (
+            ("public", False),
+            ("ajo_analytics", False),
+            ("ajo_app", True),
+            ("ajo_api", True),
+        ):
+            actual = scalar(
+                db,
+                f"""SELECT has_function_privilege(
+                          '{role}', '{fn}({args})', 'EXECUTE');""",
+            ).strip()
+            if actual != ("t" if expected else "f"):
+                allowed = "can" if actual == "t" else "cannot"
+                should = "must be able to" if expected else "must not be able to"
+                raise Failure(
+                    f"{role} {allowed} call {fn}, but {role} {should} call it. "
+                    "PUBLIC includes every role nobody has written down yet, so an "
+                    "open function is open to roles that do not exist yet."
+                )
+
+    # The one place a bare `public` check is not enough: EXECUTE on a function is
+    # granted to PUBLIC automatically when the function is created, so "the
+    # migration did not mention PUBLIC" is not the same claim as "PUBLIC cannot
+    # call it". The catalogue says this one is closed, which is the claim worth
+    # making.
+    if scalar(
+        db,
+        """SELECT has_function_privilege(
+                  'public', 'app.resolve_transfer_state(public.payment_status, public.payment_status)',
+                  'EXECUTE');""",
+    ).strip() != "f":
+        raise Failure(
+            "PUBLIC can resolve a transfer state; bootstrap_roles.sql revokes it "
+            "again on the next run, so who can reach it would depend on when roles "
+            "were last bootstrapped"
+        )
+
+    # The migrator owns the table and has to reach every row regardless of the
+    # impersonated user, because a webhook has no member behind it. Without the
+    # policies the intake function fails as soon as the row is written, and that
+    # failure looks like a webhook bug rather than a grant one.
+    policies = int(
+        scalar(
+            db,
+            # `pg_policies`, not an information_schema view -- there is no
+            # `information_schema.row_security_policies` at all, so asking for one
+            # raises rather than answering.
+            "SELECT count(*)::text FROM pg_policies "
+            "WHERE tablename = 'webhook_events';",
+        )
+    )
+    if policies == 0:
+        raise Failure(
+            "webhook_events has no row policies; the migrator cannot reach the rows "
+            "it is inserting"
+        )
+
+    return (
+        "the application role and the API role that inherits it can call all five "
+        "intake functions, PUBLIC and the analytics role can call none of them, the "
+        "transfer-state resolver is closed to PUBLIC despite EXECUTE being granted "
+        "there automatically at creation, and webhook_events carries the migrator "
+        "policies the intake depends on"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")
