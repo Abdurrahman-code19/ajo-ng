@@ -50,14 +50,19 @@ them:
 | | |
 |---|---|
 | Specification | Complete — 26 sections, ~238k words, 445 tables |
-| Domain core | 2,018 lines, 61 tests passing |
-| Database | **0 of 40 tables built** |
-| API | **0 of 66 endpoints built** |
+| Database | **43 tables, 83 policies, 126 triggers** across 23 migration sets — built and enforced |
+| Ledger | **Writable.** Migration `105` recognises a provider-confirmed capture as two balanced entries, itemises the fee, and refuses a replay. Nothing had ever written to `ledger_transactions` before it. |
+| API | 81 integration tests green; auth, sessions, rate limiting, audit and security notifications shipped. Payments, Ajos, contributions and payouts still have no HTTP surface. |
+| Domain core | 2,018 lines, 70 tests passing |
 | Web / admin | Not started |
 | Mobile | Not started |
-| Legal | **0 of 15 items cleared** |
+| Legal | **0 of 15 items cleared** — gates launch independently of engineering |
 
-Verified at `fe884ae`: `npm run verify` → 61/61 pass.
+Verified: `npm run verify` → 70 domain + 37 API unit, 0 fail. `python3 scripts/test_api.py` →
+81/81. `python3 scripts/test_migrations.py` → 32/32.
+
+Not launch-ready, and the gap is not in the database. It is the payment provider, the HTTP
+surface over the money path, the frontend, and 15 legal items.
 
 ---
 
@@ -212,18 +217,26 @@ Enforced by the database, not just by the domain:
       runs a migration. Applied to `ajo`; 7 role cases assert it, including that the owner
       is neither superuser nor `BYPASSRLS` and that `ajo_app` sees 1 of 3 users where the
       owner sees 3.
-- [ ] **Write path for the five tables `096` deliberately leaves closed.** `payments`, `payouts`,
-      `ledger_transactions`, `ledger_postings` and `risk_events` have RLS and no `INSERT` policy,
-      so a non-owner cannot write them. This is correct today and is *not* an oversight, but it
-      means those tables are unwritable until the application layer that owns them exists. The
-      spec's `§9.6` table is headed "Who can read a row", so its "Nobody" is a statement about
-      `SELECT` and is not permission to write. No function in `app` writes any of the five --
-      the only writer the migrations create is `app.audit_row()`, which writes `audit_logs`.
-      The fix is `SECURITY DEFINER` functions that validate the entry (a balanced ledger
-      transaction, a closed round, a settled payment), **not** a grant to a role that already
-      holds DML on every table. `scripts/test_migrations.py` asserts these five stay closed, so
-      a later "just grant it" cannot land unnoticed. Who may write a payout is a product
-      decision and is not a detail to change in passing.
+- [x] **Write path for two of the five tables `096` deliberately leaves closed** — ledger half
+      delivered by migration `105`. `payments`, `payouts`, `ledger_transactions`,
+      `ledger_postings` and `risk_events` had RLS with no `INSERT` policy, so a non-owner could
+      not write them. The spec's `§9.6` table is headed "Who can read a row", so its "Nobody" is a
+      statement about `SELECT` and is not permission to write, and the fix the file named was
+      `SECURITY DEFINER` functions that validate the entry — **not** a grant to a role that
+      already holds DML on every table.
+  - **Delivered for `ledger_transactions` and `ledger_postings`.**
+    `app.post_ledger_transaction()` validates before it inserts: two or more postings, positive
+    amounts, debits equal credits. `app.post_collection_capture()` is the only thing `ajo_app`
+    may call, and it posts the two BR-021 entries for a provider-confirmed payment. The
+    primitive's `REVOKE` is re-stated in `bootstrap_roles.sql`, because that script's blanket
+    `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO ajo_app` was silently handing it back.
+  - The `096` test now asserts the thing that was always meant: not "no `INSERT` policy" but
+    "**no `INSERT` policy for `ajo_app`**, and `ajo_app` is refused at call time despite holding
+    full DML grants". `payments`, `payouts` and `risk_events` remain closed entirely.
+  - **Still open — `payments`, `payouts` and `risk_events`.** A payout is written by whoever
+    settles it, and risk events by fraud logic that does not exist. Neither has a validator to
+    be the owner of the write. Who may write a payout is a product decision and is not a detail
+    to change in passing.
 - [ ] Reconcile the column count: the adopted schema has **621** columns, the spec says 576.
       Tables, indexes, constraints, triggers and policies all match. Until this is resolved,
       treat the migrations as the source of truth for shape and the spec as the source of
@@ -272,6 +285,12 @@ Enforced by the database, not just by the domain:
 - [ ] `E2-11` Staff access review tooling
 
 ### Payments — E3
+
+> **Database side landed by migration `105`.** A provider-confirmed payment can now be
+> recognised as two balanced ledger entries — `contribution.received` then `fee.recognised`,
+> 2% itemised in `fees` — with the contribution marked `paid`, both round aggregates restated,
+> and a replay of the same capture moving nothing. The provider adapter, the signed webhook and
+> the HTTP endpoint that calls it are still the work below.
 
 - [ ] `E3-02` `ProvidusFinancialProvider` adapter
 - [ ] `E3-03` Provider contract test suite

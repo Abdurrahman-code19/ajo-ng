@@ -775,16 +775,22 @@ def _self_insert(db: str) -> str:
         expect="row-level security",
     )
 
-    # And the tables 096 deliberately leaves without an INSERT policy. These are
-    # the money and ledger tables, and asserting they are closed is what stops a
-    # later "just grant it" from going unnoticed.
-    for table in (
-        "payments",
-        "payouts",
-        "ledger_transactions",
-        "ledger_postings",
-        "risk_events",
-    ):
+    # And the tables 096 deliberately leaves without an INSERT policy. Asserting
+    # they are closed is what stops a later "just grant it" from going unnoticed.
+    #
+    # 105 moves two of them. Its own words for why is worth reading before
+    # changing anything here: "an INSERT policy for the application role would be
+    # the first thing in this schema to let a caller write an arbitrary ledger
+    # entry". That is precisely and only about the application role. 105 supplies
+    # the missing definer function, and the policy it adds is for `ajo_migrator`,
+    # the function's owner, which no request ever assumes.
+    #
+    # So the claim is restated at the level it was actually about rather than
+    # deleted. "No INSERT policy at all" was a proxy for "the API cannot write
+    # this"; now that a legitimate writer exists, the proxy is wrong and the thing
+    # it stood for is asserted directly. Deleting the loop would have dropped the
+    # only check that `ajo_app` cannot reach a ledger insert.
+    for table in ("payments", "payouts", "risk_events"):
         granted = scalar(
             db,
             "SELECT count(*) FROM pg_policies WHERE tablename = "
@@ -797,9 +803,48 @@ def _self_insert(db: str) -> str:
                 "write a payout is not a detail to change without noticing."
             )
 
+    for table in ("ledger_transactions", "ledger_postings"):
+        open_to_app = scalar(
+            db,
+            "SELECT count(*) FROM pg_policies WHERE tablename = "
+            f"'{table}' AND cmd = 'INSERT' AND 'ajo_app' = ANY(roles);",
+        )
+        if open_to_app != "0":
+            raise Failure(
+                f"{table} has an INSERT policy for ajo_app. 105 gives the policy "
+                "to ajo_migrator, which owns the ledger writer and is never "
+                "assumed by a request; ajo_app writing entries directly is the one "
+                "thing 096 refused and the one thing that would make the ledger an "
+                "input rather than a record."
+            )
+
+        # And the refusal has to be real, not just unwritten: `ajo_app` holds
+        # full DML grants on public from bootstrap, so the policy is the only
+        # thing standing between the API and a forged ledger entry.
+        must_fail(
+            db,
+            f"ajo_app inserting into {table}",
+            as_role(
+                db,
+                "ajo_app",
+                "rls-a@example.ng",
+                (
+                    f"INSERT INTO {table} (id, kind, occurred_at) "
+                    "VALUES (gen_random_uuid(), 'contribution.received', now());"
+                    if table == "ledger_transactions"
+                    else f"INSERT INTO {table} (id, transaction_id, account_kind, "
+                    "side, amount_kobo) VALUES (gen_random_uuid(), gen_random_uuid(), "
+                    "'escrow_cash', 'debit', 1);"
+                ),
+            ),
+            expect="row-level security",
+        )
+
     return (
-        "profiles accepts a self-owned row and refuses someone else's, and the "
-        "five money, ledger and risk tables remain closed"
+        "profiles accepts a self-owned row and refuses someone else's; payments, "
+        "payouts and risk_events stay closed to INSERT entirely; and the two ledger "
+        "tables have INSERT policies for the migrator alone, which ajo_app cannot "
+        "use despite holding full DML grants"
     )
 
 
@@ -2510,6 +2555,816 @@ def _template_rendering(db: str) -> str:
         "device label cannot inject into the template, NULL renders without "
         "raising, and the shipped notifications retain no placeholder"
     )
+
+# The ids are fixed rather than generated so a failing case can be re-run by hand
+# against the same rows, and so two cases in this file can talk about the same Ajo
+# without passing it around.
+MONEY_AJO = "01b00000-0000-7000-8000-000000000001"
+MONEY_ROUND = "01b00000-0000-7000-8000-000000000010"
+
+
+def _money_ajo(db: str) -> str:
+    """
+    One member, one Ajo, one round, one contribution, one confirmed payment.
+
+    A fixture, and an unusually complete one, because the capture function reads
+    `contributions`, `rounds`, `payments` and `fees` and writes to all four plus
+    two ledger tables. Any of them missing turns a real failure into a fixture
+    error, and a fixture error looks exactly like a broken money path.
+
+    Everything is in one transaction because `assert_organizer_is_member` is
+    deferred and fires at COMMIT: the Ajo, its positions and the organizer's
+    membership have to land together or the Ajo is refused. That is the schema
+    stating the creator occupies one of the seats, and it is why the positions are
+    inserted here rather than left to whoever needs them.
+
+    The payment is `success`. That is not a shortcut around the provider -- it is
+    the boundary this migration is drawn at. Something else, later, sets that
+    status, and only from a signature-verified webhook. What is being tested here
+    is what happens once the provider has said yes.
+    """
+    must_succeed(
+        db,
+        "a member, an Ajo, a round and a confirmed payment",
+        "\n".join(
+            [
+                "BEGIN;",
+                f"INSERT INTO users (auth_subject_id, email, status) "
+                f"VALUES ('money-1', 'money-a@example.ng', 'active') "
+                f"ON CONFLICT DO NOTHING;",
+                f"""INSERT INTO ajos (
+                      id, name, organizer_user_id, contribution_amount_kobo,
+                      frequency_id, enrollment_opens_at, enrollment_closes_at,
+                      total_rounds, currency, status, position_count
+                    ) SELECT '{MONEY_AJO}', 'Test savings group', u.id, 1000000,
+                      f.id, now() - interval '1 day', now() + interval '4 days',
+                      3, 'NGN', 'draft', 5
+                      FROM users u, contribution_frequencies f
+                     WHERE u.email = 'money-a@example.ng' AND f.code = 'weekly'
+                    ON CONFLICT DO NOTHING;""",
+                # Five, because the Ajo says it has five seats and
+                # `materialize_organizer_membership` binds the organizer to the
+                # lowest free one as a side effect of this insert.
+                f"""INSERT INTO ajo_positions (ajo_id, position_number)
+                    SELECT a.id, n FROM ajos a, generate_series(1, 5) AS n
+                     WHERE a.id = '{MONEY_AJO}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO rounds (
+                      id, ajo_id, round_number, status, due_date, opens_at,
+                      closes_at, target_amount_kobo
+                    ) SELECT '{MONEY_ROUND}', a.id, 1, 'in_progress', current_date,
+                      now(), now() + interval '3 days', 1000000
+                      FROM ajos a WHERE a.id = '{MONEY_AJO}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO contribution_schedules (
+                      round_id, ajo_id, due_date, expected_amount_kobo,
+                      expected_member_count, late_cutoff_at
+                    ) SELECT r.id, r.ajo_id, r.due_date, 1000000, 5,
+                      now() + interval '5 days'
+                      FROM rounds r WHERE r.id = '{MONEY_ROUND}'
+                    ON CONFLICT DO NOTHING;""",
+                f"""INSERT INTO contributions (
+                      schedule_id, member_id, position_id, ajo_id, round_id,
+                      user_id, amount_kobo, due_date
+                    ) SELECT s.id, m.id, m.position_id, s.ajo_id, s.round_id,
+                      m.user_id, 1000000, s.due_date
+                      FROM contribution_schedules s
+                      JOIN ajo_members m ON m.ajo_id = s.ajo_id
+                        AND m.user_id = (SELECT id FROM users
+                                          WHERE email = 'money-a@example.ng')
+                     WHERE s.round_id = '{MONEY_ROUND}'
+                    ON CONFLICT DO NOTHING;""",
+                # `charged_amount_kobo` and `fee_kobo` are generated. Writing
+                # either here would be an error, which is the point: the fee is
+                # derived by the schema and cannot be supplied by a caller.
+                """INSERT INTO payments (
+                      contribution_id, channel_id, idempotency_key, provider,
+                      provider_reference, contribution_amount_kobo, status,
+                      provider_completed_at
+                    ) SELECT c.id, ch.id, 'idem-money-1', 'mock', 'mock-ref-1',
+                      1000000, 'success', now()
+                      FROM contributions c, payment_channels ch
+                     WHERE c.round_id = '%s' AND ch.code = 'bank_transfer'
+                    ON CONFLICT DO NOTHING;""" % MONEY_ROUND,
+                "COMMIT;",
+            ]
+        ),
+    )
+    return "money-a@example.ng"
+
+
+def _capture(db: str, idempotency: str = "idem-money-1") -> str:
+    """Recognises a capture, returning the two ledger transaction ids."""
+    return scalar(
+        db,
+        f"""SELECT array_to_string(
+                  app.post_collection_capture(
+                    (SELECT id FROM payments WHERE idempotency_key = '{idempotency}'),
+                    (SELECT id FROM users WHERE email = 'money-a@example.ng')),
+                  ',') AS joined;""",
+    )
+
+
+def _postings_for(db: str, kind: str, ids: str | None = None) -> list[tuple[str, str, int]]:
+    """
+    The postings of every entry of one kind, as (account, side, amount).
+
+    `psql` runs with `-tAF "|"`, so `scalar` treats any line containing a pipe
+    as multi-column noise and skips it. Emitting `a|b|1` here therefore reads as
+    zero rows, which is a silent pass rather than a failure -- the shape of the
+    assertions below had to stop using `scalar` for that reason.
+
+    `ids` narrows to the entries a particular capture produced. Every case shares
+    one database and the rows are real, so "the postings of every
+    `contribution.received` in the table" is a moving target: the case that proves
+    a balanced entry can be written writes one, and the case after it then counts
+    its own two plus that one. Each case has to be about its own entries.
+    """
+    only = f"AND t.id = ANY(string_to_array('{ids}', ',')::uuid[])" if ids else ""
+    rows = []
+    for line in psql(
+        db,
+        f"""SELECT p.account_kind::text || '|' || p.side::text || '|'
+                   || p.amount_kobo::text
+              FROM ledger_transactions t
+              JOIN ledger_postings p ON p.transaction_id = t.id
+             WHERE t.kind = '{kind}' {only}
+             ORDER BY t.occurred_at, p.account_kind;""",
+    ).splitlines():
+        if "|" not in line:
+            continue
+        account, side, amount = line.strip().split("|")
+        rows.append((account, side, int(amount)))
+    return rows
+
+
+@case("a confirmed collection is recognised exactly once, and only once")
+def _collection_capture(db: str) -> str:
+    """
+    The first money this system has ever moved.
+
+    The claim is narrow and load-bearing: given a payment the provider has
+    confirmed, the books come out right, the fee is itemised, and doing it again
+    changes nothing. Everything a member would later dispute -- what was collected,
+    what the platform earned, what the group is owed -- is decided by this one
+    function, and none of it was previously possible because there was no writer.
+    """
+    _money_ajo(db)
+
+    first = _capture(db)
+    if first.count(",") != 1:
+        raise Failure(
+            f"a capture produced {first!r} rather than two ledger transactions; "
+            "BR-021 splits the contribution and the fee so each is answerable alone"
+        )
+
+    # Exactly two entries, in the order BR-021 fixes, each balanced on its own.
+    #
+    # Compared as sorted tuples because `_postings_for` orders by `account_kind`,
+    # and that is an enum: it sorts by declaration order, so `escrow_cash` comes
+    # first and `contributions_receivable` second, regardless of the alphabet.
+    # Writing the expectation in that order would be an assertion about the enum
+    # that happens to sit next to an assertion about the postings.
+    if sorted(_postings_for(db, "contribution.received", first)) != sorted([
+        ("contributions_receivable", "credit", 1000000),
+        ("escrow_cash", "debit", 1000000),
+    ]):
+        raise Failure(
+            "contribution.received is not debit escrow / credit receivable for the "
+            "contribution amount: "
+            f"{_postings_for(db, 'contribution.received', first)}"
+        )
+
+    # 2% of 1,000,000 kobo is 20,000, and it is on its own entry rather than
+    # folded into the one above. A reader who finds the fee missing has no way to
+    # tell "no fee was taken" from "the fee was recorded as contribution".
+    if sorted(_postings_for(db, "fee.recognised", first)) != sorted([
+        ("escrow_cash", "debit", 20000),
+        ("fees_income", "credit", 20000),
+    ]):
+        raise Failure(
+            "fee.recognised is not debit escrow / credit fees_income for exactly "
+            f"2%: {_postings_for(db, 'fee.recognised', first)}"
+        )
+
+    # The order. Same instant, so this cannot be asserted on a timestamp and is
+    # asserted on the ordinal instead -- BR-021 says the sequence is mandatory and
+    # ordered, and two entries stamped now() carry no order of their own.
+    order = scalar(
+        db,
+        f"""SELECT string_agg(kind::text, '+' ORDER BY ordinal)
+               FROM (SELECT kind, row_number() OVER (ORDER BY ctid) AS ordinal
+                       FROM ledger_transactions
+                      WHERE id = ANY(string_to_array('{first}', ',')::uuid[])) s;""",
+    )
+    if order != "contribution.received+fee.recognised":
+        raise Failure(
+            f"the entries were posted in the order {order}; BR-021 fixes "
+            "contribution.received before fee.recognised"
+        )
+
+    # The obligation is discharged and the round's stored aggregates agree.
+    status = scalar(
+        db,
+        f"SELECT c.status::text FROM contributions c WHERE c.round_id = '{MONEY_ROUND}';",
+    )
+    if status != "paid":
+        raise Failure(f"the contribution is {status}, not paid")
+
+    pool = scalar(
+        db,
+        f"SELECT base_pool_kobo || '/' || fee_collected_kobo FROM rounds "
+        f"WHERE id = '{MONEY_ROUND}';",
+    )
+    if pool != "1000000/20000":
+        raise Failure(
+            f"the round records pool/fees as {pool}, expected 1000000/20000; these "
+            "are stored aggregates and must be restated with the contribution"
+        )
+
+    # The fee is a row of its own, pointing at the entry that recognised it.
+    link = scalar(
+        db,
+        """SELECT f.contribution_amount_kobo || '/' || f.fee_kobo || '/'
+                  || f.status::text || '/'
+                  || (f.ledger_transaction_id = t.id)::text
+             FROM fees f JOIN ledger_transactions t ON t.id = f.ledger_transaction_id
+            WHERE t.kind = 'fee.recognised';""",
+    )
+    if link != "1000000/20000/accrued/true":
+        raise Failure(
+            f"the fee row reads {link}, expected base/fee/status/linked-to-the-fee-"
+            "entry; BR-010 says the fee is itemised, never a hidden line"
+        )
+
+    # And nothing was created twice.
+    before = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+    again = _capture(db)
+    after = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+
+    if before != after:
+        raise Failure(
+            f"capturing the same payment again added {after} - {before} entries; a "
+            "replayed webhook is normal traffic and must move no money"
+        )
+    if again != first:
+        raise Failure(
+            "the replay returned different transaction ids; idempotency has to "
+            "return the original, not post again under a second identity"
+        )
+
+    return (
+        "a confirmed capture posts contribution.received then fee.recognised, each "
+        "balanced, the 2% itemised, the contribution paid, the round's aggregates "
+        "restated; and replaying it returns the same two entries and adds nothing"
+    )
+
+
+@case("the ledger refuses an entry that does not balance")
+def _ledger_writer_refuses(db: str) -> str:
+    """
+    BR-021's "a one-sided entry is rejected rather than posted", tested through
+    the writer rather than through the trigger.
+
+    The deferred constraint trigger already refuses an unbalanced transaction at
+    COMMIT, and the `_ledger` case proves it. This proves something the trigger
+    cannot: that the writer refuses *before writing*. A one-sided insert that only
+    fails at COMMIT leaves rows that exist for the duration of the transaction and
+    are rolled back afterwards, so the caller is told about a transaction that no
+    longer exists -- and, in a batch that catches the error and carries on, leaves
+    the error message pointing at rows a reader cannot find.
+    """
+    one_sided = (
+        """[{"account_kind": "escrow_cash", "side": "debit", "amount_kobo": 100}]"""
+    )
+    must_fail(
+        db,
+        "a one-sided entry",
+        f"""SELECT app.post_ledger_transaction(
+              'contribution.received', '{one_sided}'::jsonb);""",
+        expect="at least two postings",
+    )
+
+    mismatched = (
+        """[{"account_kind": "escrow_cash", "side": "debit", "amount_kobo": 100},
+            {"account_kind": "fees_income", "side": "credit", "amount_kobo": 99}]"""
+    )
+    must_fail(
+        db,
+        "an entry that is out by one kobo",
+        f"""SELECT app.post_ledger_transaction(
+              'contribution.received', '{mismatched}'::jsonb);""",
+        expect="do not balance",
+    )
+
+    # A negative amount is the same mistake wearing a different hat: it is a
+    # double negative, and accepting it would let a caller post +100 debit and
+    # +100 credit and have the sum check pass on a transaction that moves nothing.
+    must_fail(
+        db,
+        "a negative amount",
+        """SELECT app.post_ledger_transaction(
+              'contribution.received',
+              '[{"account_kind": "escrow_cash", "side": "debit",
+                 "amount_kobo": -100},
+                {"account_kind": "fees_income", "side": "credit",
+                 "amount_kobo": -100}]'::jsonb);""",
+        expect="amounts must be positive",
+    )
+
+    # Nothing was written by any of the three, which is the property that makes
+    # this test worth more than the trigger's. Counted as a delta rather than as
+    # zero: this case runs against a database that other cases have committed to,
+    # and an absolute count of zero would be an assertion about case ordering
+    # dressed up as an assertion about the writer.
+    before = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+    for label, body in (
+        ("a one-sided entry", f"SELECT app.post_ledger_transaction('contribution.received', '{one_sided}'::jsonb);"),
+        ("an entry out by one kobo", f"SELECT app.post_ledger_transaction('contribution.received', '{mismatched}'::jsonb);"),
+        ("a negative amount", """SELECT app.post_ledger_transaction(
+              'contribution.received',
+              '[{"account_kind": "escrow_cash", "side": "debit",
+                 "amount_kobo": -100},
+                {"account_kind": "fees_income", "side": "credit",
+                 "amount_kobo": -100}]'::jsonb);"""),
+    ):
+        must_fail(db, f"{label}, again", body)
+    after = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+
+    if before != after:
+        raise Failure(
+            f"a refused entry left rows behind: {before} entries before, {after} "
+            "after; the writer has to validate before it inserts, not leave a "
+            "rollback to undo it"
+        )
+
+    # Reversals are one level deep (CR-21), and the writer says so by name rather
+    # than leaving it to a foreign key that cannot find.
+    balanced = (
+        """[{"account_kind": "escrow_cash", "side": "credit", "amount_kobo": 500},
+            {"account_kind": "contributions_receivable", "side": "debit",
+             "amount_kobo": 500}]"""
+    )
+    # Two failures, not one. A reversal that names nothing, and a reversal that
+    # names something that is not there, are different mistakes and the writer
+    # distinguishes them -- asserting only the first would have passed against a
+    # version that let a dangling reference through to the foreign key.
+    must_fail(
+        db,
+        "a reversal of nothing",
+        f"""SELECT app.post_ledger_transaction(
+              'reversal', '{balanced}'::jsonb);""",
+        expect="must name the transaction it reverses",
+    )
+
+    must_fail(
+        db,
+        "a reversal of a transaction that does not exist",
+        f"""SELECT app.post_ledger_transaction(
+              'reversal', '{balanced}'::jsonb,
+              p_reverses_transaction_id => gen_random_uuid());""",
+        expect="which does not exist",
+    )
+
+    must_succeed(
+        db,
+        "a balanced entry",
+        """SELECT app.post_ledger_transaction(
+              'contribution.received',
+              '[{"account_kind": "escrow_cash", "side": "debit",
+                 "amount_kobo": 500},
+                {"account_kind": "contributions_receivable", "side": "credit",
+                 "amount_kobo": 500}]'::jsonb);""",
+    )
+    # A real reversal has to exist before it can be reversed, and this one has to
+    # be committed rather than attempted: the guard reads the referenced row, so
+    # a reversal rolled back by a failed attempt is not there to find and the
+    # next call fails as "must name the transaction it reverses" instead, which
+    # would be the wrong reason and would pass for the wrong reason if the
+    # expectation were loose.
+    must_succeed(
+        db,
+        "a reversal",
+        f"""SELECT app.post_ledger_transaction(
+              'reversal', '{balanced}'::jsonb,
+              p_reverses_transaction_id => (
+                SELECT id FROM ledger_transactions
+                 WHERE kind = 'contribution.received'
+                   AND payment_id IS NULL LIMIT 1),
+              p_memo => 'correction');""",
+    )
+
+    must_fail(
+        db,
+        "a reversal of a reversal",
+        f"""SELECT app.post_ledger_transaction(
+              'reversal', '{balanced}'::jsonb,
+              p_reverses_transaction_id => (
+                SELECT id FROM ledger_transactions
+                 WHERE kind = 'reversal' LIMIT 1));""",
+        expect="reversing a reversal is not a correction",
+    )
+
+    return (
+        "a one-sided entry, an entry out by one kobo, a negative amount and a "
+        "reversal of nothing are all refused before anything is written; a balanced "
+        "entry commits; and a reversal of a reversal is refused by name"
+    )
+
+
+@case("only a provider-confirmed payment is recognised")
+def _capture_requires_confirmation(db: str) -> str:
+    """
+    The line between this system and the provider.
+
+    `payments.status = 'success'` is somebody else's decision. This case is the
+    assertion that we never make it ourselves: every status that means "we asked
+    and have no answer" is refused, including `unknown`, which is the one most
+    likely to be mistaken for a yes.
+    """
+    _money_ajo(db)
+    before = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+
+    for status in ("initiated", "pending", "unknown", "failed", "cancelled"):
+        must_succeed(
+            db,
+            f"a {status} payment to try to capture",
+            f"""INSERT INTO payments (
+                  contribution_id, channel_id, idempotency_key, provider,
+                  contribution_amount_kobo, status
+                ) SELECT c.id, ch.id, 'idem-{status}', 'mock', 1000000, '{status}'
+                  FROM contributions c, payment_channels ch
+                 WHERE c.round_id = '{MONEY_ROUND}' AND ch.code = 'card'
+                ON CONFLICT DO NOTHING;""",
+        )
+        must_fail(
+            db,
+            f"capturing a {status} payment",
+            f"""SELECT app.post_collection_capture(
+                  (SELECT id FROM payments WHERE idempotency_key = 'idem-{status}'),
+                  (SELECT id FROM users WHERE email = 'money-a@example.ng'));""",
+            expect="only a provider-confirmed success is recognised",
+        )
+
+    after = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+    if before != after:
+        raise Failure(
+            "recognising an unconfirmed payment left entries behind; the status "
+            "check has to happen before the first posting"
+        )
+
+    return (
+        "initiated, pending, unknown, failed and cancelled payments are all "
+        "refused, and unknown is refused specifically because it means we could "
+        "not find out rather than that nothing happened"
+    )
+
+
+@case("the API can recognise a capture and cannot post a ledger entry")
+def _ledger_write_grants(db: str) -> str:
+    """
+    Who may write the books.
+
+    `ajo_app` gets `post_collection_capture` and nothing else. The primitive stays
+    closed, because a grant on the primitive makes the entry shape a suggestion:
+    the first code path that wanted a slightly different entry would invent one,
+    and the only guarantee left would be that the numbers added up somewhere.
+
+    The signature is read out of `pg_proc` rather than written out here. Hand-
+    written, it is a string that has to be edited by hand the next time an
+    argument is added, and when it drifts it drifts to a name that does not exist
+    -- and `has_function_privilege` on a non-existent function raises rather than
+    returning false, so the test would fail loudly. Loud is survivable. The
+    version of this test that was worse is one that named `ajo_api` instead of
+    `ajo_app`: `ajo_api` inherits nothing, so every assertion passed and none of
+    them described the role that runs the API.
+    """
+    primitive = scalar(
+        db,
+        """SELECT p.oid::regprocedure::text
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'app' AND p.proname = 'post_ledger_transaction';""",
+    )
+    if not primitive:
+        raise Failure("app.post_ledger_transaction is missing")
+
+    capture = scalar(
+        db,
+        """SELECT p.oid::regprocedure::text
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'app' AND p.proname = 'post_collection_capture';""",
+    )
+    if not capture:
+        raise Failure("app.post_collection_capture is missing")
+
+    for role in ("ajo_app", "ajo_analytics"):
+        if scalar(db, f"SELECT has_function_privilege('{role}', '{primitive}', 'EXECUTE');") != "f":
+            raise Failure(
+                f"{role} can call the ledger primitive; a role that can post "
+                "entries directly is a role that can invent revenue"
+            )
+
+    # PUBLIC is not a role, so `has_function_privilege('public', ...)` would be a
+    # name that does not exist. In the ACL it is the grantee 0.
+    for function in (primitive, capture):
+        if scalar(
+            db,
+            f"""SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) x
+                     WHERE p.oid::regprocedure::text = '{function}' AND x.grantee = 0);""",
+        ) != "f":
+            raise Failure(f"{function} is executable by PUBLIC")
+
+    if scalar(db, f"SELECT has_function_privilege('ajo_app', '{capture}', 'EXECUTE');") != "t":
+        raise Failure(
+            "ajo_app cannot recognise a capture; nothing can move money until it can"
+        )
+
+    # Privileges on paper are not privileges in practice, and this is the only
+    # assertion that runs as the role the API really assumes. It is also the
+    # assertion that would have caught the bootstrap granting the primitive back
+    # after migration 105 revoked it.
+    _money_ajo(db)
+    must_fail(
+        db,
+        "the API posting a ledger entry directly",
+        as_role(
+            db,
+            "ajo_app",
+            "money-a@example.ng",
+            f"""SELECT app.post_ledger_transaction(
+                  'contribution.received',
+                  '[{{"account_kind": "escrow_cash", "side": "debit",
+                     "amount_kobo": 100}},
+                    {{"account_kind": "contributions_receivable",
+                     "side": "credit", "amount_kobo": 100}}]'::jsonb);""",
+        ),
+        expect="permission denied for function post_ledger_transaction",
+    )
+
+    # Committed rather than rolled back, because a rolled-back call proves only
+    # that permission was granted, not that the same guarantee holds for the role
+    # the request actually arrives on. The payment was already captured earlier in
+    # this database, so this is a replay: it has to add nothing. Idempotency that
+    # only holds when the caller is the migration role is not idempotency.
+    before = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+    must_succeed(
+        db,
+        "the API recognising a capture",
+        as_role(
+            db,
+            "ajo_app",
+            "money-a@example.ng",
+            """SELECT app.post_collection_capture(
+                  (SELECT id FROM payments WHERE idempotency_key = 'idem-money-1'),
+                  (SELECT id FROM users WHERE email = 'money-a@example.ng'));""",
+            commit=True,
+        ),
+    )
+    after = scalar(db, "SELECT count(*) FROM ledger_transactions;")
+    if before != after:
+        raise Failure(
+            f"a replayed capture from the API role added {after} - {before} entries; "
+            "the idempotent path has to hold for the role that serves requests, not "
+            "only for the role that owns the function"
+        )
+
+    return (
+        "the primitive is closed to PUBLIC, to analytics and to the API -- checked "
+        "against pg_proc's own signature and then by the API role being refused at "
+        "call time -- while the API can recognise a capture, and doing so twice "
+        "still leaves one set of books"
+    )
+
+
+@case("a round's fee total cannot drift from the fees booked")
+def _round_fee_guard(db: str) -> str:
+    """
+    `rounds.fee_collected_kobo` had no enforcement at all.
+
+    `assert_round_pool` guards the sibling column `base_pool_kobo`, and nothing
+    guarded this one: a stored aggregate that nothing restates and nothing checks.
+    The failure is a revenue report that disagrees with the ledger and nobody finds
+    out until a human reconciles the accounts by hand.
+    """
+    _money_ajo(db)
+    _capture(db)
+
+    # Changing the contribution without restating the round, in either direction.
+    must_fail(
+        db,
+        "a round whose fee total disagrees with its paid contributions",
+        transaction(f"UPDATE rounds SET fee_collected_kobo = 1 WHERE id = '{MONEY_ROUND}';"),
+        expect="records 1 kobo of fees collected",
+    )
+
+    # And the guard has to fire from the contribution side too, or a restatement
+    # that also changed a contribution would be caught by one trigger and not the
+    # other, which is not a distinction anyone should have to reason about.
+    # Reopening a paid contribution is a real event -- a refund, a correction --
+    # so it is not refused as an invalid transition. What must not happen is it
+    # being accepted while the round still claims the money. `assert_round_pool`
+    # fires first and names the column that is now wrong.
+    must_fail(
+        db,
+        "a contribution reopened without restating the round",
+        transaction(
+            f"""UPDATE contributions SET status = 'pending'
+                 WHERE round_id = '{MONEY_ROUND}';"""
+        ),
+        expect="base_pool_kobo is a stored aggregate",
+    )
+
+    must_succeed(
+        db,
+        "restating both aggregates together",
+        transaction(
+            f"""UPDATE rounds r SET
+                  base_pool_kobo = (SELECT COALESCE(sum(c.amount_kobo), 0)
+                                      FROM contributions c
+                                     WHERE c.round_id = r.id AND c.status = 'paid'
+                                       AND c.superseded_at IS NULL
+                                       AND c.deleted_at IS NULL),
+                  fee_collected_kobo = (SELECT COALESCE(sum(c.fee_kobo), 0)
+                                          FROM contributions c
+                                         WHERE c.round_id = r.id AND c.status = 'paid'
+                                           AND c.superseded_at IS NULL
+                                           AND c.deleted_at IS NULL)
+                WHERE r.id = '{MONEY_ROUND}';"""
+        ),
+    )
+
+    return (
+        "a round that disagrees with its paid contributions is refused from either "
+        "side, and restating both aggregates together is accepted"
+    )
+
+
+@case("applying 105 to a database with a stale fee total restates it")
+def _fee_aggregate_backfill(db: str) -> str:
+    """
+    The one risk in migration 105 that the rest of this suite cannot see.
+
+    Every other case runs against a database built from these files, where 105
+    creates the guard over an empty ledger and its restatement statement is a
+    no-op. The situation that actually matters is the opposite: the adopted
+    production database, where a round already exists and already has a wrong
+    `fee_collected_kobo`, because `096` created the column as a stored aggregate
+    and nothing in the schema was able to write it.
+
+    The guard is a deferred constraint trigger, so it does not evaluate rows
+    that already exist. That is what makes 105 safe to apply to that database and
+    it is also the trap: apply the guard without restating first and the round
+    keeps its wrong number, then the first ordinary write to it fails naming a
+    column the writer never touched.
+
+    So this case reproduces the adoption for real: build a database through
+    `104`, write a paid contribution, leave the fee total at zero the way `096`
+    did, then apply `105` and require that the round comes out correct *and*
+    writable. It builds its own database rather than using the shared one,
+    because it is the only case that applies migrations at runtime, and it drops
+    it again whether it passes or fails.
+
+    It is slow, and it is here anyway.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    scratch = f"{db}_adopt"
+    round_id = "01c00000-0000-7000-8000-000000000010"
+
+    try:
+        subprocess.run(pg.admin("dropdb", "--if-exists", scratch), check=True)
+        subprocess.run(pg.admin("createdb", scratch), check=True)
+        applied = subprocess.run(
+            [sys.executable, os.path.join(here, "migrate.py"), "--db", scratch,
+             "--through", "105"],
+            capture_output=True, text=True,
+        )
+        if applied.returncode != 0:
+            raise Failure(
+                f"building {scratch} through 104 failed:\n"
+                f"    {(applied.stdout + applied.stderr).strip()[:300]}"
+            )
+
+        # The shape 096 leaves behind: a round, a paid contribution, the base
+        # pool restated because something wrote it, and the fee total never
+        # written because nothing could. `paid_at` is set because the existing
+        # check constraint requires it, which is itself a small proof that this
+        # fixture is using the schema as adopted rather than a simplified one.
+        must_succeed(
+            scratch,
+            "a round with a paid contribution and no fee total",
+            "\n".join(
+                [
+                    "BEGIN;",
+                    "INSERT INTO users (auth_subject_id, email, status) "
+                    "VALUES ('adopt-1', 'adopt-a@example.ng', 'active');",
+                    """INSERT INTO ajos (
+                          id, name, organizer_user_id, contribution_amount_kobo,
+                          frequency_id, enrollment_opens_at, enrollment_closes_at,
+                          total_rounds, currency, status, position_count
+                        ) SELECT '01c00000-0000-7000-8000-000000000001',
+                          'Adopted group', u.id, 1000000, f.id,
+                          now() - interval '1 day', now() + interval '4 days',
+                          3, 'NGN', 'draft', 5
+                          FROM users u, contribution_frequencies f
+                         WHERE u.email = 'adopt-a@example.ng' AND f.code = 'weekly';""",
+                    """INSERT INTO ajo_positions (ajo_id, position_number)
+                        SELECT a.id, n FROM ajos a, generate_series(1, 5) AS n
+                         WHERE a.id = '01c00000-0000-7000-8000-000000000001';""",
+                    f"""INSERT INTO rounds (
+                          id, ajo_id, round_number, status, due_date, opens_at,
+                          closes_at, target_amount_kobo
+                        ) SELECT '{round_id}', a.id, 1, 'in_progress', current_date,
+                          now(), now() + interval '3 days', 1000000
+                          FROM ajos a WHERE a.id = '01c00000-0000-7000-8000-000000000001';""",
+                    """INSERT INTO contribution_schedules (
+                          round_id, ajo_id, due_date, expected_amount_kobo,
+                          expected_member_count, late_cutoff_at
+                        ) SELECT r.id, r.ajo_id, r.due_date, 1000000, 5,
+                          now() + interval '5 days'
+                          FROM rounds r WHERE r.id = '%s';""" % round_id,
+                    """INSERT INTO contributions (
+                          schedule_id, member_id, position_id, ajo_id, round_id,
+                          user_id, amount_kobo, due_date, status, paid_at
+                        ) SELECT s.id, m.id, m.position_id, s.ajo_id, s.round_id,
+                          m.user_id, 1000000, s.due_date, 'paid', now()
+                          FROM contribution_schedules s
+                          JOIN ajo_members m ON m.ajo_id = s.ajo_id
+                            AND m.user_id = (SELECT id FROM users
+                                              WHERE email = 'adopt-a@example.ng')
+                         WHERE s.round_id = '%s';""" % round_id,
+                    f"UPDATE rounds SET base_pool_kobo = 1000000 WHERE id = '{round_id}';",
+                    "COMMIT;",
+                ]
+            ),
+        )
+
+        stale = scalar(
+            scratch,
+            f"SELECT fee_collected_kobo FROM rounds WHERE id = '{round_id}';",
+        )
+        if stale != "0":
+            raise Failure(
+                f"the fixture's fee total is {stale}, not 0; without a stale row "
+                "this case proves nothing"
+            )
+
+        applied = subprocess.run(
+            [sys.executable, os.path.join(here, "migrate.py"), "--db", scratch],
+            capture_output=True, text=True,
+        )
+        if applied.returncode != 0:
+            raise Failure(
+                f"applying 105 to the adopted database failed:\n"
+                f"    {(applied.stdout + applied.stderr).strip()[:300]}"
+            )
+
+        restated = scalar(
+            scratch,
+            f"SELECT base_pool_kobo || '|' || fee_collected_kobo FROM rounds "
+            f"WHERE id = '{round_id}';",
+        )
+        if restated != "1000000|20000":
+            raise Failure(
+                f"after 105 the round reads {restated}, expected 1000000|20000; the "
+                "restatement has to happen on apply, because the guard it precedes "
+                "will refuse every future write to a round that is left wrong"
+            )
+
+        # Correct is not enough -- it has to be writable, or the guard is holding
+        # a round hostage with the right number. The write exercised is the
+        # aggregate restatement the guard's own HINT tells callers to perform, so
+        # the advice the error message gives is proven to work on the row the
+        # error message was written for. Restating to the values already stored
+        # is deliberate: the round is already correct, so the only way this can
+        # fail is the guard refusing a correct restatement.
+        must_succeed(
+            scratch,
+            "restating the aggregates on the round 105 brought into agreement",
+            transaction(
+                f"""UPDATE rounds r SET
+                      base_pool_kobo = (SELECT COALESCE(sum(c.amount_kobo), 0)
+                                          FROM contributions c
+                                         WHERE c.round_id = r.id AND c.status = 'paid'
+                                           AND c.superseded_at IS NULL
+                                           AND c.deleted_at IS NULL),
+                      fee_collected_kobo = (SELECT COALESCE(sum(c.fee_kobo), 0)
+                                              FROM contributions c
+                                             WHERE c.round_id = r.id AND c.status = 'paid'
+                                               AND c.superseded_at IS NULL
+                                               AND c.deleted_at IS NULL)
+                    WHERE r.id = '{round_id}';"""
+            ),
+        )
+
+        return (
+            "a database built through 104 with a round whose fee total was never "
+            "written comes out of 105 correct at 2% and accepting writes, which is "
+            "the adoption case the live database is in"
+        )
+    finally:
+        subprocess.run(pg.admin("dropdb", "--if-exists", scratch), check=False,
+                       capture_output=True)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()

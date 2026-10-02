@@ -269,6 +269,33 @@ ALTER DEFAULT PRIVILEGES FOR ROLE ajo_migrator IN SCHEMA public
 ALTER DEFAULT PRIVILEGES FOR ROLE ajo_migrator IN SCHEMA app
   GRANT EXECUTE ON FUNCTIONS TO ajo_app;
 
+-- ...and one function that is deliberately narrower than that default.
+--
+-- The blanket grant above is right for almost everything in app.*: a trigger
+-- function is called by the database, and the API calling one it already has
+-- EXECUTE on is not a new capability. It is the wrong default for a function
+-- that exists to constrain the API rather than serve it.
+--
+-- `app.post_ledger_transaction` is that function. Migration 105 revokes it from
+-- `PUBLIC` and from `ajo_app`, and that REVOKE was silently undone here: the
+-- blanket `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO ajo_app` above runs
+-- after every migration, and it handed the ledger primitive straight back. The
+-- result was a database where migration 105's own grant test failed while
+-- migration 105's own REVOKE sat unread above it, both in the same file, and the
+-- only way to tell which was lying was to read the ACL.
+--
+-- So the restriction is re-stated here, after the grant that overrides it. That
+-- is duplication, and it is deliberate: the migration owns the intent and this
+-- script owns the environment, and neither is load-bearing alone.
+--
+-- A new internal function needs a REVOKE here. The tell is that it is
+-- SECURITY DEFINER, writes money or audit rows, and has no reason to be called
+-- by a request -- ask whether granting the API EXECUTE on it would be news.
+REVOKE EXECUTE ON FUNCTION app.post_ledger_transaction(
+  ledger_entry_type, jsonb, text, uuid, uuid, uuid, uuid, uuid, uuid, uuid,
+  timestamptz, text
+) FROM PUBLIC, ajo_app;
+
 COMMENT ON SCHEMA app IS
   'Trigger and policy functions. Owned by ajo_migrator so the six SECURITY '
   'DEFINER functions in here execute with bounded privilege instead of a '
