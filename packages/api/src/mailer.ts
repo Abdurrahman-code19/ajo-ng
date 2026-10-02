@@ -116,6 +116,108 @@ export function createHttpRelaySender(relay: MailRelayConfig): VerificationSende
 }
 
 /**
+ * A raw transactional message, with no verification token in it.
+ *
+ * Separate from `VerificationSender` rather than a parameter on it because the two
+ * have opposite safety properties. A verification message carries a secret, so it
+ * is written to put the token in the body and never in a URL, never in a subject
+ * line, and never in an error. A security notification carries no secret and is
+ * the opposite: it is a warning about a compromised account, and it should be as
+ * loud and as clear as the format allows. One interface cannot be right for both,
+ * and folding them together would either weaken the token handling or water down
+ * the alarm.
+ */
+export interface NotificationTransport {
+  sendEmail(message: {
+    readonly to: string;
+    readonly subject: string;
+    readonly body: string;
+  }): Promise<void>;
+}
+
+/**
+ * The production transport for notifications.
+ *
+ * The same relay, the same authentication, the same timeout -- only the payload
+ * differs. Two send paths over one relay rather than one send path with a nullable
+ * token field, because the failure mode of sharing it is a template that forgets
+ * to interpolate something and sends a member a body with a raw `{{token}}` in
+ * it, which is exactly the sort of message that makes people stop reading alerts.
+ */
+export function createHttpRelayTransport(relay: MailRelayConfig): NotificationTransport {
+  return {
+    async sendEmail(message): Promise<void> {
+      const response = await fetch(relay.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${relay.token}`,
+        },
+        body: JSON.stringify({
+          from: relay.from,
+          to: message.to,
+          subject: message.subject,
+          text: message.body,
+        }),
+        // Same reasoning as `createHttpRelaySender`: a stalled relay must not hold
+        // a worker pass open until the process gives up. This is longer than the
+        // verification send's 10s because a notification body is longer and the
+        // relay may be doing provider work, but it is still bounded.
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!response.ok) {
+        // The status only, never the body. A relay's error response can echo the
+        // recipient address back, and this string reaches `failure_detail`, which
+        // is read by anyone debugging the queue.
+        throw new Error(`the mail relay rejected the message (HTTP ${response.status})`);
+      }
+    },
+  };
+}
+
+/** Development only. The message lands in the log so a test or a human can read it. */
+export function createLoggingTransport(log: MailLog): NotificationTransport {
+  return {
+    async sendEmail(message): Promise<void> {
+      log.info(
+        { to: message.to, subject: message.subject, body: message.body },
+        'DEVELOPMENT: security notification; never log this outside local development',
+      );
+    },
+  };
+}
+
+/**
+ * The notification transport the composition root picks.
+ *
+ * Same rule as `createVerificationSender`, and for the same reason: in production
+ * with no relay, this throws rather than returning the logging transport. A process
+ * that will not start is much better than one that starts and logs every
+ * compromise alarm to stdout, where it lands in a log aggregator and is read by
+ * nobody who was told to act on it.
+ */
+export function createNotificationTransport(
+  environment: string,
+  log: MailLog,
+  relay?: MailRelayConfig,
+): NotificationTransport {
+  if (environment !== 'production') {
+    return createLoggingTransport(log);
+  }
+
+  if (relay === undefined) {
+    throw new Error(
+      'No mail transport is configured. Set MAIL_RELAY_URL, MAIL_RELAY_TOKEN ' +
+        'and MAIL_FROM. The development transport writes every security ' +
+        'notification to stdout, so this process will not start without a relay.',
+    );
+  }
+
+  return createHttpRelayTransport(relay);
+}
+
+/**
  * The sender the composition root picks.
  *
  * In production this returns the relay, and throws if no relay is configured.

@@ -1591,6 +1591,926 @@ END $$;
     )
 
 
+@case("a reused token tells the member, and cannot be made to tell anyone else")
+def _reuse_notification(db: str) -> str:
+    """
+    The half of 12.4.2 that 103 could not reach.
+
+    103 detects a replayed refresh token, revokes every session the member holds,
+    and writes an audit row. That is the whole of what it did. The spec's other
+    half -- `security.suspicious_token_reuse` "is sent to every registered
+    contact" -- went unimplemented, so a member whose sessions were all revoked at
+    three in the morning had no way to find out short of noticing that the app had
+    quietly forgotten them.
+
+    The mechanism is the transactional outbox, and the reason it is a trigger on
+    `audit_logs` rather than a call in the request handler is the thing this case
+    mostly pins: **the alarm has to be in the same transaction as the
+    revocation.** A worker that polls afterwards has a window in which a crash, a
+    deploy or a backlog turns a compromise alarm into silence, and for this one
+    event the entire value is that it cannot be lost.
+
+    So the assertion that matters most here is the rollback one. A notification
+    that survives a rolled-back revocation is worse than no notification: it tells
+    a member their account was just attacked when it was not.
+
+    Every count in this case is scoped to this case's own member. The cases run in
+    sequence against one database and the case above exercises reuse detection on
+    a different member, so an unscoped count is asserting on another case's
+    fixtures -- and would have passed while this case's own member was told
+    nothing.
+    """
+    email = _loginable(db, "notify-reuse@example.ng")
+    token = _open_session(db, email, "9a9a9a", device="laptop")
+    _open_session(db, email, "9b9b9b", expires_in="30 days", device="phone")
+
+    def outbox_count() -> str:
+        return scalar(
+            db,
+            f"""SELECT count(*) FROM outbox_events
+                 WHERE event_type = 'security.suspicious_token_reuse'
+                   AND payload->>'user_id' = (SELECT id::text FROM users
+                                               WHERE email = '{email}');""",
+        )
+
+    # Rollback first, because a rollback that leaked a notification would leave a
+    # row behind that the committed test below would then collide with. The
+    # replacement hash differs from the committed ones so a leak is visible as a
+    # *second* event rather than hiding behind the dedupe index.
+    must_succeed(
+        db,
+        "detect a replay without committing",
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('9b0b0b', 'hex'),
+                    now(), now() + interval '30 days');""",
+        ),
+    )
+    if outbox_count() != "0":
+        raise Failure(
+            "a rolled-back token reuse left an outbox event behind; the alarm has "
+            "to be in the same transaction as the revocation, or a crash between "
+            "them loses a compromise warning -- and a surviving one tells a member "
+            "they were attacked when they were not"
+        )
+    leaked = scalar(
+        db,
+        f"""SELECT count(*) FROM notifications n
+             WHERE n.user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if leaked != "0":
+        raise Failure(
+            f"a rolled-back token reuse left {leaked} notification(s) behind, so a "
+            "member would be told their account was attacked by a transaction that "
+            "never happened"
+        )
+
+    # Now for real, and in the order the flow actually happens in: the rotation
+    # commits first, then the *spent* token is presented. A single committed call
+    # cannot demonstrate reuse, because the first presentation of a live token is
+    # a rotation -- `rotated`, not `reused`. The spent-token ledger is what turns
+    # the second presentation into `reused`, and it only exists if the first call
+    # committed.
+    rotated = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('9c9c9c', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=True,
+        ),
+    )
+    if rotated != "rotated":
+        raise Failure(
+            f"the setup rotation reported {rotated!r} where 'rotated' was expected, "
+            "so there is no spent-token record and the reuse path cannot be reached"
+        )
+
+    outcome = scalar(
+        db,
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT coalesce((SELECT outcome FROM app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('9d9d9d', 'hex'),
+                    now(), now() + interval '30 days')), 'no-row');""",
+            commit=True,
+        ),
+    )
+    if outcome != "reused":
+        raise Failure(
+            f"the committed reuse reported {outcome!r} where 'reused' was expected; "
+            "without the reuse branch firing there is no revocation and no alarm"
+        )
+
+    # The event reached the outbox, in the transaction that revoked the sessions.
+    if outbox_count() != "1":
+        raise Failure(
+            f"a committed token reuse produced {outbox_count()} outbox events for "
+            "this member where 1 was expected; the audit_logs trigger is the only "
+            "thing putting it there"
+        )
+
+    # Drain first. Materialisation is the drain's job, not the trigger's: the
+    # trigger writes one outbox row per event, and turning that into a row per
+    # channel is what `app.drain_security_notifications` does. Asserting on
+    # `notifications` before draining would be asserting on the wrong half, and
+    # would read as "the trigger enqueued nothing" when the trigger enqueued
+    # exactly what it should.
+    must_succeed(
+        db,
+        "materialise the queued notifications",
+        "SELECT count(*) FROM app.drain_security_notifications();",
+    )
+
+    # One notification per channel, and only for active security templates. Checked
+    # per channel rather than as a total, because a total of 3 also matches "3
+    # pushes, no email", which would leave the member with nothing readable.
+    for channel in ("email", "sms", "push"):
+        got = scalar(
+            db,
+            f"""SELECT count(*) FROM notifications
+                 WHERE event_key = 'security.suspicious_token_reuse'
+                   AND channel = '{channel}'
+                   AND status = 'queued'
+                   AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+        )
+        if got != "1":
+            raise Failure(
+                f"the reuse alarm queued {got} {channel} notification(s) where 1 was "
+                "expected; every active security template has to be materialised"
+            )
+
+    # SMS is not optional, and the reason is in the schema rather than in this
+    # migration: `app.assert_money_critical_has_sms` is a deferred constraint
+    # trigger that refuses to commit any `is_security` template whose event has no
+    # active SMS template. CANONICAL.md section 8 prints an em dash for
+    # `security.login_new_device`, and the trigger has been contradicting that
+    # cell since migration 000. Asserted because the day someone "fixes" the
+    # catalogue by dropping the sms rows, the migration stops applying at all.
+    sms_template = scalar(
+        db,
+        "SELECT count(*) FROM notification_templates "
+        "WHERE event_key = 'security.suspicious_token_reuse' AND channel = 'sms' "
+        "AND is_active;",
+    )
+    if sms_template != "1":
+        raise Failure(
+            "there is no active sms template for the reuse event, which "
+            "app.assert_money_critical_has_sms refuses to let the migration commit "
+            "without; this means the template was deactivated after the fact"
+        )
+
+    # And the recipient is a real address, resolved for the member rather than
+    # hardcoded, because 12.4.2 says "every registered contact".
+    recipient = scalar(
+        db,
+        f"SELECT app.member_email((SELECT id FROM users WHERE email = '{email}'));",
+    )
+    if recipient.strip() != email:
+        raise Failure(
+            f"member_email returned {recipient.strip()!r} where {email!r} was "
+            "expected; the alarm would be delivered to nobody"
+        )
+
+    # Preference suppression. A member who has switched off every channel must
+    # still be told, because section 6 says security events "cannot be switched
+    # off" -- and because a preference that silences this particular alarm means an
+    # attacker holding live sessions against an account that asked not to be
+    # disturbed. Set explicitly rather than relying on defaults, and with quiet
+    # hours set to cover a 3am breach, because quiet hours are the subtler half:
+    # deferring a breach detected at 3am to 7am is how the attacker finishes.
+    must_succeed(
+        db,
+        "a member who has switched off every channel",
+        f"""
+        INSERT INTO notification_preferences
+          (user_id, push_enabled, email_enabled, sms_enabled, money_sms_opt_in,
+           quiet_hours_start, quiet_hours_end)
+        VALUES ((SELECT id FROM users WHERE email = '{email}'),
+                false, false, false, false, '23:00', '06:00')
+        ON CONFLICT (user_id) DO UPDATE
+          SET push_enabled = false, email_enabled = false, sms_enabled = false, money_sms_opt_in = false;
+        """,
+    )
+    suppressed = scalar(
+        db,
+        f"""SELECT count(*) FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse'
+               AND status = 'queued'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if suppressed != "3":
+        raise Failure(
+            f"a member with every channel disabled and quiet hours set still has "
+            f"{suppressed} queued reuse notification(s) where 3 was expected; a "
+            "security alarm cannot be switched off, and quiet hours must not defer "
+            "a breach detected at 3am to 7am"
+        )
+
+    return (
+        "a replayed token queues a push, an email and an SMS for every registered "
+        "contact in the same transaction that revoked the sessions; a rolled-back "
+        "reuse queues nothing; and a member who has disabled every channel and set "
+        "quiet hours is told anyway"
+    )
+
+
+@case("a new device is recognised once, and only when it is new")
+def _new_device_notification(db: str) -> str:
+    """
+    US-04 and US-05 pull in opposite directions and the naive implementation
+    loses to both.
+
+    US-05 wants an alert when a session appears from a device the member does not
+    recognise. US-04 says revoking a session must not raise one. Read literally
+    with "a session exists" as the test, the second is unreachable -- revoking
+    creates and removes sessions -- so the question is which rows count as
+    evidence, and the answer that satisfies both is *all of them*.
+
+    Every session row the member has ever had, revoked ones included. Revocation
+    is not deletion: 103 revoked a row specifically so that a revoked session
+    used afterwards is evidence rather than a lookup miss. Those same rows are
+    also the record that this member has used this device before, so the history
+    that makes theft detectable is the history that stops false alarms.
+
+    The failure this prevents is quiet and cumulative. Sign out and back in on
+    the same phone -- the common case, and people sign out constantly -- and a
+    live-only check finds no prior session and sends "we have not seen this
+    device before". Do that a few times and the member learns the alert is noise,
+    which is precisely the state in which it cannot report the one time it
+    mattered.
+    """
+    email = _loginable(db, "notify-device@example.ng")
+    _loginable(db, "notify-device-2@example.ng")
+    uid_sql = f"(SELECT id FROM users WHERE email = '{email}')"
+
+    def check(platform, device_label) -> str:
+        """Runs the detection and returns its verdict, on a fresh session id."""
+        platform_sql = "'%s'" % platform if platform is not None else "NULL"
+        label_sql = "'%s'" % device_label if device_label is not None else "NULL"
+        return scalar(
+            db,
+            f"""SELECT app.record_login_new_device(
+                    {uid_sql}, gen_random_uuid(), {platform_sql}, {label_sql},
+                    '198.51.100.7', 'TestAgent/1.0');""",
+        )
+
+    # The first use of a device is new, and says so.
+    if check("web", "Work laptop") != "t":
+        raise Failure(
+            "the first login from a device reported it as already known, so the "
+            "alert for a genuinely new device is never sent"
+        )
+
+    # And the audit row it wrote is the thing the trigger turns into an outbox
+    # event. Asserted through the outbox, because that is the delivery path and
+    # an audit row nobody drains is not an alert.
+    alerted = scalar(
+        db,
+        "SELECT count(*) FROM outbox_events WHERE event_type = "
+        "'security.login_new_device';",
+    )
+    if alerted != "1":
+        raise Failure(
+            f"a new device produced {alerted} outbox event(s) where 1 was expected; "
+            "FR-SEC-002 requires the alert and only the trigger enqueues it"
+        )
+
+    # The payload carries what the templates render. The device label in
+    # particular, because a notification saying "new sign-in from an unknown
+    # device" with no device on it is not much of a warning -- the member cannot
+    # act on what they cannot compare against the device in their hand.
+    # Asked of the database rather than read into Python, because `scalar` returns
+    # one line and these bodies are multi-line -- reading the first line of an
+    # email template and concluding it has no placeholder in it would pass for
+    # exactly the templates it is supposed to catch.
+    mentions_device = scalar(
+        db,
+        """SELECT count(*) FROM notification_templates t
+            WHERE t.event_key = 'security.login_new_device'
+              AND t.channel = 'email'
+              AND t.body LIKE '%{{device_label}}%';""",
+    )
+    if mentions_device != "1":
+        raise Failure(
+            "the login_new_device email template does not reference the device "
+            "label; a notification saying 'new sign-in from an unknown device' "
+            "with no device on it is not much of a warning, because the member "
+            f"cannot compare it against the device in their hand (count {mentions_device})"
+        )
+
+    # Now the half that needs a real session row rather than just the function.
+    # The detection is called before the INSERT in the real flow, so a fixture
+    # that inserts first and then asks is asking a different question -- which is
+    # why the row below is inserted *after* the first check, standing in for a
+    # session that has since been signed out.
+    must_succeed(
+        db,
+        "a session on the same device, then signed out",
+        f"""
+        INSERT INTO sessions (user_id, refresh_token_hash, device_label, platform,
+                              refresh_expires_at)
+        SELECT id, decode('ab1ab1', 'hex'), 'Work laptop', 'web',
+               now() + interval '30 days'
+          FROM users WHERE email = '{email}';
+        UPDATE sessions AS s SET revoked_at = now(), revoked_reason = 'signed_out'
+          FROM users u WHERE u.id = s.user_id AND u.email = '{email}';
+        """,
+    )
+    if check("web", "Work laptop") != "f":
+        raise Failure(
+            "a device the member had signed out of was reported as new, so every "
+            "sign-out and sign-in sends a 'we have not seen this device' alert; "
+            "training people to ignore the alert is how it stops working"
+        )
+
+    # A genuinely different device on the same member still alerts, which is the
+    # half that breaks first if the function returns a constant or matches on the
+    # member rather than the device.
+    if check("android", "Pixel 8") != "t":
+        raise Failure(
+            "a second device on the same member was not reported as new, so the "
+            "lookup is matching the member rather than the device"
+        )
+
+    # US-04: revoking a session must not raise an alert. Revoke the phone session
+    # the previous check stood in for, then ask about that device again. The
+    # outbox count is compared before and after, because the function returning
+    # "not new" and the function returning "new but failing to enqueue" are the
+    # same failure seen from two sides, and only the count separates them.
+    must_succeed(
+        db,
+        "revoke the phone session",
+        f"""
+        INSERT INTO sessions (user_id, refresh_token_hash, device_label, platform,
+                              refresh_expires_at)
+        SELECT id, decode('ab2ab2', 'hex'), 'Pixel 8', 'android',
+               now() + interval '30 days'
+          FROM users WHERE email = '{email}';
+        UPDATE sessions AS s SET revoked_at = now(), revoked_reason = 'revoked_by_member'
+          FROM users u WHERE u.id = s.user_id AND u.email = '{email}'
+          AND s.device_label = 'Pixel 8';
+        """,
+    )
+    before = scalar(
+        db,
+        "SELECT count(*) FROM outbox_events WHERE event_type = 'security.login_new_device';",
+    )
+    if check("android", "Pixel 8") != "f":
+        raise Failure(
+            "US-04 is explicit that revoking a session must not send a "
+            "security.login_new_device alert, but the revoked device was reported "
+            "as new"
+        )
+    after = scalar(
+        db,
+        "SELECT count(*) FROM outbox_events WHERE event_type = 'security.login_new_device';",
+    )
+    if before != after:
+        raise Failure(
+            f"US-04 is explicit that revoking a session must not send a "
+            f"security.login_new_device alert, but the outbox went from {before} "
+            f"to {after} events"
+        )
+
+    # The NULL case, which decides how many alerts a browser client sends.
+    # `sessions.device_label` is nullable and a client that sends nothing produces
+    # a row of NULLs; under plain `=` every such client collides with every other
+    # one, because NULL = NULL is unknown. That would mean the sixth silent login
+    # alerts and the first five do not -- an ordering no user can explain and no
+    # support answer can give.
+    #
+    # The fixture row matters: `record_login_new_device` reads `sessions`, and in
+    # the real flow it is called *before* the INSERT. Calling it twice with no row
+    # in between asserts that a function which inserts nothing can distinguish two
+    # consecutive calls, which it cannot and should not -- so the row is written
+    # here too, standing in for the session the first call would have been
+    # followed by.
+    if check(None, None) != "t":
+        raise Failure(
+            "a client's very first sign-in with no device label and no platform "
+            "was not reported as new"
+        )
+    must_succeed(
+        db,
+        "a session with no device label and no platform",
+        f"""
+        INSERT INTO sessions (user_id, refresh_token_hash, device_label, platform,
+                              refresh_expires_at)
+        SELECT id, decode('ac1ac1', 'hex'), NULL, NULL, now() + interval '30 days'
+          FROM users WHERE email = '{email}';
+        """,
+    )
+    if check(None, None) != "f":
+        raise Failure(
+            "a second sign-in with no device label was reported as new, so the "
+            "NULL comparison is not matching NULLs to each other; every member on "
+            "an older client build gets an alert on every login after the first"
+        )
+
+    # And one member's devices never alert for another. Without this the whole
+    # case could pass on a query that matched any session anywhere in the table,
+    # which is the failure mode a member-scoping assertion exists to catch.
+    stranger = scalar(
+        db,
+        """SELECT app.record_login_new_device(
+                (SELECT id FROM users WHERE email = 'notify-device-2@example.ng'),
+                gen_random_uuid(), 'web', 'Work laptop', '198.51.100.9', 'Other/1.0');""",
+    )
+    if stranger != "t":
+        raise Failure(
+            "a device belonging to a different member was treated as already "
+            "known, so the lookup is not scoped to the member"
+        )
+
+    return (
+        "a first device alerts, a signed-out device does not, a second device on "
+        "the same member does, revocation never alerts, NULL device labels match "
+        "each other, and one member's devices are invisible to another"
+    )
+
+
+@case("notifications are queued once, leased once, and delivered")
+def _notification_delivery(db: str) -> str:
+    """
+    The queue semantics, which are the difference between a working alarm and a
+    plausible-looking one.
+
+    Materialisation is exactly-once per channel: `notifications_dedupe_unique` is
+    UNIQUE on (dedupe_key, channel), so a replayed event cannot produce a second
+    email. Delivery is at-least-once, because `notification_status` has no
+    in-flight value and `app.claim_queued_notifications` leases a row by pushing
+    `scheduled_for` forward rather than by marking it sent.
+
+    That asymmetry is deliberate and it is the right way round for these two
+    events specifically. A member who receives "we signed you out, was this you?"
+    twice has been frightened twice and has lost nothing. A member who receives it
+    zero times has been robbed. The two failures are not equivalent, so a queue
+    that quietly drops a row when a worker dies -- which is what exactly-once
+    delivery would buy -- is the wrong side of that trade.
+
+    Which is only defensible if the lease actually expires. If it did not, a worker
+    crash would strand the row forever and the alarm would be lost silently, which
+    is the failure at-least-once delivery exists to avoid.
+
+    Scoped to this case's own member and event throughout, for the reason the case
+    above gives: the cases share a database and earlier ones leave pending outbox
+    rows behind.
+    """
+    email = _loginable(db, "notify-drain@example.ng")
+    token = _open_session(db, email, "9e9e9e", device="laptop")
+
+    must_succeed(
+        db,
+        "rotate, then detect the reuse",
+        as_role(
+            db,
+            "ajo_app",
+            email,
+            f"""SELECT app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('9f0f0f', 'hex'),
+                    now(), now() + interval '30 days');
+                SELECT app.claim_refresh_token(
+                    decode('{token}', 'hex'), decode('9f1f1f', 'hex'),
+                    now(), now() + interval '30 days');""",
+            commit=True,
+        ),
+    )
+
+    mine = f"(payload->>'user_id' = (SELECT id::text FROM users WHERE email = '{email}'))"
+
+    # The outbox row is still pending: nothing has drained it.
+    pending = scalar(
+        db,
+        f"SELECT count(*) FROM outbox_events WHERE event_type = "
+        f"'security.suspicious_token_reuse' AND {mine};",
+    )
+    if pending != "1":
+        raise Failure(
+            f"{pending} outbox event(s) are pending for this member where 1 was "
+            "expected; the event should sit in the outbox until a worker drains it"
+        )
+
+    # The drain is global by design -- it is a worker's job to empty the queue, not
+    # to pick an event -- and it takes a batch limit. The cases above share a
+    # database and left their own pending events behind, so the queue is emptied
+    # in a loop before this case asserts on its own member. Otherwise the batch
+    # limit fills with another case's rows and this one concludes its alarm was
+    # never materialised.
+    while scalar(db, "SELECT count(*) FROM app.drain_security_notifications();") != "0":
+        pass
+
+    drained = scalar(
+        db,
+        f"""SELECT count(*) FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if drained != "3":
+        raise Failure(
+            f"draining produced {drained} notification(s) for this member where 3 "
+            "was expected (push, email and sms); a channel silently missing from "
+            "the drain is a channel the member is never told on"
+        )
+
+    published = scalar(
+        db,
+        f"SELECT count(*) FROM outbox_events WHERE event_type = "
+        f"'security.suspicious_token_reuse' AND status = 'published' AND {mine};",
+    )
+    if published != "1":
+        raise Failure(
+            f"{published} outbox event(s) are published where 1 was expected; the "
+            "event and its notifications have to move together or a crash between "
+            "them loses the alarm"
+        )
+
+    # A second drain finds nothing. Idempotence is what makes a retrying worker
+    # safe, and without it every retry would email the member again.
+    # Counting what the *second drain returns*, which is the only thing that shows
+    # whether it did any work. Counting rows that exist instead would be 3 by
+    # design -- the first drain created them -- and would fail for the right
+    # behaviour having been the right behaviour.
+    again = scalar(
+        db,
+        """SELECT count(*) FROM app.drain_security_notifications();""",
+    )
+    if again != "0":
+        raise Failure(
+            f"a second drain produced {again} notification(s) for this member where "
+            "0 was expected; draining has to be idempotent or a retrying worker "
+            "spams the member with the same alarm"
+        )
+
+    # Claiming leases the rows rather than consuming them, so they come back. Only
+    # this member's rows are counted, because other cases have queued theirs.
+    claimed = scalar(
+        db,
+        f"""SELECT count(*) FROM app.claim_queued_notifications(500)
+             WHERE user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if claimed != "3":
+        raise Failure(
+            f"claiming returned {claimed} notification(s) for this member where 3 "
+            "was expected"
+        )
+    still_queued = scalar(
+        db,
+        f"""SELECT count(*) FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse'
+               AND status = 'queued'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if still_queued != "3":
+        raise Failure(
+            f"claiming consumed {3 - still_queued} of 3 rows; a lease must not mark "
+            "a row sent, because a worker that dies mid-send would then drop the "
+            "alarm silently"
+        )
+
+    # Within the lease they are invisible, which is what stops two API replicas
+    # from sending the same alarm twice.
+    reentrant = scalar(
+        db,
+        f"""SELECT count(*) FROM app.claim_queued_notifications(500)
+             WHERE user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if reentrant != "0":
+        raise Failure(
+            f"a second claim inside the lease window returned {reentrant} rows where "
+            "0 was expected; two API replicas would send the same alarm twice"
+        )
+
+    # Recipients resolve per channel. push has none, and saying so is better than a
+    # function that returns NULL for every real member and looks like it works.
+    push_rows = scalar(
+        db,
+        f"""SELECT count(*) FROM app.claim_queued_notifications(1, 1)
+             WHERE channel = 'push'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if push_rows != "0":
+        raise Failure(
+            "a leased push row was offered again with a one-second lease, so the "
+            "lease length is not being applied; the claimed set here should be "
+            "another member's, not this one's"
+        )
+
+    # Sent and failed both land, with a bounded failure_detail.
+    note_id = scalar(
+        db,
+        f"""SELECT id::text FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse' AND channel = 'email'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}')
+             LIMIT 1;""",
+    )
+    must_succeed(
+        db,
+        "mark one sent and one failed",
+        f"""
+        SELECT app.mark_notification_sent('{note_id}');
+        SELECT app.mark_notification_failed(
+          (SELECT id FROM notifications
+            WHERE event_key = 'security.suspicious_token_reuse' AND channel = 'sms'
+              AND user_id = (SELECT id FROM users WHERE email = '{email}')),
+          repeat('x', 900));
+        """,
+    )
+    final = scalar(
+        db,
+        f"""SELECT status::text FROM notifications WHERE id = '{note_id}'::uuid;""",
+    )
+    if final.strip() != "sent":
+        raise Failure(
+            f"mark_notification_sent did not land: status is {final.strip()!r}"
+        )
+
+    bounded = scalar(
+        db,
+        f"""SELECT length(failure_detail) FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse' AND channel = 'sms'
+               AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if bounded.strip() != "500":
+        raise Failure(
+            f"failure_detail came back {bounded.strip()} characters where 500 was "
+            "expected; a provider error body can be megabytes and this column is "
+            "free text"
+        )
+
+    # The lease expires, so a crashed worker's rows return. `scheduled_for` is
+    # pushed back rather than waiting out the five-minute default.
+    must_succeed(
+        db,
+        "expire this member's leases",
+        f"""UPDATE notifications SET scheduled_for = now() - interval '1 second'
+              WHERE status = 'queued'
+                AND user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    recovered = scalar(
+        db,
+        f"""SELECT count(*) FROM app.claim_queued_notifications(500)
+             WHERE user_id = (SELECT id FROM users WHERE email = '{email}');""",
+    )
+    if recovered != "1":
+        raise Failure(
+            f"{recovered} row(s) came back after the lease expired where 1 was "
+            "expected; a worker crash would otherwise strand the alarm forever, "
+            "which is the failure at-least-once delivery is supposed to prevent"
+        )
+
+    return (
+        "draining materialises push, email and sms and publishes the event in one "
+        "call; a second drain and a second claim inside the lease both return "
+        "nothing; an expired lease returns the row; sent and failed both land with "
+        "a bounded failure detail"
+    )
+
+
+@case("the delivery functions are not open to the whole cluster")
+def _notification_grants(db: str) -> str:
+    """
+    `bootstrap_roles.sql` runs before any migration, so its
+    `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO ajo_app` covers the functions
+    that existed when it ran and nothing created afterwards. The functions in 103
+    are reachable only because PostgreSQL's default is EXECUTE TO PUBLIC and that
+    bootstrap's REVOKE had already happened by the time they were created.
+
+    That default is too loose for these. `app.drain_security_notifications` and
+    `app.claim_queued_notifications` take a user id from their caller and write
+    real rows that a real relay sends mail from, so any role holding EXECUTE can
+    address an alarm to an arbitrary member -- and PUBLIC includes every role in
+    the cluster, including ones nobody has added yet.
+
+    A phishing-shaped use: an attacker with any database foothold writes
+    "your account was compromised, email this link to reclaim it" into a real
+    member's notification stream, from the system's own sender, timed to a real
+    event. It needs nothing but EXECUTE on one function.
+    """
+    # PUBLIC must be gone. Asserted via `has_function_privilege` with the
+    # `public` pseudo-role, because checking `proacl` directly requires knowing
+    # the grant order and the null case is ambiguous.
+    for fn, args in (
+        ("app.drain_security_notifications", "integer"),
+        ("app.claim_queued_notifications", "integer, integer"),
+        ("app.mark_notification_sent", "uuid"),
+        ("app.mark_notification_failed", "uuid, text"),
+    ):
+        open_to_public = scalar(
+            db,
+            f"""SELECT has_function_privilege('public', '{fn}({args})', 'EXECUTE');""",
+        )
+        if open_to_public.strip() == "t":
+            raise Failure(
+                f"{fn} is still executable by PUBLIC; any role in the cluster can "
+                "address a security alarm to an arbitrary member"
+            )
+
+    # And the login path must still work, or the migration has broken the thing
+    # it was written for. `app.record_login_new_device` is called from the API's
+    # login handler as `ajo_app`, so it has to be reachable -- asserted as the
+    # role the worker connects as, which is `ajo_api`, a member of `ajo_app`.
+    for fn, args in (
+        ("app.record_login_new_device", "uuid, uuid, text, text, inet, text"),
+        ("app.enqueue_security_notification", "text, uuid, uuid, jsonb"),
+        ("app.member_email", "uuid"),
+        ("app.drain_security_notifications", "integer"),
+    ):
+        reachable = scalar(
+            db,
+            f"""SELECT has_function_privilege('ajo_api', '{fn}({args})', 'EXECUTE');""",
+        )
+        if reachable.strip() != "t":
+            raise Failure(
+                f"{fn} is not executable by ajo_api, so either the login path or "
+                "the delivery worker cannot call it; the REVOKE went one step too "
+                "far"
+            )
+
+    # `ajo_analytics` is the reporting role and gets no DML anywhere in this
+    # repository. It must not be able to send.
+    for fn, args in (
+        ("app.drain_security_notifications", "integer"),
+        ("app.claim_queued_notifications", "integer, integer"),
+    ):
+        analytics = scalar(
+            db,
+            f"""SELECT has_function_privilege('ajo_analytics', '{fn}({args})', 'EXECUTE');""",
+        )
+        if analytics.strip() == "t":
+            raise Failure(
+                f"ajo_analytics can call {fn}; a reporting role that can write "
+                "notification rows can send mail from the system sender"
+            )
+
+    return (
+        "the four delivery functions are closed to PUBLIC and to analytics, and "
+        "the login path and worker functions are still reachable as ajo_api"
+    )
+
+
+@case("templates render from the payload, and a missing key is not a failure")
+def _template_rendering(db: str) -> str:
+    """
+    `{{key}}` substitution, tested on its own because the interesting failures are
+    all in the edges.
+
+    Three decisions, and the last one is the one worth arguing about.
+
+    A key the payload did not supply substitutes to empty, because the alternative
+    is failing to deliver a compromise alarm over an optional field. The body
+    should be slightly odd -- "at  from android" -- not absent. That reads like a
+    typo to the member, which is survivable; silence is not.
+
+    A placeholder nobody supplied is left alone, so the caller can strip it. That
+    split is what lets the drain be one pass: substitute everything the payload
+    has, then remove whatever is left. A template typo therefore produces a
+    visibly wrong message that a human notices, rather than a silently truncated
+    one that nobody does.
+
+    And substitution is not recursive. A device label is attacker-influenced text
+    -- it comes from the client that is logging in -- so if the implementation
+    re-scanned its own output, a member whose device is named `{{platform}}` would
+    have the platform substituted into their notification, and a label naming a
+    template key could pull arbitrary payload values into the message. Small, but it
+    is our own mail rendering untrusted input twice, and the fix is one `replace`
+    call rather than a loop.
+
+    The NULL cases are asserted because a raise inside the drain takes the whole
+    batch with it: one malformed row would stop every security alarm in flight.
+    """
+    # The ordinary case. The unsupplied `{{ip_address}}` deliberately stays put,
+    # because `record_login_new_device` writes that key as a JSON null rather than
+    # omitting it, and the empty substitution is what produces "at  from".
+    got = scalar(
+        db,
+        """SELECT app.render_notification_body(
+                 'Device: {{device_label}} at {{ip_address}} from {{platform}}',
+                 '{"device_label": "Pixel 8", "platform": "android"}'::jsonb);""",
+    )
+    expected = "Device: Pixel 8 at {{ip_address}} from android"
+    if got.strip() != expected:
+        raise Failure(
+            "substitution should replace supplied keys and leave unsupplied "
+            f"placeholders for the caller to strip; expected {expected!r} and got "
+            f"{got.strip()[:200]!r}"
+        )
+
+    # An explicitly null value, which is not the same as an absent key and is the
+    # case this function actually sees in production: `record_login_new_device`
+    # puts a real JSON null in the payload for a client that sent no device label.
+    # `jsonb_each_text` yields SQL NULL for it, so without a coalesce the whole
+    # `replace` returns NULL and the drain raises on a real login.
+    null_value = scalar(
+        db,
+        """SELECT coalesce(
+                 app.render_notification_body('Device: {{device_label}}',
+                   '{"device_label": null}'::jsonb), '<null>');""",
+    )
+    if null_value.strip() != "Device:":
+        raise Failure(
+            "an explicitly null payload value should render as empty, not NULL and "
+            f"not the text 'null'; got {null_value.strip()[:120]!r}"
+        )
+
+    # Not recursive: a substituted value that looks like a placeholder is inert.
+    not_recursive = scalar(
+        db,
+        """SELECT app.render_notification_body(
+                 'Device: {{device_label}}',
+                 '{"device_label": "{{platform}}"}'::jsonb);""",
+    )
+    if not_recursive.strip() != "Device: {{platform}}":
+        raise Failure(
+            "substitution recursed into a substituted value; a device label of "
+            f"'{{{{platform}}}}' was rendered as the platform: "
+            f"{not_recursive.strip()[:200]!r}"
+        )
+
+    # NULL in, template out. Returning the template unchanged rather than NULL is
+    # deliberate: a NULL body would violate `notifications.body NOT NULL` and the
+    # insert would fail.
+    null_template = scalar(
+        db,
+        """SELECT coalesce(app.render_notification_body(NULL, '{}'::jsonb), '<null>');""",
+    )
+    if null_template.strip() != "<null>":
+        raise Failure(
+            f"a NULL template should render to NULL, not raise; got "
+            f"{null_template.strip()[:120]!r}"
+        )
+    null_payload = scalar(
+        db,
+        """SELECT app.render_notification_body('body', NULL);""",
+    )
+    if null_payload.strip() != "body":
+        raise Failure(
+            "a NULL payload should leave the template unchanged rather than raise "
+            f"or blank it; got {null_payload.strip()[:120]!r}"
+        )
+
+    # The rows that actually ship. The two cases above leave queued rows behind,
+    # and this one reads `notifications`, so the queue is materialised first --
+    # otherwise there is nothing here to inspect and the count is zero by
+    # accident.
+    while scalar(db, "SELECT count(*) FROM app.drain_security_notifications();") != "0":
+        pass
+
+    # No placeholder left in any shipped body, on any channel. Checked across the
+    # whole table rather than for one event, because the two templates differ in
+    # exactly the place a leftover would hide: the reuse bodies have no
+    # `{{device_label}}` at all, so a strip that only worked for keys the template
+    # happened to use would leave the SMS ones clean by luck.
+    leftovers = scalar(
+        db,
+        "SELECT count(*) FROM notifications WHERE body LIKE '%{{%' OR body LIKE '%}}%';",
+    )
+    if leftovers != "0":
+        raise Failure(
+            f"{leftovers} queued notification(s) still contain a placeholder; the "
+            "drain strips them, and a leftover in a security email erodes trust in "
+            "the one message that has to be believed"
+        )
+
+    # The rendered reuse email actually says what happened, on the channel a
+    # member is most likely to read carefully. Asked of the database in one
+    # expression because `scalar` returns a single line and these bodies are
+    # multi-line, so reading the first line into Python would pass for exactly the
+    # templates it is meant to catch.
+    # Counted as "how many reuse emails *fail* the test", because the cases above
+    # share a database and have queued this event for several members -- an
+    # equality check against 1 would be asserting on how many fixtures ran.
+    silent = scalar(
+        db,
+        """SELECT count(*) FROM notifications
+             WHERE event_key = 'security.suspicious_token_reuse'
+               AND channel = 'email'
+               AND (body NOT LIKE '%already been used%'
+                 OR body NOT LIKE '%signed out%'
+                 OR body NOT LIKE '%password%');""",
+    )
+    if silent != "0":
+        raise Failure(
+            f"{silent} reuse email(s) do not say what happened and what to do -- a "
+            "member who does not know to change their password cannot respond to "
+            "the alarm, so the notification exists and communicates nothing"
+        )
+
+    return (
+        "supplied keys substitute and unsupplied ones survive for the caller to "
+        "strip, a JSON null renders as empty, substitution is not recursive so a "
+        "device label cannot inject into the template, NULL renders without "
+        "raising, and the shipped notifications retain no placeholder"
+    )
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")

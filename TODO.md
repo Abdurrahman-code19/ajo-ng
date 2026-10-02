@@ -245,10 +245,18 @@ Enforced by the database, not just by the domain:
 
   Three things in here are unfinished, deliberately and with the reason:
 
-  - `security.login_new_device` and `security.suspicious_token_reuse` are
-    recorded in `audit_logs` but not *delivered*. There is no notification
-    template or dispatcher on the platform yet, and writing one before 12.4.2's
-    threat model settles would be guessing at the contract.
+  - **Now delivered by migration `104` and `packages/api/src/notifications.ts`.**
+    Both security events are enqueued to `outbox_events` by a trigger on
+    `audit_logs`, so the alarm is written by the same transaction that revokes the
+    sessions and cannot be lost between the revocation committing and a worker
+    noticing. A worker drains the outbox into one row per channel, leases them, and
+    sends email. Security notifications ignore `notification_preferences` and quiet
+    hours, deliberately: a mute anyone can set is a mute an attacker can set.
+  - Still open there: **push and SMS have no provider.** Both rows are materialised
+    and leased, then left `queued` rather than marked failed, because "failed" would
+    be a false report about a channel nobody has integrated. They will be delivered
+    when a provider exists — and the backlog accumulated in the meantime is
+    deliberate, not a leak.
   - Refresh replacement reuses the 30-day window, so a session that is refreshed
     every 29 days can live indefinitely. The absolute limit (90 days) is enforced
     against `sessions.created_at` and is the real bound; if 12.4.3 is read as

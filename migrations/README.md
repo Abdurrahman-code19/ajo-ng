@@ -56,6 +56,7 @@ its own foreign keys by hand without a great deal of care. The result is
 | `101_claim_token_visibility` | lets the claim function's owner see the token it is about to consume |
 | `102_token_lock_policy` | the `USING` clause the claim function's `FOR UPDATE` needs, because `FOR UPDATE` applies UPDATE policies |
 | `103_login_refresh` | login, refresh rotation, the spent-token ledger that makes replay observable, and the narrow migrator grants the two unauthenticated functions need |
+| `104_security_notifications` | the security notification templates, the `audit_logs` trigger that enqueues both alarms in the revocation's own transaction, new-device recognition, and the drain/lease/mark functions the delivery worker calls |
 
 Deferred objects come last because they reference things created above them.
 

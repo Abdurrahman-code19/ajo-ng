@@ -10,7 +10,8 @@ import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { createAccessTokenPair } from './access-token.js';
 import { createPool } from './db.js';
-import { createVerificationSender } from './mailer.js';
+import { createNotificationTransport, createVerificationSender } from './mailer.js';
+import { runWorker } from './notifications.js';
 import { createFixedWindowLimiter } from './rate-limit.js';
 
 async function main(): Promise<void> {
@@ -39,6 +40,36 @@ async function main(): Promise<void> {
     verifier,
   });
 
+  // The security notification worker, started after the app so it can log through
+  // the real logger. Started before `listen` rather than after, and that is
+  // deliberate in the direction it looks wrong: the alarms are already in the
+  // queue from the previous process's login traffic, and a deploy that serves
+  // logins before anyone is draining the outbox makes that window longer on every
+  // release.
+  //
+  // The signal is a promise rather than a flag because the worker awaits it
+  // between passes. A boolean checked at the top of a loop with a 30-second sleep
+  // inside it would ignore SIGTERM for up to 30 seconds, and this process has 10
+  // seconds of grace before it is killed -- so the flag version would be shut down
+  // by the platform every single time. See `runWorker`.
+  let signalWorkerStop: (() => void) | undefined;
+  const workerStopped = new Promise<void>((resolve) => {
+    signalWorkerStop = resolve;
+  });
+
+  void runWorker(
+    pool,
+    createNotificationTransport(config.environment, app.log, config.mail),
+    app.log,
+    workerStopped,
+  ).catch((error: unknown) => {
+    // Without this the worker is a floating promise and a failure -- an
+    // unreachable database, say -- stops delivery with nothing in the logs but a
+    // generic unhandled rejection. Better a loud line and no delivery than a
+    // silently drained queue.
+    app.log.error({ err: error }, 'the security notification worker stopped unexpectedly');
+  });
+
   // Registering the shutdown hooks before `listen` means a process that is
   // interrupted during startup still gets them, which is the window where an
   // aborted deploy otherwise leaves a connection open.
@@ -56,6 +87,15 @@ async function main(): Promise<void> {
     // connection, and the 10-second grace period exists so those requests get
     // to finish first.
     await app.close();
+
+    // Then the worker, and before the pool. A worker still mid-pass when the pool
+    // closes fails on a released connection, which turns an orderly shutdown into a
+    // 'could not deliver' on an alarm the member was owed. The signal is
+    // synchronous and the worker's own pass is bounded by the relay's 15s timeout,
+    // so this resolves promptly; it is not awaited to completion because the grace
+    // period, not this function, is what guarantees the process exits.
+    signalWorkerStop?.();
+
     await limiter.close();
     await pool.end();
 

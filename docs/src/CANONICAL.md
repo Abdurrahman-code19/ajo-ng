@@ -276,10 +276,24 @@ Admin: Overview, Users, Ajos, Disputes, Risk/Fraud, Verification, Reports, Audit
 | `payout.held` | recipient + organizer | ✔ | ✔ | ✔ | on insufficient funding |
 | `ajo.completed` | all members | ✔ | ✔ | — | on completion |
 | `dispute.opened` / `dispute.resolved` | parties | ✔ | ✔ | — | immediate |
-| `security.login_new_device` | user | ✔ | ✔ | — | immediate |
+| `security.login_new_device` | user | ✔ | ✔ | ✔ | immediate |
+| `security.suspicious_token_reuse` | user | ✔ | ✔ | ✔ | immediate |
 | `account.frozen` | user | ✔ | ✔ | ✔ | immediate |
 
 SMS reserved for money-critical and security events. Push and email for the rest.
+
+Two rows in that table are not a free choice, and both were corrected here by
+migration `104` rather than in this file alone:
+
+- `security.suspicious_token_reuse` is required by §12.4.2 — *notify every
+  registered contact* — and was missing from this catalogue entirely, even though
+  the code emitted it.
+- Both security rows carry SMS. `security.login_new_device` printed an em dash
+  here, and `app.assert_money_critical_has_sms` (a deferred constraint trigger
+  adopted in migration `000`) refuses to commit *any* `is_security` template
+  without an active SMS sibling. The schema and this table had been contradicting
+  each other since migration `000`; the schema won, because a member's phone is
+  the one channel that reaches them when they have lost the device that was stolen.
 
 ---
 

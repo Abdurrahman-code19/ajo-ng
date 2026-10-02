@@ -31,7 +31,8 @@ import { createPool } from '../src/db.js';
 import { hashToken } from '../src/identity.js';
 import { allowAllLimiter, createFixedWindowLimiter, type RateLimiter } from '../src/rate-limit.js';
 import type { Config } from '../src/config.js';
-import type { VerificationSender } from '../src/mailer.js';
+import type { NotificationTransport, VerificationSender } from '../src/mailer.js';
+import { drainOnce } from '../src/notifications.js';
 
 const HAVE_REDIS = process.env['REDIS_AVAILABLE'] === '1';
 
@@ -645,6 +646,366 @@ async function loginableMember(prefix: string): Promise<{
 
   return { email, password, userId };
 }
+
+/**
+ * Captures what would have been sent, so a test can assert on a delivered alarm.
+ *
+ * A separate class from `CapturingMailer` rather than one that implements both
+ * interfaces, because the two are different contracts with opposite rules:
+ * `VerificationSender` handles a secret and must never log one, while
+ * `NotificationTransport` sends a loud warning to a human. Sharing a recorder
+ * would put a token and an alarm in the same array, and an assertion like
+ * "the last message is the reuse warning" would then pass or fail depending on
+ * whether registration happened to run first.
+ */
+class CapturingTransport implements NotificationTransport {
+  readonly sent: { to: string; subject: string; body: string }[] = [];
+  /** Set to make every send reject, to exercise the failed path. */
+  failWith: Error | undefined;
+
+  async sendEmail(message: { to: string; subject: string; body: string }): Promise<void> {
+    if (this.failWith !== undefined) {
+      throw this.failWith;
+    }
+    this.sent.push(message);
+  }
+}
+
+/**
+ * Outbox events for one member, read as the superuser.
+ *
+ * Needed because the outbox and the notifications table are two different stages,
+ * and a login only reaches the first. Asserting on `notifications` straight after
+ * a sign-in asserts on a stage that no worker has run yet, which is a test that
+ * fails for the wrong reason and then gets "fixed" by deleting the assertion.
+ */
+async function outboxFor(userId: string, eventType?: string) {
+  const values: string[] = [userId];
+  const filter = eventType === undefined ? '' : (values.push(eventType), 'AND event_type = $2');
+  const result = await admin.query(
+    `SELECT id::text, event_type, status::text, aggregate_id::text, payload
+       FROM outbox_events
+      WHERE payload ->> 'user_id' = $1::text ${filter}
+      ORDER BY created_at`,
+    values,
+  );
+  return result.rows as {
+    id: string;
+    event_type: string;
+    status: string;
+    aggregate_id: string;
+    payload: Record<string, unknown>;
+  }[];
+}
+
+/** Queued notifications for one member, read as the superuser. */
+async function queuedFor(userId: string, eventKey?: string) {
+  const values: string[] = [userId];
+  const filter =
+    eventKey === undefined ? '' : (values.push(eventKey), 'AND event_key = $2');
+  const result = await admin.query(
+    // No `recipient` here, because the table does not have one: the address is
+    // resolved by `app.claim_queued_notifications` at lease time, so that a member
+    // who changes their email between queueing and delivery is written to the new
+    // one. Selecting a stored address would have been testing a column that does
+    // not exist, which is what happened.
+    `SELECT id::text, channel::text, subject, body, status::text
+       FROM notifications
+      WHERE user_id = $1 ${filter}
+      ORDER BY created_at, channel`,
+    values,
+  );
+  return result.rows as {
+    id: string;
+    channel: string;
+    subject: string | null;
+    body: string;
+    status: string;
+  }[];
+}
+
+/** A log sink that keeps the test output readable; the worker logs on every pass. */
+function silentLog() {
+  return { info: () => undefined, warn: () => undefined };
+}
+
+describe('security notifications', () => {
+  let transport: CapturingTransport;
+
+  before(() => {
+    transport = new CapturingTransport();
+  });
+
+  it('queues an alarm the first time a member uses a device, and never again', async () => {
+    // The claim that matters: the alarm fires once per real device, and a member
+    // who signs in on the same device every morning must not be trained to ignore
+    // it. Getting this wrong in the "always" direction is the failure a support
+    // request would report as spam; getting it wrong in the "never" direction is
+    // the one nobody reports, because nothing happens.
+    const member = await loginableMember('newdev');
+
+    const first = await signIn(member.email, member.password, {
+      deviceLabel: 'a phone nobody has seen',
+      platform: 'android',
+    });
+    assert.equal(first.statusCode, 200, first.body);
+
+    // The login produced an outbox event and nothing else, because materialising a
+    // notification is a worker's job. Asserted in this order deliberately: the
+    // event is what the login transaction is responsible for, and the rows are what
+    // the worker is responsible for, and this test is about the first.
+    const events = await outboxFor(member.userId, 'security.login_new_device');
+    assert.equal(events.length, 1, 'the login enqueued exactly one event');
+    const enqueued = events[0];
+    assert.ok(enqueued !== undefined, 'the event asserted above is the one checked below');
+    assert.equal(enqueued.status, 'pending', 'and nothing has drained it yet');
+    // The event's aggregate is the session, which is what makes
+    // `outbox_events_dedupe_unique` meaningful for this event: two events about the
+    // same session are the same alarm, two events about different sessions are not.
+    assert.equal(
+      enqueued.aggregate_id,
+      (first.json() as { sessionId: string }).sessionId,
+      'the alarm is about the session that was just created',
+    );
+
+    await drainOnce(pool, transport, silentLog());
+    const afterFirst = await queuedFor(member.userId, 'security.login_new_device');
+    assert.equal(afterFirst.length, 3, 'push, email and sms are all queued');
+    // Per channel, not collectively. Email has a transport in this repository and
+    // push and sms do not, so after one pass the three rows have three different
+    // states -- and an assertion that they share one would pass only by being wrong
+    // about two of them.
+    assert.equal(
+      afterFirst.find((row) => row.channel === 'email')?.status,
+      'sent',
+      'email is delivered by the worker',
+    );
+    for (const channel of ['push', 'sms']) {
+      assert.equal(
+        afterFirst.find((row) => row.channel === channel)?.status,
+        'queued',
+        `${channel} has no provider, so its row stays queued rather than failing`,
+      );
+    }
+
+    // Two more logins on the same device, and a second login after logging out --
+    // the last one is the interesting case, because a revoked session is still
+    // evidence that this device belongs to the member.
+    await signIn(member.email, member.password, {
+      deviceLabel: 'a phone nobody has seen',
+      platform: 'android',
+    });
+    const afterSignOut = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: withBearer(
+        (first.json() as { accessToken: string }).accessToken,
+      ),
+    });
+    assert.equal(afterSignOut.statusCode, 204, afterSignOut.body);
+    await signIn(member.email, member.password, {
+      deviceLabel: 'a phone nobody has seen',
+      platform: 'android',
+    });
+
+    // Drained again before counting, because these logins enqueue nothing and so
+    // materialise nothing: the count below is only meaningful once the queue has
+    // been emptied, or it would be reading the three rows from the first pass.
+    await drainOnce(pool, transport, silentLog());
+    const afterAll = await queuedFor(member.userId, 'security.login_new_device');
+    assert.equal(
+      afterAll.length,
+      3,
+      'the same device must not queue a second alarm, even after being signed out',
+    );
+    assert.equal(
+      (await outboxFor(member.userId, 'security.login_new_device')).length,
+      1,
+      'no second event was enqueued either',
+    );
+
+    // A genuinely new device is still recognised as new.
+    await signIn(member.email, member.password, {
+      deviceLabel: 'a laptop nobody has seen',
+      platform: 'web',
+    });
+    await drainOnce(pool, transport, silentLog());
+    const withLaptop = await queuedFor(member.userId, 'security.login_new_device');
+    assert.equal(withLaptop.length, 6, 'a second device queues its own alarm');
+  });
+
+  it('sends the email over the transport and leaves nothing queued behind', async () => {
+    const member = await loginableMember('deliver');
+    await signIn(member.email, member.password, { deviceLabel: 'the first device' });
+
+    const result = await drainOnce(pool, transport, silentLog());
+
+    // `materialised` is a count over the whole queue, and other members' events are
+    // in it too, so the claim is "this event became three rows", not "this call
+    // made three". The per-member count below is the scoped version.
+    assert.ok(result.materialised >= 3, 'the outbox event became queued rows');
+    const delivered = transport.sent.filter((m) => m.to === member.email);
+    assert.equal(delivered.length, 1, 'one email, to the member, not three');
+    // Named out of the array rather than indexed at each use: `noUncheckedIndexedAccess`
+    // makes `delivered[0]` a possibly-undefined on every single line, and the fix for
+    // that is normally a non-null assertion. Here the length was asserted one line
+    // above, so binding it to a name states the same thing without an assertion that
+    // could silently outlive the check.
+    const message = delivered[0];
+    assert.ok(message !== undefined, 'the delivered message is the one asserted above');
+    // The subject and the body are asserted separately because they fail
+    // differently. A vague subject is a triage problem: the member decides whether to
+    // open the message from the subject line alone, and a notification with a broken
+    // subject is an unread one. A body that omits what to do is a security problem:
+    // it tells someone they are being robbed and then stops.
+    assert.ok(
+      message.subject.toLowerCase().includes('new sign-in'),
+      `the subject should say what happened: ${message.subject}`,
+    );
+    for (const fragment of [
+      'device we have not seen before',
+      'if this was you, no action is needed',
+      'if it was not',
+      'sign out and revoke your sessions now',
+      'changing your password signs you out everywhere',
+    ]) {
+      assert.ok(
+        message.body.toLowerCase().includes(fragment),
+        `the body should tell the member what happened and what to do; missing "${fragment}": ${message.body}`,
+      );
+    }
+
+    // The placeholders are gone. A body with a raw {{device_label}} in it is how a
+    // member learns to distrust an alert, and it would pass every assertion above
+    // because the surrounding prose is still correct.
+    assert.ok(!/\{\{/.test(message.body), `no placeholder survives: ${message.body}`);
+
+    // Idempotent: a second pass with an empty outbox must send nothing, because a
+    // worker that runs every five seconds forever would otherwise mail the same
+    // alarm every five seconds forever.
+    const again = await drainOnce(pool, transport, silentLog());
+    assert.equal(again.materialised, 0);
+    assert.equal(again.attempted, 0);
+    assert.equal(
+      transport.sent.filter((m) => m.to === member.email).length,
+      1,
+      'the alarm was already delivered',
+    );
+  });
+
+  it('delivers the reuse alarm, which is written by the rotation transaction', async () => {
+    // The end-to-end path for the other event, and the one that matters most: the
+    // alarm is written by `app.claim_refresh_token` revoking the sessions, not by
+    // any code in the API. If the trigger were missing, this member is robbed and
+    // never hears about it, and nothing else in the suite would notice.
+    const member = await loginableMember('reuse-notify');
+    const device = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    const stolen = refreshCookieOf(device);
+
+    const rotated = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(stolen),
+    });
+    assert.equal(rotated.statusCode, 200, rotated.body);
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: withCookie(stolen),
+    });
+    assert.equal(replay.statusCode, 401, replay.body);
+
+    // Enqueued by the same transaction that revoked the sessions -- so asserted
+    // before any worker runs, or the test cannot tell which step did it.
+    const events = await outboxFor(member.userId, 'security.suspicious_token_reuse');
+    assert.equal(events.length, 1, 'the reuse alarm is enqueued by the rotation');
+
+    await drainOnce(pool, transport, silentLog());
+    const queued = await queuedFor(member.userId, 'security.suspicious_token_reuse');
+    assert.equal(queued.length, 3);
+
+    // Matched on the body rather than the subject, because the subject says what
+    // happened to the *account* ("Your Ajo sessions were signed out") and carries no
+    // word that identifies this event. Filtering on a word the subject happens not
+    // to contain is how a test ends up asserting on a template's wording instead of
+    // on the delivery.
+    const delivered = transport.sent.filter(
+      (m) => m.to === member.email && m.body.includes('already been used'),
+    );
+    assert.equal(delivered.length, 1, 'the reuse alarm reaches the member');
+    const alarm = delivered[0];
+    assert.ok(alarm !== undefined, 'the delivered alarm is the one asserted above');
+    for (const fragment of ['already been used', 'signed out', 'password']) {
+      assert.ok(
+        alarm.body.includes(fragment),
+        `a member who does not know to change their password cannot act on the alarm; missing "${fragment}": ${alarm.body}`,
+      );
+    }
+  });
+
+  it('records a failed send as failed rather than dropping the alarm quietly', async () => {
+    const member = await loginableMember('relay-down');
+    await signIn(member.email, member.password, { deviceLabel: 'a device' });
+
+    const broken = new CapturingTransport();
+    broken.failWith = new Error('the mail relay is down');
+    const result = await drainOnce(pool, broken, silentLog());
+
+    assert.equal(result.attempted, 0, 'nothing was delivered');
+
+    const rows = await queuedFor(member.userId, 'security.login_new_device');
+    const email = rows.find((row) => row.channel === 'email');
+    // An email row is the premise of this test: `login_new_device` queues all three
+    // channels and the failing one is picked out by name, so `undefined` here means
+    // the queue never produced an email and the failure detail is untested.
+    assert.ok(email !== undefined, 'a security notification queues an email');
+    assert.equal(email.status, 'failed');
+
+    // And the detail is bounded, so a verbose relay error cannot grow the row
+    // without limit. Asserted as <= 500 because that is the function's contract.
+    const detail = await admin.query(
+      'SELECT length(failure_detail) AS n FROM notifications WHERE id = $1',
+      [email.id],
+    );
+    assert.ok(
+      Number(detail.rows[0].n) <= 500,
+      `failure_detail must be bounded, got ${detail.rows[0].n}`,
+    );
+
+    // Push and sms are untouched. They have no transport, and calling them
+    // "failed" would be a false report about what happened to them.
+    const others = rows.filter((row) => row.channel !== 'email');
+    assert.ok(
+      others.every((row) => row.status === 'queued'),
+      'channels with no transport stay queued, for when a provider exists',
+    );
+  });
+
+  it('never silences an alarm because the member muted their notifications', async () => {
+    // A member can mute everything in settings. That must not mute this, because
+    // a mute anyone can set is a mute an attacker can set.
+    const member = await loginableMember('muted');
+    await admin.query(
+      `UPDATE notification_preferences
+          SET push_enabled = false, email_enabled = false, sms_enabled = false,
+              money_sms_opt_in = false, quiet_hours_start = '23:00',
+              quiet_hours_end = '06:00'
+        WHERE user_id = $1`,
+      [member.userId],
+    );
+
+    await signIn(member.email, member.password, { deviceLabel: 'a device' });
+    await drainOnce(pool, transport, silentLog());
+
+    const rows = await queuedFor(member.userId, 'security.login_new_device');
+    assert.equal(
+      rows.length,
+      3,
+      'a security notification ignores preferences and quiet hours',
+    );
+  });
+});
 
 const signIn = (email: string, password: string, over: Record<string, unknown> = {}) =>
   app.inject({

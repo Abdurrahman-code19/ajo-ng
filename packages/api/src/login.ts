@@ -283,6 +283,36 @@ async function loginOnce(
       throw new Error('the session insert returned no id');
     }
 
+    // After the insert, and passed the real session id rather than a generated
+    // one. The function answers "have we seen this device before?" by looking at
+    // `sessions` history and excluding the session it is told about, so calling it
+    // here means the audit row names a session that exists -- which is what
+    // `outbox_events_dedupe_unique` needs, since it is UNIQUE on
+    // (event_type, aggregate_id) and an id that matches no session cannot dedupe
+    // against anything.
+    //
+    // Called before the insert instead, with a random id, the two problems are
+    // inverse and equally bad: the lookup would not see the new row at all, so
+    // every login looks new, and the alert would fire on every single one.
+    //
+    // It writes an audit row rather than inserting a notification directly, and
+    // that indirection is not ceremony. The audit row is inside this transaction,
+    // and migration 104's trigger turns it into an outbox event in the same
+    // commit -- so the alert cannot be lost between the login committing and a
+    // worker noticing, which is the same reason the reuse alarm is enqueued from
+    // a trigger rather than from `refresh.ts`.
+    await client.query(
+      `SELECT app.record_login_new_device($1, $2::uuid, $3, $4, $5::inet, $6)`,
+      [
+        credential.user_id,
+        sessionId,
+        input.platform ?? null,
+        input.deviceLabel ?? null,
+        input.clientIp ?? null,
+        input.userAgent ?? null,
+      ],
+    );
+
     // After the insert, so the new session is one of the rows being counted. See
     // `EVICT_PAST_CAP`.
     await client.query(EVICT_PAST_CAP, [credential.user_id, config.maxSessions]);
