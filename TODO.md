@@ -57,6 +57,27 @@ them:
 | Web / admin | Not started |
 | Mobile | Not started |
 | Legal | **0 of 15 items cleared** — gates launch independently of engineering |
+### Known data gap — one legacy fee is not itemised
+
+Found while verifying migration `106` against live: the aggregate and the itemisation
+disagree, and they are both individually correct.
+
+Round 1 of the adopted seed data has three contributions of ₦1,000 — two `paid`, one
+`defaulted`. At 2% that is ₦40 of fees, and `rounds.fee_collected_kobo` is 4000, which is
+right (migration `105` corrected it from 0). But `fees` holds one row, not two: ₦20 for the
+first paid contribution. The second paid contribution has no `fees` row at all, and the row
+that does exist has `payment_id` and `ledger_transaction_id` both NULL, because it predates
+the ledger and has never been linked to a payment.
+
+So `rounds.fee_collected_kobo <> sum(fees.fee_kobo)` on this row, and a reconciliation job
+comparing the two will flag it on its first run. Deliberately left as it is: the alternative
+is writing a fee row into a live money table outside the capture path that is the only thing
+allowed to create one. The invariant holds for everything `105` itself posts, which posts
+both the aggregate and the itemisation together.
+
+Decide with `E3-08` whether reconciliation treats this row as a known opening balance or
+whether it gets an explicit one-time backfill. Do not let it become a day-one page that
+everybody learns to ignore.
 
 Verified: `npm run verify` → 70 domain + 37 API unit, 0 fail. `python3 scripts/test_api.py` →
 81/81. `python3 scripts/test_migrations.py` → 32/32.
