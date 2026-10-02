@@ -43,6 +43,9 @@ const harness: ProviderHarness = {
         .digest('hex'),
     };
   },
+
+  signRaw: (provider, rawBody) =>
+    (provider as MockFinancialProvider).sign(rawBody),
 };
 
 runProviderContract('MockFinancialProvider', harness);

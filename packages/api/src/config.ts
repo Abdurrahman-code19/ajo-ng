@@ -73,11 +73,68 @@ export interface Config {
    * balancer silently logs people out. The composition root branches on this
    * field rather than on `environment`, so there is one place that knows.
    */
+  readonly webhooks: {
+    /**
+     * Deliveries allowed per window, per client address, per provider.
+     *
+     * Generous compared to the login limit, because the sender is not a person:
+     * a provider retries on its own schedule and a burst of confirmations is
+     * ordinary traffic, not an attack. The limit exists for the other direction
+     * -- an unbounded endpoint that writes a row per request into a table with no
+     * other authentication on it.
+     */
+    readonly rateLimit: number;
+    readonly windowMs: number;
+    /**
+     * Which providers this process accepts webhooks for, keyed by the id used in
+     * the path. An id absent from this map has no HMAC secret and therefore no
+     * endpoint at all.
+     *
+     * Absence is the configuration, not an oversight to be defaulted away. A
+     * provider with no secret cannot be verified against, and an endpoint that
+     * accepted its traffic anyway would be a money path guarded by nothing. So
+     * there is no default secret and no fallback: unconfigured is unconfigured.
+     *
+     * There is deliberately no boot-time refusal for an empty map either, because
+     * the provider integration is not approved yet (`E3-01`) and an API that
+     * cannot yet take webhooks is a working API. What refuses to start is
+     * configuration that is half-written, below.
+     */
+    readonly secrets: Readonly<Record<string, string>>;
+  };
   readonly signingKey: {
     readonly privateKeyPem: string;
     readonly publicKeyPem: string;
     readonly source: 'configured' | 'ephemeral';
   };
+}
+
+/**
+ * The webhook secrets, keyed by provider id.
+ *
+ * Each provider is independent and each absence is silent, which is the opposite
+ * of how the mail relay and the signing key are treated here. The reason is that
+ * a half-set pair is a *mistake* in both of those cases -- one variable forgotten
+ * next to the other -- while a provider with no secret is a provider that is not
+ * switched on yet. The integration is not approved (`E3-01`), so the correct
+ * production state today is an empty map, and a boot-time refusal for it would
+ * make the whole API unbootable until a business decision lands. An endpoint
+ * that is off is safe; an endpoint with a default secret is not.
+ */
+const WEBHOOK_SECRET_VARIABLES: Readonly<Record<string, string>> = {
+  mock: 'MOCK_WEBHOOK_SECRET',
+  providus_unity: 'PROVIDUSUNITY_WEBHOOK_SECRET',
+};
+
+function loadWebhookSecrets(env: NodeJS.ProcessEnv): Readonly<Record<string, string>> {
+  const secrets: Record<string, string> = {};
+  for (const [providerId, variable] of Object.entries(WEBHOOK_SECRET_VARIABLES)) {
+    const value = env[variable];
+    if (value !== undefined && value !== '') {
+      secrets[providerId] = value;
+    }
+  }
+  return secrets;
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -234,6 +291,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
           : integer(env['LOGIN_WINDOW_MS'], 'LOGIN_WINDOW_MS'),
       maxSessions:
         env['MAX_SESSIONS'] === undefined ? 5 : integer(env['MAX_SESSIONS'], 'MAX_SESSIONS'),
+    },
+    webhooks: {
+      rateLimit:
+        env['WEBHOOK_RATE_LIMIT'] === undefined
+          ? 120
+          : integer(env['WEBHOOK_RATE_LIMIT'], 'WEBHOOK_RATE_LIMIT'),
+      windowMs:
+        env['WEBHOOK_WINDOW_MS'] === undefined
+          ? 60 * 1000
+          : integer(env['WEBHOOK_WINDOW_MS'], 'WEBHOOK_WINDOW_MS'),
+      secrets: loadWebhookSecrets(env),
     },
     signingKey: loadSigningKey(env, environment),
   };

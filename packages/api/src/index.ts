@@ -13,6 +13,8 @@ import { createPool } from './db.js';
 import { createNotificationTransport, createVerificationSender } from './mailer.js';
 import { runWorker } from './notifications.js';
 import { createFixedWindowLimiter } from './rate-limit.js';
+import { createProviderRegistry } from './providers.js';
+import { runSettlementWorker } from './settlement-worker.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -22,6 +24,14 @@ async function main(): Promise<void> {
     limit: config.registration.rateLimit,
     windowMs: config.registration.windowMs,
   });
+  const webhookLimiter = createFixedWindowLimiter({
+    url: config.redis.url,
+    limit: config.webhooks.rateLimit,
+    windowMs: config.webhooks.windowMs,
+    namespace: 'webhook',
+  });
+
+  const providers = createProviderRegistry({ secrets: config.webhooks.secrets });
 
   // Built before the app, and awaited, so a malformed key fails the boot instead
   // of the first login. `jose`'s imports are async, which is the reason this is
@@ -32,6 +42,8 @@ async function main(): Promise<void> {
     config,
     pool,
     limiter,
+    webhookLimiter,
+    resolveProvider: providers.resolve,
     // Returns the HTTP relay in production and refuses to construct at all if one
     // is not configured, so a deploy cannot log verification tokens by accident.
     // See `mailer.ts`.
@@ -68,6 +80,12 @@ async function main(): Promise<void> {
     // generic unhandled rejection. Better a loud line and no delivery than a
     // silently drained queue.
     app.log.error({ err: error }, 'the security notification worker stopped unexpectedly');
+  });
+
+  // The settlement worker, for the same reason and with the same failure mode: a
+  // queue that is never drained is a queue of payments nobody has been told about.
+  void runSettlementWorker(pool, app.log, workerStopped).catch((error: unknown) => {
+    app.log.error({ err: error }, 'the settlement worker stopped unexpectedly');
   });
 
   // Registering the shutdown hooks before `listen` means a process that is

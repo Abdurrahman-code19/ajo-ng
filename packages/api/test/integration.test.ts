@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
+import { MockFinancialProvider } from '@ajo/domain';
 import type { Pool } from 'pg';
 import { buildApp } from '../src/app.js';
 import {
@@ -33,6 +34,11 @@ import { allowAllLimiter, createFixedWindowLimiter, type RateLimiter } from '../
 import type { Config } from '../src/config.js';
 import type { NotificationTransport, VerificationSender } from '../src/mailer.js';
 import { drainOnce } from '../src/notifications.js';
+import {
+  drainOnce as drainSettlementOnce,
+  runSettlementWorker,
+} from '../src/settlement-worker.js';
+import { createProviderRegistry } from '../src/providers.js';
 
 const HAVE_REDIS = process.env['REDIS_AVAILABLE'] === '1';
 
@@ -62,6 +68,15 @@ function testConfig(): Config {
     // then pass for an unrelated reason, and the failure would be a confusing
     // "every token is invalid" rather than "you mixed the keys up".
     signingKey: { ...generateEphemeralSigningKey(), source: 'ephemeral' },
+    // `mock` is switched on and every other provider is not, which is the
+    // production shape: the endpoint exists for the one provider whose signing
+    // format is known. A test for an unknown provider is therefore a test of the
+    // 404 path rather than one that has to be told which providers to expect.
+    webhooks: {
+      rateLimit: 1000,
+      windowMs: 60_000,
+      secrets: { mock: 'test-webhook-secret' },
+    },
   };
 }
 
@@ -78,10 +93,13 @@ async function buildTestApp(
 ): Promise<FastifyInstance> {
   const keys = createAccessTokenPair(testConfig().signingKey);
   const { signer, verifier } = await keys;
+  const providers = createProviderRegistry({ secrets: testConfig().webhooks.secrets });
   const built = await buildApp({
     config: testConfig(),
     pool: pool as Pool,
     limiter: allowAllLimiter(),
+    webhookLimiter: allowAllLimiter(),
+    resolveProvider: providers.resolve,
     mailer: new CapturingMailer(),
     signer,
     verifier,
@@ -729,6 +747,11 @@ function silentLog() {
   return { info: () => undefined, warn: () => undefined };
 }
 
+/** As `silentLog`, but with the `error` the settlement worker logs through. */
+function silentSettlementLog() {
+  return { info: () => undefined, warn: () => undefined, error: () => undefined };
+}
+
 describe('security notifications', () => {
   let transport: CapturingTransport;
 
@@ -1029,6 +1052,457 @@ function refreshCookieOf(response: LightMyRequestResponse): string {
 const withCookie = (token: string) => ({ cookie: `ajo_refresh=${token}` });
 
 const withBearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+describe('provider webhooks', () => {
+  /**
+   * A second adapter instance, used only to sign.
+   *
+   * Separate from the one the app holds, and that is the point: it proves the
+   * signature is checked against the *secret*, not against an object the route
+   * happens to share with the test. It also gives the tests arbitrary bodies,
+   * which `buildWebhook` cannot produce because it only knows how to describe a
+   * transfer it initiated.
+   */
+  const signer = new MockFinancialProvider({ secret: 'test-webhook-secret' });
+
+  function delivery(over: Record<string, unknown> = {}): {
+    rawBody: string;
+    signatureHeader: string;
+  } {
+    const rawBody = JSON.stringify({
+      eventId: `evt-${randomUUID()}`,
+      eventType: 'transfer.success',
+      reference: `ref-${randomUUID()}`,
+      state: 'SUCCESS',
+      amount: 20_000,
+      currency: 'NGN',
+      occurredAt: new Date().toISOString(),
+      ...over,
+    });
+    return { rawBody, signatureHeader: signer.sign(rawBody) };
+  }
+
+  function send(
+    body: { rawBody: string; signatureHeader: string },
+    path = '/api/v1/webhooks/payments/mock',
+    headers: Record<string, string> = {},
+  ): Promise<LightMyRequestResponse> {
+    return app.inject({
+      method: 'POST',
+      url: path,
+      // The body is sent as the exact string that was signed. Re-serialising an
+      // object here would sign one byte sequence and verify another, and the test
+      // would be testing the harness.
+      payload: body.rawBody,
+      headers: {
+        'content-type': 'application/json',
+        'x-signature': body.signatureHeader,
+        ...headers,
+      },
+    });
+  }
+
+  async function eventsFor(reference: string) {
+    const result = await admin.query(
+      `SELECT id::text, status::text, signature_verified, provider_reference,
+              provider_event_id, event_type, amount_kobo, currency,
+              reported_state::text, error_detail, occurred_at
+         FROM webhook_events
+        WHERE provider_reference = $1
+        ORDER BY created_at`,
+      [reference],
+    );
+    return result.rows as {
+      id: string;
+      status: string;
+      signature_verified: boolean;
+      provider_reference: string | null;
+      provider_event_id: string;
+      event_type: string;
+      amount_kobo: string | null;
+      currency: string | null;
+      reported_state: string | null;
+      error_detail: string | null;
+      occurred_at: Date;
+    }[];
+  }
+
+  it('refuses an unsigned delivery with a 401 and records nothing', async () => {
+    const unverified = async (): Promise<number> => {
+      const result = await admin.query(
+        'SELECT count(*)::int AS n FROM webhook_events WHERE signature_verified = false',
+      );
+      return (result.rows[0] as { n: number }).n;
+    };
+    const before = await unverified();
+
+    const body = delivery();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/webhooks/payments/mock',
+      payload: body.rawBody,
+      headers: { 'content-type': 'application/json' },
+    });
+
+    assert.equal(response.statusCode, 401, response.body);
+    // Nothing recorded. An unsigned delivery that left a row would be
+    // indistinguishable from a forgery later, which is worse than having no row.
+    assert.equal(await unverified(), before, 'an unsigned delivery recorded a row');
+    const rows = await eventsFor(JSON.parse(body.rawBody).reference as string);
+    assert.equal(rows.length, 0, 'and recorded nothing under its reference either');
+  });
+
+  it('refuses a signature that does not match the body', async () => {
+    const body = delivery();
+    const tampered = delivery();
+
+    // The body is one delivery's, the signature another's. This is the forgery
+    // the whole seam exists to refuse, and it must not be recorded either.
+    const response = await send({
+      rawBody: tampered.rawBody,
+      signatureHeader: body.signatureHeader,
+    });
+
+    assert.equal(response.statusCode, 401, response.body);
+    const rows = await eventsFor(JSON.parse(tampered.rawBody).reference as string);
+    assert.equal(rows.length, 0, 'a forged delivery left a row behind');
+  });
+
+  it('acknowledges a verified delivery, and queues it without settling it', async () => {
+    const body = delivery();
+
+    const response = await send(body);
+
+    assert.equal(response.statusCode, 202, response.body);
+    const payload = response.json() as { received: boolean; acted_on: boolean; duplicate: boolean };
+    assert.equal(payload.received, true);
+    assert.equal(payload.acted_on, true, 'a transfer event is one we act on');
+    assert.equal(payload.duplicate, false);
+
+    const rows = await eventsFor(JSON.parse(body.rawBody).reference as string);
+    assert.equal(rows.length, 1, 'exactly one row for one delivery');
+    const row = rows[0];
+    assert.ok(row !== undefined);
+    assert.equal(row.signature_verified, true);
+    // Still waiting for a worker. If this were `processed` here, the capture would
+    // have happened inside the request, which is the slow handler the spec forbids.
+    assert.equal(row.status, 'received', 'nothing is settled on the request thread');
+    // `bigint` comes back as a string, and comparing it to a number would pass
+    // only if both were coerced -- so the string form is what is asserted, which
+    // is also what a later reconciliation would have to parse.
+    assert.equal(row.amount_kobo, '20000');
+    assert.equal(row.currency, 'NGN');
+    assert.equal(row.reported_state, 'success');
+  });
+
+  it('acknowledges a redelivery without reprocessing it', async () => {
+    const body = delivery();
+
+    const first = await send(body);
+    assert.equal(first.statusCode, 202, first.body);
+    const second = await send(body);
+    assert.equal(second.statusCode, 202, second.body);
+
+    const payload = second.json() as { duplicate: boolean };
+    assert.equal(payload.duplicate, true, 'the second delivery is reported as a duplicate');
+
+    const rows = await eventsFor(JSON.parse(body.rawBody).reference as string);
+    assert.equal(rows.length, 1, 'a redelivery created a second row');
+    assert.equal(rows[0]?.status, 'received', 'and did not settle the first one early');
+  });
+
+  it('ignores an event type it does not act on, without refusing it', async () => {
+    const body = delivery({ eventType: 'account.updated', reference: `acct-${randomUUID()}` });
+
+    const response = await send(body);
+
+    // Spec §13.5: acknowledged, logged, ignored -- never a 4xx. A provider that
+    // retries a delivery we will never understand sends it forever.
+    assert.equal(response.statusCode, 202, response.body);
+    assert.equal((response.json() as { acted_on: boolean }).acted_on, false);
+
+    const reference = JSON.parse(body.rawBody).reference as string;
+    const rows = await eventsFor(reference);
+    assert.equal(rows.length, 1, 'the ignored event is still recorded');
+    assert.equal(rows[0]?.status, 'ignored');
+    assert.equal(
+      rows[0]?.error_detail,
+      'event type account.updated is not acted on',
+      'and says why, which is the record the spec wants',
+    );
+  });
+
+  it('rejects a verified event older than the replay window', async () => {
+    const body = delivery({ occurredAt: new Date(Date.now() - 20 * 60_000).toISOString() });
+
+    const response = await send(body);
+
+    // Not acknowledged: §13.5 says reject, and returning 2xx would tell the
+    // provider its event was queued when it was dropped.
+    assert.equal(response.statusCode, 422, response.body);
+  });
+
+  it('acknowledges a verified body it cannot read, rather than crashing', async () => {
+    const rawBody = 'this was signed but is not JSON';
+    const response = await send({ rawBody, signatureHeader: signer.sign(rawBody) });
+
+    // A provider defect, not a forgery: the signature proved the bytes are theirs.
+    // A 5xx would make the provider retry bytes that will never parse.
+    assert.equal(response.statusCode, 202, response.body);
+    assert.equal((response.json() as { acted_on: boolean }).acted_on, false);
+  });
+
+  it('records nothing for a verified body it cannot represent', async () => {
+    // Signed, so not a forgery -- but a state the ledger has no meaning for. The
+    // status is mapped before the row is written, so this leaves nothing behind
+    // rather than an unverified row no worker can claim and nobody can explain.
+    const body = delivery({ state: 'BANANA', reference: `st-${randomUUID()}` });
+
+    const response = await send(body);
+
+    assert.equal(response.statusCode, 202, response.body);
+    assert.equal((response.json() as { acted_on: boolean }).acted_on, false);
+    const rows = await eventsFor(JSON.parse(body.rawBody).reference as string);
+    assert.equal(rows.length, 0, 'an unusable state left a row behind');
+  });
+
+  it('acknowledges a verified body carrying an amount that is not money', async () => {
+    // Also signed. `kobo()` refuses a negative amount, and a provider that reports
+    // one is broken rather than lying -- so this is reported as a provider defect,
+    // not as a 500 from the money type.
+    const negative = delivery({ amount: -1, reference: `neg-${randomUUID()}` });
+
+    const response = await send(negative);
+
+    assert.equal(response.statusCode, 202, response.body);
+    assert.equal((response.json() as { acted_on: boolean }).acted_on, false);
+    const rows = await eventsFor(JSON.parse(negative.rawBody).reference as string);
+    assert.equal(rows.length, 0, 'an unusable amount left a row behind');
+  });
+
+  it('has no endpoint for a provider with no configured secret', async () => {
+    const body = delivery();
+
+    const response = await send(body, '/api/v1/webhooks/payments/providus_unity');
+
+    // 404 rather than 401, and with nothing about which providers exist: an
+    // unconfigured provider and an unrouted path are the same answer.
+    assert.equal(response.statusCode, 404, response.body);
+    assert.equal((response.json() as { error: string }).error, 'not_found');
+  });
+
+  it('has no endpoint for a provider that is not a provider at all', async () => {
+    const body = delivery();
+
+    const response = await send(body, '/api/v1/webhooks/payments/notaprovider');
+
+    assert.equal(response.statusCode, 404, response.body);
+  });
+
+  it('is rate limited per provider and address', async () => {
+    // Redis, not `allowAllLimiter`, because the limit being tested is the one
+    // this class of limiter implements. And it is closed below: an ioredis socket
+    // left open keeps the whole test process alive after the last case, which is a
+    // failure that looks like a hang rather than a mistake.
+    const webhookLimiter = createFixedWindowLimiter({
+      url: process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379',
+      limit: 2,
+      windowMs: 60_000,
+      namespace: 'webhook-limit-test',
+    });
+    const limited = await buildTestApp({
+      config: {
+        ...testConfig(),
+        webhooks: { ...testConfig().webhooks, rateLimit: 2 },
+      },
+      webhookLimiter,
+    });
+
+    try {
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const body = delivery();
+        statuses.push(
+          (await limited.inject({
+            method: 'POST',
+            url: '/api/v1/webhooks/payments/mock',
+            payload: body.rawBody,
+            headers: {
+              'content-type': 'application/json',
+              'x-signature': body.signatureHeader,
+            },
+          })).statusCode,
+        );
+      }
+
+      assert.equal(statuses[0], 202, `first delivery: ${String(statuses[0])}`);
+      assert.equal(statuses[2], 429, `third delivery is over the limit: ${String(statuses[2])}`);
+      assert.equal(statuses[3], 429, 'and stays over the limit');
+    } finally {
+      await limited.close();
+      await webhookLimiter.close();
+    }
+  });
+
+  it('preserves the raw body byte for byte for everything else', async () => {
+    // The parser is app-wide because it is keyed by content type, so the cost of
+    // keeping the bytes is paid by every route. This is what pays for it: a
+    // registration body that has an extra property must still be rejected by the
+    // schema rather than silently trimmed, which is what the JSON parser's
+    // `removeAdditional` default would have done to it.
+    const response = await post({
+      email: uniqueEmail('rawbody'),
+      password: 'a sufficiently long passphrase',
+      fullName: 'Raw Body',
+      phone: uniquePhone(),
+      acceptedTerms: true,
+      acceptedPrivacy: true,
+      acceptedTermsAt: '2011-01-01T00:00:00.000Z',
+    });
+
+    assert.equal(response.statusCode, 400, response.body);
+  });
+
+  describe('the settlement worker', () => {
+    /**
+     * Drains whatever is claimable right now.
+     *
+     * Every route case above leaves verified events behind, so a worker case that
+     * assumed an empty queue would be at the mercy of test order -- and would
+     * quietly stop testing anything the moment someone reordered the file.
+     */
+    async function drainQueue(): Promise<number> {
+      let claimed = 0;
+      for (let pass = 0; pass < 5; pass += 1) {
+        const result = await drainSettlementOnce(pool, silentSettlementLog());
+        claimed += result.claimed;
+        if (result.claimed === 0) {
+          break;
+        }
+      }
+      return claimed;
+    }
+
+    it('claims what the route queued, and backs off instead of spinning', async () => {
+      await drainQueue();
+
+      const references: string[] = [];
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const body = delivery({ reference: `wkr-${randomUUID()}` });
+        assert.equal((await send(body)).statusCode, 202);
+        references.push(JSON.parse(body.rawBody).reference as string);
+      }
+
+      const result = await drainSettlementOnce(pool, silentSettlementLog());
+      assert.equal(result.claimed, 3, 'a pass claims the whole batch');
+      assert.equal(result.handled, 3, 'and gives each one a verdict');
+
+      // None of these references matches a payment, so each was deferred with a
+      // future `next_retry_at`. The second pass is the assertion that matters: a
+      // worker that ignored the backoff would re-claim them immediately and burn
+      // database work on every event it cannot possibly settle yet.
+      const again = await drainSettlementOnce(pool, silentSettlementLog());
+      assert.equal(again.claimed, 0, 'a deferred event was re-claimed straight away');
+
+      for (const reference of references) {
+        const rows = await eventsFor(reference);
+        assert.equal(rows.length, 1);
+        assert.equal(
+          rows[0]?.status,
+          'received',
+          'an event with no matching payment stays queued rather than failing',
+        );
+      }
+    });
+
+    it('never claims an event whose signature did not verify, or one it ignored', async () => {
+      await drainQueue();
+
+      const ignored = delivery({ eventType: 'account.updated', reference: `ign-${randomUUID()}` });
+      assert.equal((await send(ignored)).statusCode, 202);
+      const ignoredReference = JSON.parse(ignored.rawBody).reference as string;
+
+      const forged = delivery();
+      // Signed with the wrong secret: refused, so no row at all. The unverified-row
+      // case is the one that matters, and it is exercised here directly by writing
+      // the row the way an interrupted request would have left it.
+      const forgedResponse = await app.inject({
+        method: 'POST',
+        url: '/api/v1/webhooks/payments/mock',
+        payload: forged.rawBody,
+        headers: { 'content-type': 'application/json', 'x-signature': 'not-the-signature' },
+      });
+      assert.equal(forgedResponse.statusCode, 401);
+
+      const result = await drainSettlementOnce(pool, silentSettlementLog());
+      assert.equal(result.claimed, 0, 'the claim took something it must not touch');
+
+      const ignoredRows = await eventsFor(ignoredReference);
+      assert.equal(ignoredRows[0]?.status, 'ignored', 'and left the ignored event alone');
+    });
+
+    it('settles the rest of a batch when one event raises', async () => {
+      await drainQueue();
+
+      const references: string[] = [];
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const body = delivery({ reference: `poison-${randomUUID()}` });
+        assert.equal((await send(body)).statusCode, 202);
+        references.push(JSON.parse(body.rawBody).reference as string);
+      }
+      const poisoned = references[1] as string;
+
+      // The worker settles by event id, not by reference, so the poison has to be
+      // keyed on the uuid -- matching on the reference would silently never fire
+      // and this test would pass without testing anything.
+      const poisonedRow = (await eventsFor(poisoned))[0];
+      assert.ok(poisonedRow !== undefined, 'the poisoned event was recorded');
+      const poisonedId = poisonedRow.id;
+
+      // A pool that fails one specific event, so the batch-interruption property
+      // is tested without contriving a database state that is hard to reach on
+      // purpose. The real trigger -- an event whose settlement raises -- exists;
+      // what is under test is what happens to the other two.
+      const failing = {
+        query: (text: unknown, values?: unknown) => {
+          if (
+            typeof text === 'string' &&
+            text.includes('settle_provider_event') &&
+            Array.isArray(values) &&
+            values.includes(poisonedId)
+          ) {
+            return Promise.reject(new Error('settlement exploded'));
+          }
+          return pool.query(text as string, values as never[]);
+        },
+      } as unknown as Pool;
+
+      const result = await drainSettlementOnce(failing, silentSettlementLog());
+      assert.equal(result.claimed, 3);
+      assert.equal(result.raised, 1, 'the raising event was counted as raised');
+      assert.equal(
+        result.handled,
+        2,
+        'and the two behind it in the batch were still settled',
+      );
+    });
+
+    it('stops when it is asked to', async () => {
+      let release: () => void = () => undefined;
+      const stopped = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      const running = runSettlementWorker(pool, silentSettlementLog(), stopped, {
+        idleIntervalMs: 1,
+      });
+      release();
+      // The worker is awaited, so a loop that ignored the stop signal would hang
+      // this test rather than pass it. That is the whole assertion.
+      await running;
+    });
+  });
+});
 
 describe('login', () => {
   it('exchanges a password for an access token, a session and a cookie', async () => {

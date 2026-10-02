@@ -159,6 +159,21 @@ def main() -> int:
     else:
         print(f"redis: reachable at {redis_url}")
 
+    # `--force`, and before the API's own compile, because the API tests import
+    # `@ajo/domain` as a *built* package. Building only the API leaves domain's
+    # `dist/` at whatever it was, so a change to the provider seam can sit on disk
+    # unbuilt and every case below passes against the old code -- which is how a
+    # test for an adapter behaviour passed against an adapter that did not have it.
+    built = subprocess.run(
+        ["npx", "tsc", "--build", "--force"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if built.returncode != 0:
+        print("the packages do not build:\n" + built.stdout + built.stderr)
+        return 1
+
     compiled = subprocess.run(
         ["npx", "tsc", "-p", "packages/api/tsconfig.test.json"],
         cwd=ROOT,

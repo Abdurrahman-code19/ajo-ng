@@ -50,10 +50,10 @@ them:
 | | |
 |---|---|
 | Specification | Complete — 26 sections, ~238k words, 445 tables |
-| Database | **43 tables, 87 policies, 126 triggers** across 25 migration sets — built and enforced |
+| Database | **43 tables, 87 policies, 126 triggers** across 26 migration sets — built and enforced |
 | Ledger | **Writable.** Migration `105` recognises a provider-confirmed capture as two balanced entries, itemises the fee, and refuses a replay. Nothing had ever written to `ledger_transactions` before it. |
-| Provider events | **Settle themselves, asynchronously.** Migrations `106` and `107` record an unverified event, verify it as a separate auditable act, then lease it to a worker that matches the payment on `(provider, provider_reference)`, refuses to post on an amount or currency that is not what we instructed, and captures on a success. Still no HTTP endpoint. |
-| API | 81 integration tests green; auth, sessions, rate limiting, audit and security notifications shipped. Payments, Ajos, contributions and payouts still have no HTTP surface. |
+| Provider events | **Settle themselves, asynchronously, over HTTP.** Migrations `106`, `107` and `108` record an unverified event, verify it as a separate auditable act, then lease it to a worker that matches the payment on `(provider, provider_reference)`, refuses to post on an amount or currency that is not what we instructed, and captures on a success. `POST /api/v1/webhooks/payments/:provider` verifies the HMAC over the raw body, records, and answers `202`; only `mock` is switched on. |
+| API | 98 integration tests green; auth, sessions, rate limiting, audit and security notifications shipped. Payments, Ajos, contributions and payouts still have no HTTP surface. |
 | Domain core | 2,018 lines, 84 tests passing, including a reusable provider contract suite |
 | Web / admin | Not started |
 | Mobile | Not started |
@@ -83,9 +83,9 @@ everybody learns to ignore.
 Verified: `npm run verify` → 70 domain + 37 API unit, 0 fail. `python3 scripts/test_api.py` →
 81/81. `python3 scripts/test_migrations.py` → 32/32.
 
-Those counts predate migrations `106` and `107`. Current: `npm run verify` → 37 API unit,
-0 fail; `npm test` → 84 domain, 0 fail; `python3 scripts/test_api.py` → 81/81;
-`python3 scripts/test_migrations.py` → 47/47.
+Those counts predate migrations `106`, `107` and `108`. Current: `npm run verify` → 37 API
+unit, 0 fail; `npm test` → 86 domain, 0 fail; `python3 scripts/test_api.py` → 98/98;
+`python3 scripts/test_migrations.py` → 49/49.
 
 Not launch-ready, and the gap is not in the database. It is the payment provider, the HTTP
 surface over the money path, the frontend, and 15 legal items.
@@ -345,16 +345,27 @@ Enforced by the database, not just by the domain:
       failure surfacing. `MockFinancialProvider` passes it, so the adapter written in
       `E3-02` cannot quietly disagree with the money path.
 - [ ] `E3-04` Webhook verification, replay protection, idempotency, out-of-order handling —
-      the database half is migrations `106` and `107`. `106` is intake: unverified intake, an
-      auditable separate verification act that records its algorithm, the five-minute replay
-      window, one row per `provider_event_id` with `is_new` distinguishing a first sighting
-      from a redelivery, unknown event types ignored with a recorded reason, a gate that
-      refuses anything not verified and open, and terminal-state resolution. `107` is
-      settlement: the claimed-and-leased queue, the provider-scoped reference match, the
-      amount and currency checks against what we actually instructed, contradiction handling,
-      and the capture itself. **Still to do:** the HTTP endpoint, per-IP rate limiting, 90-day
-      replay, and the worker loop that calls the claim.
-- [ ] `E3-05` Collection initiation and pending contribution flow
+      the database half is migrations `106`, `107` and `108`. `106` is intake: unverified
+      intake, an auditable separate verification act that records its algorithm, the
+      five-minute replay window, one row per `provider_event_id` with `is_new`
+      distinguishing a first sighting from a redelivery, unknown event types ignored with a
+      recorded reason, a gate that refuses anything not verified and open, and
+      terminal-state resolution. `107` is settlement: the claimed-and-leased queue, the
+      provider-scoped reference match, the amount and currency checks against what we
+      actually instructed, contradiction handling, and the capture itself. `108` is the gap
+      `106` left: a verified event type we do not act on has no reference, amount or state
+      to record, so it could be neither verified nor ignored. `app.discard_provider_event`
+      does both in one statement, records the reference when there is one so
+      reconciliation can find it, and leaves a row the claim cannot reach.
+      The HTTP half now exists: `POST /api/v1/webhooks/payments/:provider` verifies over the
+      raw body, records, and answers `202` without settling anything —
+      `packages/api/src/webhooks.ts`, `webhook-routes.ts`, `raw-body.ts`. A provider with
+      no configured secret has no endpoint, and `mock` is the only one switched on.
+      `settlement-worker.ts` drains the queue with the claim and the settle.
+      **Still to do:** 90-day replay tooling, and a provider-status backstop (`E3-12`).
+- [ ] `E3-05` Collection initiation and pending contribution flow — **blocked on `E3-01`**
+      for the real provider. The seam's `initiateCollection` and the mock's signed webhooks
+      are in place, so what is missing is knowing how a real provider creates a charge.
 - [ ] `E3-06` Fee calculation and capture posting — itemised, never a hidden line
 - [ ] `E3-07` Escrow and settlement account setup — **no member funds in operating accounts, ever**
 - [ ] `E3-08` Daily reconciliation service and reporting

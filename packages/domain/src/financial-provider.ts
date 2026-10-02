@@ -69,14 +69,41 @@ export interface InitiatePayoutCommand {
 }
 
 export interface ProviderWebhookEvent {
+  /**
+   * The provider's own identifier for this delivery.
+   *
+   * This is the deduplication key, and the only one that can be. A provider
+   * redelivers, retries on a timer, and occasionally sends the same logical
+   * event twice with different payload bytes; the reference alone cannot tell
+   * those apart from two genuinely separate confirmations of one transfer.
+   */
+  readonly eventId: string;
+  /**
+   * The provider's own event name, e.g. `transfer.success`.
+   *
+   * Provider-shaped on purpose. The application matches on it to decide what an
+   * event *is*, so a mapping to our vocabulary here would mean every adapter
+   * could name things differently; the mapping is one table, one place.
+   */
+  readonly eventType: string;
   readonly providerReference: string;
   readonly idempotencyKey: string;
   readonly state: TransferState;
   readonly amount: Kobo;
+  /** ISO 4217. The settlement compares it against the Ajo's currency. */
+  readonly currency: string;
   readonly occurredAt: Date;
   /** Raw payload exactly as received, for signature verification before parsing. */
   readonly rawBody: string;
   readonly signatureHeader: string;
+  /**
+   * The body, parsed.
+   *
+   * Kept whole and provider-shaped rather than reduced to what we happen to use,
+   * because this is what gets persisted for forensics: the row has to answer
+   * "what did the provider actually send" months later, and a subset cannot.
+   */
+  readonly parsedPayload: Readonly<Record<string, unknown>>;
 }
 
 export class WebhookSignatureError extends Error {
@@ -119,6 +146,12 @@ export interface FinancialProvider {
    * MUST throw WebhookSignatureError on a bad signature. Implementations must
    * verify over `rawBody` before any parsing, and must be constant-time in
    * their comparison.
+   *
+   * Returns an *enriched* copy, not the input: `eventId`, `eventType`,
+   * `currency` and `parsedPayload` are read out of the body, so they are empty
+   * on the way in and only trustworthy on the way out. A caller that reads them
+   * off the unparsed event is reading whatever the sender put in a field this
+   * process has not checked yet.
    */
   parseWebhook(event: ProviderWebhookEvent): Promise<ProviderWebhookEvent>;
 }

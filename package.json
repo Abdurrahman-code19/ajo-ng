@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --noEmit -p packages/domain/tsconfig.json && tsc --noEmit -p packages/domain/tsconfig.test.json && tsc --noEmit -p packages/api/tsconfig.json && tsc --noEmit -p packages/api/tsconfig.test.json",
+    "typecheck": "tsc --build --force && tsc --noEmit -p packages/domain/tsconfig.test.json && tsc --noEmit -p packages/api/tsconfig.test.json",
     "test": "tsc -p packages/domain/tsconfig.test.json && node --test packages/domain/build-test/test/",
     "test:unit:api": "tsc -p packages/api/tsconfig.test.json && node --test packages/api/build-test/test/unit.test.js",
     "test:db": "python3 scripts/test_migrations.py",

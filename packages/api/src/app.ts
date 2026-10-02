@@ -16,8 +16,11 @@ import { RegistrationConflict, register } from './register.js';
 import { VerificationError, verifyEmailToken } from './verify-email.js';
 import type { VerificationSender } from './mailer.js';
 import type { AccessTokenSigner, AccessTokenVerifier } from './access-token.js';
+import type { FinancialProvider } from '@ajo/domain';
 import { registerSessionRoutes } from './session-routes.js';
 import { UnauthenticatedError, unauthenticated } from './auth.js';
+import { preserveRawBody } from './raw-body.js';
+import { registerWebhookRoutes } from './webhook-routes.js';
 
 export interface AppDependencies {
   readonly config: Config;
@@ -37,6 +40,20 @@ export interface AppDependencies {
    */
   readonly signer: AccessTokenSigner;
   readonly verifier: AccessTokenVerifier;
+  /**
+   * Webhook deliveries get their own limiter, not a second budget on the signup
+   * one. The two have opposite shapes -- a person's login attempts and a
+   * provider's confirmations -- and sharing a counter would mean a busy webhook
+   * endpoint locked a member out of logging in.
+   */
+  readonly webhookLimiter: RateLimiter;
+  /**
+   * Resolves a provider id in a webhook path to an adapter.
+   *
+   * Absent for a provider whose secret is not configured, so "no endpoint" and
+   * "no secret" are the same condition and cannot drift apart.
+   */
+  readonly resolveProvider: (id: string) => FinancialProvider | undefined;
 }
 
 export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> {
@@ -153,6 +170,16 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerAuthRoutes(app, pool, limiter, mailer, config);
   registerVerifyEmailRoute(app, pool, limiter, config);
   registerSessionRoutes(app, { config, pool, limiter, signer, verifier });
+  // Before any route is registered, and for every route: the webhook endpoint is
+  // the only consumer of the raw bytes, but the parser has to be the app-wide one
+  // because it is keyed by content type.
+  preserveRawBody(app);
+  registerWebhookRoutes(app, {
+    config,
+    pool,
+    limiter: deps.webhookLimiter,
+    resolveProvider: deps.resolveProvider,
+  });
   return app;
 }
 

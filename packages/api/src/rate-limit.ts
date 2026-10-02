@@ -37,12 +37,23 @@ export interface FixedWindowOptions {
   readonly url: string;
   readonly limit: number;
   readonly windowMs: number;
+  /**
+   * Which counter these attempts belong to.
+   *
+   * Not decoration. Two limits sharing a Redis key share a counter, so a single
+   * client's webhook deliveries would consume its signup allowance and vice
+   * versa -- an endpoint with two independent budgets would be enforcing one
+   * number that is neither. The default keeps the existing keys byte-for-byte so
+   * a deploy does not silently reset everyone's signup window.
+   */
+  readonly namespace?: string;
   /** Injectable so a test can assert the key derivation without Redis. */
   readonly now?: () => number;
 }
 
 export function createFixedWindowLimiter(options: FixedWindowOptions): RateLimiter {
   const now = options.now ?? Date.now;
+  const namespace = options.namespace ?? 'registration';
   const redis = new Redis(options.url, { maxRetriesPerRequest: 2 });
 
   return {
@@ -52,7 +63,7 @@ export function createFixedWindowLimiter(options: FixedWindowOptions): RateLimit
       // of needing a sweep. The TTL is two windows so a counter cannot expire
       // between the INCR and the reply that decides whether the caller is let
       // through.
-      const redisKey = `ajo:ratelimit:registration:${key}:${window}`;
+      const redisKey = `ajo:ratelimit:${namespace}:${key}:${window}`;
       const count = await redis.incr(redisKey);
       if (count === 1) {
         await redis.expire(redisKey, Math.ceil(options.windowMs / 1000) * 2);

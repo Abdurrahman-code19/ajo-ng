@@ -29,7 +29,7 @@ import {
   type Transfer,
   type TransferState,
 } from './financial-provider.js';
-import { format, type Kobo } from './money.js';
+import { format, kobo, type Kobo } from './money.js';
 
 export interface MockProviderOptions {
   readonly secret?: string;
@@ -51,6 +51,22 @@ function constantTimeEquals(a: string, b: string): boolean {
     return false;
   }
   return timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Read a string field, treating a wrong type as absent.
+ *
+ * `undefined` rather than a throw, because the caller decides what a missing
+ * field means: `currency` and `idempotencyKey` have sensible defaults, while a
+ * missing `eventId` is fatal and gets its own error. Collapsing "absent" and
+ * "wrong type" into one value here is what lets that distinction be made.
+ */
+function readString(
+  payload: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = payload[key];
+  return typeof value === 'string' ? value : undefined;
 }
 
 export class MockFinancialProvider implements FinancialProvider {
@@ -210,7 +226,79 @@ export class MockFinancialProvider implements FinancialProvider {
     if (!constantTimeEquals(expected, event.signatureHeader)) {
       throw new WebhookSignatureError('webhook signature verification failed');
     }
-    return event;
+
+    // Parsing happens *after* the comparison above, on purpose. A signature is
+    // computed over bytes, so there is nothing to trust in the body until the
+    // bytes are known to be the ones that were signed -- and a parser that runs
+    // first is a parser running on attacker-controlled input.
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(event.rawBody) as Record<string, unknown>;
+    } catch {
+      // A verified body that will not parse is a provider defect, not a forgery:
+      // the signature already proved the bytes are theirs. ProviderError is
+      // retryable here, because the next delivery may well be well-formed, and a
+      // 4xx that reads "malformed request" would be a lie.
+      throw new ProviderError(
+        'verified webhook body is not JSON',
+        'MALFORMED_WEBHOOK',
+        true,
+      );
+    }
+
+    const reference = readString(parsed, 'reference');
+    const state = readString(parsed, 'state');
+    const amount = parsed['amount'];
+    const occurredAt = readString(parsed, 'occurredAt');
+    const eventId = readString(parsed, 'eventId');
+    const eventType = readString(parsed, 'eventType');
+    const currency = readString(parsed, 'currency');
+
+    if (reference === undefined || eventId === undefined || eventType === undefined) {
+      throw new ProviderError(
+        'verified webhook is missing the fields settlement matches on',
+        'MALFORMED_WEBHOOK',
+        true,
+      );
+    }
+
+    // Reported as a provider defect rather than allowed to throw whatever the
+    // money type throws. The seam has two ways to fail a delivery -- the signature
+    // did not verify, or the body was signed and cannot be used -- and an adapter
+    // that raised a third kind of error for a signed body would leave the caller
+    // with no way to tell "this provider is broken" from "this code is broken".
+    // A negative or fractional amount is a real possibility in a body that
+    // verified, and `kobo()` would reject it.
+    if (amount !== undefined && (typeof amount !== 'number' || !Number.isInteger(amount) || amount < 0)) {
+      throw new ProviderError(
+        'verified webhook carries an amount that is not a whole number of kobo',
+        'MALFORMED_WEBHOOK',
+        true,
+      );
+    }
+
+    const when = occurredAt === undefined ? new Date() : new Date(occurredAt);
+    if (Number.isNaN(when.getTime())) {
+      throw new ProviderError(
+        'verified webhook carries an unparseable occurredAt',
+        'MALFORMED_WEBHOOK',
+        true,
+      );
+    }
+
+    return {
+      eventId,
+      eventType,
+      providerReference: reference,
+      idempotencyKey: readString(parsed, 'idempotencyKey') ?? '',
+      state: (state ?? 'UNKNOWN') as TransferState,
+      amount: typeof amount === 'number' ? kobo(amount) : (0 as Kobo),
+      currency: currency ?? 'NGN',
+      occurredAt: when,
+      rawBody: event.rawBody,
+      signatureHeader: event.signatureHeader,
+      parsedPayload: parsed,
+    };
   }
 
   /**
@@ -226,20 +314,34 @@ export class MockFinancialProvider implements FinancialProvider {
       throw new ProviderError(`unknown transfer ${providerReference}`, 'NOT_FOUND', false);
     }
     const rawBody = JSON.stringify({
+      // These two are what settlement deduplicates on and dispatches by, so the
+      // mock has to send them for real rather than let the parser invent them:
+      // a fixture that cannot produce a redelivery cannot test that a redelivery
+      // is harmless.
+      eventId: `mock-evt-${providerReference}-${state}`,
+      eventType: `transfer.${state.toLowerCase()}`,
       reference: providerReference,
       idempotencyKey: transfer.idempotencyKey,
       state,
       amount: transfer.amount,
+      currency: 'NGN',
       occurredAt: new Date().toISOString(),
     });
     return {
+      eventId: `mock-evt-${providerReference}-${state}`,
+      eventType: `transfer.${state.toLowerCase()}`,
       providerReference,
       idempotencyKey: transfer.idempotencyKey,
       state,
       amount: transfer.amount,
+      currency: 'NGN',
       occurredAt: new Date(),
       rawBody,
       signatureHeader: this.sign(rawBody),
+      // What the *sender* believes it sent. Deliberately not the parsed values:
+      // the whole point of the round trip is that these arrive as empty and come
+      // back filled in from the body.
+      parsedPayload: {},
     };
   }
 

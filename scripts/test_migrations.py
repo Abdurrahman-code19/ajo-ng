@@ -4546,6 +4546,118 @@ def _settlement_that_raises_is_bounded(db: str) -> str:
     )
 
 
+@case("an event type we do not act on is acknowledged and recorded, not refused")
+def _unknown_event_type_is_discarded(db: str) -> str:
+    """
+    Spec §13.5: "Unknown event types: Acknowledged, logged, and ignored -- never a
+    4xx, and never a crash."
+
+    The two functions `106` wrote for this cannot reach each other. Ignoring an
+    event asserts it is signature-verified, and the only function that records a
+    verification insists on the reference, amount and state that settlement
+    matches on -- which an event type we do not act on is most likely not to
+    carry at all. `account.updated` has no `provider_reference` in it.
+
+    So this case sends exactly that: a verified event with no reference, no amount
+    and no state, and asserts it ends up `ignored` with a reason rather than as a
+    verification failure or a stuck row.
+    """
+    row_id = scalar(
+        db,
+        f"""SELECT (e.event_id::text) AS joined
+              FROM app.ingest_provider_event(
+                'mock', 'evt-account-updated', 'account.updated', now(),
+                '{{"accountId":"acct-1","status":"ACTIVE"}}'::jsonb) e;""",
+    )
+    must_fail(
+        db,
+        "verifying it without the values settlement needs",
+        f"SELECT app.mark_provider_event_verified('{row_id}', 'HMAC-SHA256', NULL, NULL, NULL, NULL);",
+        expect="must record the provider reference",
+    )
+
+    must_succeed(
+        db,
+        "discarding the event type we do not act on",
+        f"""SELECT app.discard_provider_event(
+                '{row_id}', 'HMAC-SHA256',
+                'event type account.updated is not acted on', 'acct-1');""",
+    )
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{row_id}';") != "ignored":
+        raise Failure("an unrecognised event type did not end up ignored")
+
+    if scalar(db, f"SELECT provider_reference FROM webhook_events WHERE id = '{row_id}';") != "acct-1":
+        raise Failure(
+            "the discarded event did not record the reference it was about; a "
+            "reconciliation query by reference would not find it"
+        )
+
+    if "account.updated" not in scalar(
+        db, f"SELECT error_detail FROM webhook_events WHERE id = '{row_id}';"
+    ):
+        raise Failure("the discarded event did not record which event type it was")
+
+    # The important half. An ignored event is signature-verified, so anything that
+    # checked only that flag would find it actionable; what has to stop it is its
+    # status. Both gates are asserted, because either one alone is enough to hold
+    # today and neither is obviously load-bearing.
+    if scalar(db, f"SELECT signature_verified FROM webhook_events WHERE id = '{row_id}';") != "t":
+        raise Failure("the discarded event was not recorded as verified; the queue would claim it")
+
+    claimed = scalar(
+        db,
+        f"SELECT count(*)::text FROM app.claim_provider_event() WHERE id = '{row_id}';",
+    )
+    if claimed != "0":
+        raise Failure("a discarded event was handed out by the claim; it must be unreachable")
+
+    must_fail(
+        db,
+        "settling a discarded event",
+        f"SELECT app.settle_provider_event('{row_id}');",
+        expect="not claimed for processing",
+    )
+
+    return (
+        "an unrecognised event type is recorded as verified, marked ignored with its "
+        "reason, findable by reference, and is neither claimable nor settleable"
+    )
+
+
+@case("a redelivered event can be discarded without being an error")
+def _discard_is_idempotent(db: str) -> str:
+    """
+    Providers retry, and a retry of a good event must not look like an attack. The
+    same rule the verify path follows: an event already processed is not an error.
+    """
+    row_id = scalar(
+        db,
+        f"""SELECT (e.event_id::text) AS joined
+              FROM app.ingest_provider_event(
+                'mock', 'evt-discarded-twice', 'account.updated', now(),
+                '{{"accountId":"acct-2"}}'::jsonb) e;""",
+    )
+    for attempt in ("first", "second"):
+        must_succeed(
+            db,
+            f"discarding the {attempt} delivery",
+            f"SELECT app.discard_provider_event('{row_id}', 'HMAC-SHA256', 'not acted on');",
+        )
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{row_id}';") != "ignored":
+        raise Failure("the redelivery changed the outcome of a discarded event")
+
+    must_fail(
+        db,
+        "discarding an event without saying how it was verified",
+        f"SELECT app.discard_provider_event('{row_id}', NULL, 'no algorithm');",
+        expect="must record which algorithm verified it",
+    )
+
+    return "a second delivery of a discarded event is absorbed, and the algorithm is still required"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")

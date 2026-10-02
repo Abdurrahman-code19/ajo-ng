@@ -53,6 +53,15 @@ export interface ProviderHarness {
     provider: FinancialProvider,
     reference: string,
   ) => Promise<ProviderWebhookEvent>;
+  /**
+   * Sign arbitrary bytes.
+   *
+   * For the clause that needs a body which verifies but does not parse. Asking
+   * the provider to build it is not possible -- there is no such webhook -- and
+   * signing it with a *different* secret would exercise the signature check
+   * instead, which is already covered and would prove nothing.
+   */
+  readonly signRaw: (provider: FinancialProvider, rawBody: string) => string;
 }
 
 const KNOWN_PROVIDER_IDS: readonly ProviderId[] = ['mock', 'providus_unity'];
@@ -362,6 +371,98 @@ export function runProviderContract(name: string, harness: ProviderHarness): voi
       const second = await provider.parseWebhook(event);
       assert.equal(first.providerReference, second.providerReference);
       assert.equal(first.state, second.state);
+    });
+
+    // ------------------------------------------------- what parsing has to fill
+
+    it('fills the identity fields from the body rather than echoing the caller', async () => {
+      // The event arrives with nothing in it -- no event id, no event type, no
+      // currency, no parsed payload -- because none of those have been checked
+      // yet. An adapter that returns its input unchanged hands the HTTP layer a
+      // deduplication key the sender chose, and `parseWebhook` returning `event`
+      // verbatim is exactly the shape that does that while still passing every
+      // clause above it.
+      const provider = harness.build();
+      const transfer = await provider.initiateCollection({
+        idempotencyKey: 'contract-hook-enrich',
+        accountNumber: '000000001',
+        amount: kobo(75_000),
+        reference: 'AJO/CONTRACT/HOOK-ENRICH',
+        callbackUrl: 'https://example.ng/hooks',
+      });
+      const event = await harness.signedWebhook(provider, transfer.providerReference);
+
+      const blank: ProviderWebhookEvent = {
+        ...event,
+        eventId: '',
+        eventType: '',
+        currency: '',
+        parsedPayload: {},
+      };
+      const parsed = await provider.parseWebhook(blank);
+
+      assert.ok(
+        parsed.eventId.length > 0,
+        'parseWebhook returned no eventId; the HTTP layer deduplicates on it and ' +
+          'would treat every delivery of one transfer as a separate event',
+      );
+      assert.ok(
+        parsed.eventType.length > 0,
+        'parseWebhook returned no eventType; nothing can tell a transfer event ' +
+          'from an account event, so everything would be either ignored or misread',
+      );
+      assert.ok(
+        parsed.currency.length > 0,
+        'parseWebhook returned no currency; settlement compares it against the ' +
+          "Ajo's and a missing one silently passes every check",
+      );
+      assert.ok(
+        Object.keys(parsed.parsedPayload).length > 0,
+        'parseWebhook returned an empty parsedPayload; the row persisted for ' +
+          'forensics would not contain what the provider actually sent',
+      );
+    });
+
+    it('reports a verified but unreadable body as a provider failure', async () => {
+      // A body that will not parse, or that is missing the fields settlement
+      // matches on, has already passed the signature check -- so the bytes are
+      // genuinely the provider's and the defect is theirs. It must surface as a
+      // ProviderError, which the HTTP layer treats as retryable, rather than as
+      // a WebhookSignatureError, which would tell the provider "you signed this
+      // wrongly" about a body they signed correctly.
+      const provider = harness.build();
+      const transfer = await provider.initiateCollection({
+        idempotencyKey: 'contract-hook-garbage',
+        accountNumber: '000000001',
+        amount: kobo(75_000),
+        reference: 'AJO/CONTRACT/HOOK-GARBAGE',
+        callbackUrl: 'https://example.ng/hooks',
+      });
+      const event = await harness.signedWebhook(provider, transfer.providerReference);
+
+      const garbage = '{"eventId":';
+      const mangled = {
+        ...event,
+        rawBody: garbage,
+        signatureHeader: harness.signRaw(provider, garbage),
+      };
+
+      let thrown: unknown;
+      try {
+        await provider.parseWebhook(mangled);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(
+        thrown instanceof ProviderError,
+        'a verified but unparseable body was not reported as a ProviderError',
+      );
+      assert.notEqual(
+        thrown instanceof WebhookSignatureError,
+        true,
+        'a verified body was reported as a signature failure, which tells the ' +
+          'provider their signing is wrong when it is not',
+      );
     });
 
     // ------------------------------------------------------------- failures
