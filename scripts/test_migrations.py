@@ -3985,6 +3985,18 @@ def _pending_money_ajo(db: str, reference: str = "settle-ref-1", group: int = 1)
     return reference
 
 
+# `app.claim_provider_event()` hands out a batch, oldest first, and its default is
+# ten. A case that artificially expires a lease leaves the row it is about with a
+# `next_retry_at` in the past, which sorts *after* every never-attempted event,
+# whose NULL retry sorts first. On the one database the whole suite shares, rows
+# committed by earlier cases can therefore fill the batch and leave the row a case
+# cares about unclaimed. That is the flake that made
+# `_settlement_that_raises_is_bounded` fail on some orderings and pass on others.
+# A batch larger than any case creates makes the helper deterministic without
+# touching the production ordering, which is deliberate.
+_CLAIM_EVERYTHING = 100000
+
+
 def _verified_event(
     db: str,
     reference: str,
@@ -4009,11 +4021,16 @@ def _verified_event(
               '{row_id}', 'HMAC-SHA256', '{reference}', {amount}, '{currency}',
               '{state}'::public.payment_status);""",
     )
-    must_succeed(
+    if scalar(
         db,
-        f"claiming {event_id}",
-        f"""SELECT count(*) FROM app.claim_provider_event() WHERE id = '{row_id}';""",
-    )
+        f"SELECT count(*)::text FROM app.claim_provider_event({_CLAIM_EVERYTHING}) "
+        f"WHERE id = '{row_id}';",
+    ) != "1":
+        raise Failure(
+            f"{event_id} was not handed out by the claim, so the case cannot start "
+            "from a claimed event; either it is not claimable or another case's rows "
+            "filled an apparatus sized too small"
+        )
     return row_id
 
 
@@ -4502,7 +4519,8 @@ def _settlement_that_raises_is_bounded(db: str) -> str:
     def _reclaim() -> str:
         return scalar(
             db,
-            f"SELECT count(*)::text FROM app.claim_provider_event() WHERE id = '{second}';",
+            f"SELECT count(*)::text FROM app.claim_provider_event({_CLAIM_EVERYTHING}) "
+            f"WHERE id = '{second}';",
         )
 
     # Every attempt raises the same way, and nothing about it is retried forever.

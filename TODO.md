@@ -175,6 +175,13 @@ cleared.**
 
 - [ ] `!` `E3-01` ProvidusUnity technical due diligence — verified sandbox spec, published fee
       schedule, settlement behaviour — **or a documented decision to use a different provider**
+- [ ] **Decision date `2026-10-17`.** If ProvidusUnity has not supplied a sandbox specification,
+      credentials, a callback/signature format and a fee schedule by then, start documented
+      due diligence on an alternative provider. This is cheap by design: `E3-04` takes a
+      `provider` name and a raw payload and asserts nothing about either, and `E3-03` is a
+      reusable contract suite, so a switch costs a new adapter rather than a rewrite. The
+      failure to avoid is waiting indefinitely — `E3-02`, `E3-05` and real money all sit
+      behind this date.
 - [ ] Never invent ProvidusUnity behaviour. `MockFinancialProvider` refuses production use for
       exactly this reason.
 - **Nothing has been received from ProvidusUnity.** No sandbox specification, no API

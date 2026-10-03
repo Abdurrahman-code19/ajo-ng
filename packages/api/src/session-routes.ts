@@ -37,7 +37,14 @@ const CREDENTIAL_BODY = {
 export interface SessionRouteDependencies {
   readonly config: Config;
   readonly pool: Pool;
-  readonly limiter: RateLimiter;
+  /**
+   * The limiter that enforces `config.login`, not registration.
+   *
+   * The two are separate instances in the composition root (`index.ts`), for the
+   * reason given on `AppDependencies.loginLimiter`: one limiter carries one limit
+   * and one window, and login and registration do not share either.
+   */
+  readonly loginLimiter: RateLimiter;
   readonly signer: AccessTokenSigner;
   readonly verifier: AccessTokenVerifier;
 }
@@ -123,12 +130,17 @@ function loginRateLimitKeys(input: { email: string }, clientIp: string): string[
   // `A@x.ng` and `a@x.ng` would be two budgets, and case-insensitivity -- which
   // is why `user_credentials.email` is `citext` -- would hand every attacker two
   // budgets per account for free.
+  //
+  // No `login:` prefix on the key: the limiter these are consumed by is created
+  // with `namespace: 'login'`, which already separates them from the registration
+  // counter. A prefix here would produce `...:login:login:addr` and suggest the
+  // namespace is not doing its job.
   const normalised = input.email.trim().toLowerCase();
-  return [`login:addr:${clientIp}`, `login:account:${normalised}`];
+  return [`addr:${clientIp}`, `account:${normalised}`];
 }
 
 export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDependencies): void {
-  const { config, pool, limiter, signer, verifier } = deps;
+  const { config, pool, loginLimiter, signer, verifier } = deps;
 
   /**
    * POST /api/v1/auth/login
@@ -146,7 +158,7 @@ export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDe
     try {
       for (const key of keys) {
         // Not short-circuited: see `loginRateLimitKeys`.
-        const result = await limiter.consume(key);
+        const result = await loginLimiter.consume(key);
         allowed = allowed && result;
       }
     } catch (error) {

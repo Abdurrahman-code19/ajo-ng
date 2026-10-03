@@ -98,6 +98,7 @@ async function buildTestApp(
     config: testConfig(),
     pool: pool as Pool,
     limiter: allowAllLimiter(),
+    loginLimiter: allowAllLimiter(),
     webhookLimiter: allowAllLimiter(),
     resolveProvider: providers.resolve,
     mailer: new CapturingMailer(),
@@ -603,6 +604,47 @@ describe('rate limiting', { skip: HAVE_REDIS ? false : 'Redis is not reachable' 
     } finally {
       await limited.close();
       await limiter.close();
+    }
+  });
+
+  it('stops a burst of sign-in attempts with the login budget', async () => {
+    // The regression this pins: login and registration used to share one limiter,
+    // which carried the registration limit and window. Login was therefore
+    // enforced at the signup number while its `Retry-After` advertised the login
+    // window -- a limit that was neither. A separate `loginLimiter` is the fix,
+    // and this fails if the two are ever wired back together.
+    //
+    // The key namespace is unique per run so a previous run's counters cannot make
+    // the first attempt here return 429 for the wrong reason.
+    const loginLimiter: RateLimiter = createFixedWindowLimiter({
+      url: process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379',
+      limit: 3,
+      windowMs: 60_000,
+      namespace: `login-limit-test-${Date.now()}`,
+    });
+    const limited = await buildTestApp({ config: testConfig(), pool, loginLimiter });
+
+    try {
+      const codes: number[] = [];
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await limited.inject({
+          method: 'POST',
+          url: '/api/v1/auth/login',
+          payload: { email: 'nobody@example.ng', password: 'not-the-password' },
+        });
+        codes.push(response.statusCode);
+        if (response.statusCode === 429) {
+          assert.ok(response.headers['retry-after'], 'a 429 must say when to come back');
+        }
+      }
+
+      // The first three reach the credential check and are refused as bad
+      // credentials; the last two never get there.
+      assert.equal(codes.filter((c) => c === 401).length, 3, `got ${codes.join(',')}`);
+      assert.equal(codes.filter((c) => c === 429).length, 2, `got ${codes.join(',')}`);
+    } finally {
+      await limited.close();
+      await loginLimiter.close();
     }
   });
 
@@ -1949,5 +1991,60 @@ describe('the authenticated session routes', () => {
       passwrod: member.password,
     } as unknown as Record<string, unknown>);
     assert.equal(response.statusCode, 400, response.body);
+  });
+});
+
+describe('the current member (GET /api/v1/me)', () => {
+  async function tokenFor(prefix: string) {
+    const member = await loginableMember(prefix);
+    const response = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    assert.equal(response.statusCode, 200, response.body);
+    return {
+      ...member,
+      accessToken: (response.json() as { accessToken: string }).accessToken,
+    };
+  }
+
+  it('answers with the member the token names, and never an identity field', async () => {
+    const member = await tokenFor('me');
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me',
+      headers: withBearer(member.accessToken),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+
+    const body = response.json() as Record<string, unknown>;
+    assert.equal(body['userId'], member.userId);
+    assert.equal(body['email'], member.email);
+    assert.equal(body['isEmailVerified'], true);
+    assert.equal(body['displayName'], 'Test Member');
+
+    // The response is the member's own view, and identity data is not part of it.
+    // The assertion is on the whole key set, not one field, because the failure
+    // this guards against -- a column added downstream "because it was handy" --
+    // would appear as a new key rather than as a changed one.
+    assert.deepEqual(
+      Object.keys(body).sort(),
+      [
+        'createdAt',
+        'displayName',
+        'email',
+        'isEmailVerified',
+        'isPhoneVerified',
+        'lastLoginAt',
+        'phoneE164',
+        'preferredLocale',
+        'status',
+        'userId',
+      ].sort(),
+    );
+    assert.equal(response.headers['cache-control'], 'private, max-age=60');
+  });
+
+  it('refuses without a token, the same as every other session read', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/v1/me' });
+    assert.equal(response.statusCode, 401);
+    assert.match(String(response.headers['www-authenticate']), /Bearer/);
   });
 });

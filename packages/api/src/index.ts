@@ -24,6 +24,15 @@ async function main(): Promise<void> {
     limit: config.registration.rateLimit,
     windowMs: config.registration.windowMs,
   });
+  // Login's budget is its own. Sharing the registration limiter enforced the
+  // registration number against sign-in and reported the login window in
+  // `Retry-After`; see `AppDependencies.loginLimiter`.
+  const loginLimiter = createFixedWindowLimiter({
+    url: config.redis.url,
+    limit: config.login.rateLimit,
+    windowMs: config.login.windowMs,
+    namespace: 'login',
+  });
   const webhookLimiter = createFixedWindowLimiter({
     url: config.redis.url,
     limit: config.webhooks.rateLimit,
@@ -42,6 +51,7 @@ async function main(): Promise<void> {
     config,
     pool,
     limiter,
+    loginLimiter,
     webhookLimiter,
     resolveProvider: providers.resolve,
     // Returns the HTTP relay in production and refuses to construct at all if one
@@ -114,7 +124,7 @@ async function main(): Promise<void> {
     // period, not this function, is what guarantees the process exits.
     signalWorkerStop?.();
 
-    await limiter.close();
+    await Promise.all([limiter.close(), loginLimiter.close(), webhookLimiter.close()]);
     await pool.end();
 
     // Exit explicitly. `app.close()` resolves once the server has stopped, but

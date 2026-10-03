@@ -18,6 +18,7 @@ import type { VerificationSender } from './mailer.js';
 import type { AccessTokenSigner, AccessTokenVerifier } from './access-token.js';
 import type { FinancialProvider } from '@ajo/domain';
 import { registerSessionRoutes } from './session-routes.js';
+import { registerMeRoutes } from './me-routes.js';
 import { UnauthenticatedError, unauthenticated } from './auth.js';
 import { preserveRawBody } from './raw-body.js';
 import { registerWebhookRoutes } from './webhook-routes.js';
@@ -41,6 +42,18 @@ export interface AppDependencies {
   readonly signer: AccessTokenSigner;
   readonly verifier: AccessTokenVerifier;
   /**
+   * Sign-in attempts get their own limiter, because their budget is not the
+   * registration budget.
+   *
+   * Registration and login both bound a write path, but with different numbers:
+   * a handful of signups per hour versus ten sign-in attempts per fifteen
+   * minutes, per address *and* per account. One limiter instance carries one
+   * limit and one window, so sharing it -- which is what this used to do --
+   * enforced the registration numbers on login while reporting the login window
+   * in `Retry-After`. Two shapes, two counters.
+   */
+  readonly loginLimiter: RateLimiter;
+  /**
    * Webhook deliveries get their own limiter, not a second budget on the signup
    * one. The two have opposite shapes -- a person's login attempts and a
    * provider's confirmations -- and sharing a counter would mean a busy webhook
@@ -57,7 +70,7 @@ export interface AppDependencies {
 }
 
 export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> {
-  const { config, pool, limiter, mailer, signer, verifier } = deps;
+  const { config, pool, limiter, loginLimiter, mailer, signer, verifier } = deps;
   const app = Fastify({
     logger: { level: config.logLevel },
     ajv: {
@@ -169,7 +182,8 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
 
   registerAuthRoutes(app, pool, limiter, mailer, config);
   registerVerifyEmailRoute(app, pool, limiter, config);
-  registerSessionRoutes(app, { config, pool, limiter, signer, verifier });
+  registerSessionRoutes(app, { config, pool, loginLimiter, signer, verifier });
+  registerMeRoutes(app, { pool, verifier });
   // Before any route is registered, and for every route: the webhook endpoint is
   // the only consumer of the raw bytes, but the parser has to be the app-wide one
   // because it is keyed by content type.
