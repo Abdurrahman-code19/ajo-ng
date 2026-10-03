@@ -4959,6 +4959,109 @@ def _replay_records_who_asked(db: str) -> str:
     )
 
 
+@case("creating an Ajo writes it, its seats, and the organizer's seat in one transaction")
+def _create_ajo(db: str) -> str:
+    """
+    `app.create_ajo` (migration 110) is the only write path for a new Ajo, and
+    the schema makes it all-or-nothing: `ajos_organizer_is_member` is a
+    DEFERRABLE INITIALLY DEFERRED constraint trigger, so the Ajo row, its
+    positions and the organizer's membership have to land together or the commit
+    is refused.
+
+    `SET CONSTRAINTS ALL IMMEDIATE` is placed *after* the call and before the
+    rollback, which is what makes the deferred check actually run here. Without
+    it the case would pass against a transaction that a real COMMIT would have
+    rejected -- `_organizer`'s `transaction()` helper does the same thing for the
+    same reason.
+    """
+    email = "create-ajo@example.ng"
+    body = f"""
+INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+VALUES ('t-create-ajo', '{email}', 'active', true);
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{email}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.create_ajo('E5-01 Ajo', 'the test', 100000, 'NGN', 'fortnightly', 10, 'friday', DATE '2026-11-01');
+SET CONSTRAINTS ALL IMMEDIATE;
+SELECT 'seats=' || count(*) || '/' || count(*) FILTER (WHERE p.status = 'claimed')
+  FROM ajo_positions p JOIN ajos a ON a.id = p.ajo_id WHERE a.name = 'E5-01 Ajo';
+SELECT 'org=' || m.status || '/' || p.position_number
+  FROM ajo_members m
+  JOIN ajos a ON a.id = m.ajo_id
+  JOIN ajo_positions p ON p.id = m.position_id
+ WHERE a.name = 'E5-01 Ajo';
+SELECT 'ajo=' || total_rounds || '/' || position_count || '/' || collection_day || '/' || status
+  FROM ajos WHERE name = 'E5-01 Ajo';
+"""
+    out = must_succeed(db, "create_ajo as a verified member", f"BEGIN;\n{body}\nROLLBACK;")
+    for expected in ("seats=10/1", "org=active/1", "ajo=10/10/friday/draft"):
+        if expected not in out:
+            raise Failure(
+                f"create_ajo did not produce {expected!r}:\n    {out.strip()[:400]}"
+            )
+
+    # Rejections, each in its own transaction so one failure does not abort the
+    # next, and each asserted on its own message rather than only on the failure:
+    # the SQLSTATE alone would not tell "unverified" from "bad amount".
+    verified = f"""
+INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+VALUES ('t-create-bad', 'create-bad@example.ng', 'active', true);
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = 'create-bad@example.ng'), true);
+SET LOCAL ROLE ajo_app;
+"""
+    must_fail(
+        db,
+        "three members",
+        f"BEGIN;{verified}SELECT app.create_ajo('Too Small', null, 100000, 'NGN', 'weekly', 3, 'friday', DATE '2026-11-01');ROLLBACK;",
+        expect="between 5 and 20",
+    )
+    must_fail(
+        db,
+        "999 naira",
+        f"BEGIN;{verified}SELECT app.create_ajo('Too Cheap', null, 99900, 'NGN', 'weekly', 10, 'friday', DATE '2026-11-01');ROLLBACK;",
+        expect="between 1000 and 5000000",
+    )
+    must_fail(
+        db,
+        "an unknown cadence",
+        f"BEGIN;{verified}SELECT app.create_ajo('Bad Freq', null, 100000, 'NGN', 'daily', 10, 'friday', DATE '2026-11-01');ROLLBACK;",
+        expect="unknown or inactive frequency",
+    )
+    must_fail(
+        db,
+        "an unverified caller",
+        "BEGIN;"
+        "INSERT INTO users (auth_subject_id, email, status, is_email_verified) "
+        "VALUES ('t-create-unver', 'create-unver@example.ng', 'active', false);"
+        "SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = 'create-unver@example.ng'), true);"
+        "SET LOCAL ROLE ajo_app;"
+        "SELECT app.create_ajo('Unverified', null, 100000, 'NGN', 'weekly', 10, 'friday', DATE '2026-11-01');"
+        "ROLLBACK;",
+        expect="email-verified active member",
+    )
+
+    # The grant is read out of pg_proc rather than proved by calling: the suite
+    # connects as the superuser, which can execute anything, so a call would say
+    # nothing about who else may. 106's README note is the reason this assertion
+    # exists at all.
+    if scalar(
+        db,
+        "SELECT has_function_privilege('public', "
+        "'app.create_ajo(text,text,bigint,text,text,integer,text,date)', 'EXECUTE')::text;",
+    ) != "false":
+        raise Failure("PUBLIC can still execute app.create_ajo after the bootstrap")
+    if scalar(
+        db,
+        "SELECT has_function_privilege('ajo_app', "
+        "'app.create_ajo(text,text,bigint,text,text,integer,text,date)', 'EXECUTE')::text;",
+    ) != "true":
+        raise Failure("ajo_app cannot execute app.create_ajo")
+
+    return (
+        "creates the Ajo, 10 seats and the organizer's claimed seat 1; rejects a "
+        "bad size, amount, cadence and unverified caller; EXECUTE stays ajo_app-only"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")

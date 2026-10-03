@@ -5,16 +5,24 @@ import {
   DEFAULT_AJO_MEMBERS,
   ENROLLMENT_WINDOW_DAYS,
   MAX_AJO_MEMBERS,
+  MAX_CONTRIBUTION_KOBO,
   MIN_AJO_MEMBERS,
+  MIN_CONTRIBUTION_KOBO,
   assertValidContributionAmount,
   assertValidMemberCount,
   availableEvents,
   canTransition,
+  collectionDayCode,
+  collectionDayFromCode,
   createAjo,
   evaluateEnrollmentWindow,
+  frequencyCode,
+  frequencyFromCode,
+  isAjoFrequency,
+  isCollectionDay,
   transition,
 } from '../src/ajo-state.js';
-import { naira } from '../src/money.js';
+import { kobo, naira } from '../src/money.js';
 
 describe('Ajo state machine', () => {
   it('starts in DRAFT and refuses to skip enrollment', () => {
@@ -195,5 +203,43 @@ describe('Ajo member count (5 to 20, creator included)', () => {
       assertValidMemberCount(n);
       assert.equal(n, n, 'rounds equal members');
     }
+  });
+
+  it('bounds a contribution to the platform window of NGN 1,000 to NGN 5,000,000', () => {
+    assert.doesNotThrow(() => assertValidContributionAmount(kobo(MIN_CONTRIBUTION_KOBO), 10));
+    assert.doesNotThrow(() => assertValidContributionAmount(kobo(MAX_CONTRIBUTION_KOBO), 10));
+    assert.throws(
+      () => assertValidContributionAmount(kobo(MIN_CONTRIBUTION_KOBO - 1), 10),
+      /at least 1000 naira/,
+    );
+    assert.throws(
+      () => assertValidContributionAmount(kobo(MAX_CONTRIBUTION_KOBO + 1), 10),
+      /may not exceed 5000000 naira/,
+    );
+    // The window is in kobo, so the round-naira edges a person would type must
+    // land inside it exactly.
+    assert.doesNotThrow(() => assertValidContributionAmount(naira(1_000), 5));
+    assert.doesNotThrow(() => assertValidContributionAmount(naira(5_000_000), 20));
+    assert.throws(() => assertValidContributionAmount(naira(999), 10), /at least 1000/);
+    assert.throws(() => assertValidContributionAmount(naira(5_000_001), 10), /may not exceed/);
+  });
+
+  it('maps the API cadence and weekday names onto the stored vocabulary', () => {
+    // The API says BIWEEKLY; the reference table says fortnightly. That
+    // difference is the reason the map exists.
+    assert.equal(frequencyCode('WEEKLY'), 'weekly');
+    assert.equal(frequencyCode('BIWEEKLY'), 'fortnightly');
+    assert.equal(frequencyCode('MONTHLY'), 'monthly');
+    assert.equal(frequencyFromCode('fortnightly'), 'BIWEEKLY');
+    assert.equal(frequencyFromCode('nonsense'), undefined);
+
+    assert.equal(collectionDayCode('FRIDAY'), 'friday');
+    assert.equal(collectionDayFromCode('friday'), 'FRIDAY');
+    assert.equal(collectionDayFromCode('caturday'), undefined);
+
+    assert.equal(isAjoFrequency('WEEKLY'), true);
+    assert.equal(isAjoFrequency('weekly'), false);
+    assert.equal(isCollectionDay('MONDAY'), true);
+    assert.equal(isCollectionDay('FUNDAY'), false);
   });
 });

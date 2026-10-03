@@ -220,6 +220,88 @@ export const MAX_AJO_MEMBERS = 20;
 export const DEFAULT_AJO_MEMBERS = 10;
 
 /**
+ * The creation-time contribution window, in kobo: NGN 1,000 to NGN 5,000,000.
+ *
+ * Below the floor an Ajo collects less than it costs to move the money; above
+ * the ceiling a single default is large enough to threaten the platform rather
+ * than one group. Section 11 of the API spec fixes these as the bounds on
+ * `POST /api/v1/ajos`, so they belong here with the other money-and-rights
+ * rules rather than in the route.
+ */
+export const MIN_CONTRIBUTION_KOBO = 100_000;
+export const MAX_CONTRIBUTION_KOBO = 500_000_000;
+
+/** The contribution cadences the product offers, as the API names them. */
+export type AjoFrequency = 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY';
+
+export const AJO_FREQUENCIES: readonly AjoFrequency[] = ['WEEKLY', 'BIWEEKLY', 'MONTHLY'];
+
+/** The weekday a collection lands on, as the API names them. */
+export type CollectionDay =
+  | 'MONDAY'
+  | 'TUESDAY'
+  | 'WEDNESDAY'
+  | 'THURSDAY'
+  | 'FRIDAY'
+  | 'SATURDAY'
+  | 'SUNDAY';
+
+export const COLLECTION_DAYS: readonly CollectionDay[] = [
+  'MONDAY',
+  'TUESDAY',
+  'WEDNESDAY',
+  'THURSDAY',
+  'FRIDAY',
+  'SATURDAY',
+  'SUNDAY',
+];
+
+/**
+ * The API's cadence name to the reference-data `contribution_frequencies.code`.
+ *
+ * The two vocabularies are not the same and must not be conflated: the API says
+ * `BIWEEKLY` and the table says `fortnightly`. An explicit map means a fourth
+ * frequency is a compile error here rather than a lookup that silently returns
+ * no row at runtime.
+ */
+const FREQUENCY_CODES: Record<AjoFrequency, string> = {
+  WEEKLY: 'weekly',
+  BIWEEKLY: 'fortnightly',
+  MONTHLY: 'monthly',
+};
+
+export function frequencyCode(frequency: AjoFrequency): string {
+  return FREQUENCY_CODES[frequency];
+}
+
+/**
+ * The API's weekday name to the stored form, lower-cased.
+ *
+ * The database's own vocabulary is lower-case throughout (`weekly`, `active`,
+ * `draft`), and the day is no exception. Storing exactly what the API sent would
+ * make this one column the only place a value's convention came from the wire.
+ */
+export function collectionDayCode(day: CollectionDay): string {
+  return day.toLowerCase();
+}
+
+export function frequencyFromCode(code: string): AjoFrequency | undefined {
+  return AJO_FREQUENCIES.find((frequency) => FREQUENCY_CODES[frequency] === code);
+}
+
+export function collectionDayFromCode(code: string): CollectionDay | undefined {
+  return COLLECTION_DAYS.find((day) => day.toLowerCase() === code);
+}
+
+export function isAjoFrequency(value: unknown): value is AjoFrequency {
+  return typeof value === 'string' && (AJO_FREQUENCIES as readonly string[]).includes(value);
+}
+
+export function isCollectionDay(value: unknown): value is CollectionDay {
+  return typeof value === 'string' && (COLLECTION_DAYS as readonly string[]).includes(value);
+}
+
+/**
  * Validate an Ajo's member count.
  *
  * The creator occupies one of these positions rather than sitting outside
@@ -258,6 +340,19 @@ export function assertValidContributionAmount(amount: Kobo, memberCount: number)
   try {
     if (amount <= 0) {
       throw new AjoRuleError('contribution amount must be positive');
+    }
+    // The platform window, not a per-group choice. The floor is what keeps an
+    // Ajo from collecting less than it costs to move the money; the ceiling is
+    // what bounds the loss from a single default.
+    if (amount < MIN_CONTRIBUTION_KOBO) {
+      throw new AjoRuleError(
+        `a contribution must be at least ${MIN_CONTRIBUTION_KOBO / 100} naira`,
+      );
+    }
+    if (amount > MAX_CONTRIBUTION_KOBO) {
+      throw new AjoRuleError(
+        `a contribution may not exceed ${MAX_CONTRIBUTION_KOBO / 100} naira`,
+      );
     }
   } catch (error: unknown) {
     if (error instanceof MoneyError) {

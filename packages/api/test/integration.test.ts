@@ -2048,3 +2048,130 @@ describe('the current member (GET /api/v1/me)', () => {
     assert.match(String(response.headers['www-authenticate']), /Bearer/);
   });
 });
+
+describe('creating an Ajo (POST /api/v1/ajos)', () => {
+  async function verifiedToken(prefix: string) {
+    const member = await loginableMember(prefix);
+    const response = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    assert.equal(response.statusCode, 200, response.body);
+    return {
+      ...member,
+      accessToken: (response.json() as { accessToken: string }).accessToken,
+    };
+  }
+
+  const ajoBody = (over: Record<string, unknown> = {}) => ({
+    name: 'Lagos Savers',
+    contributionKobo: 100_000,
+    currency: 'NGN',
+    frequency: 'WEEKLY',
+    collectionDay: 'FRIDAY',
+    durationRounds: 10,
+    maxMembers: 10,
+    startDate: '2026-11-06',
+    ...over,
+  });
+
+  const createAjo = (token: string, payload: Record<string, unknown>) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(token),
+      payload,
+    });
+
+  it('creates a draft Ajo, its seats and the organizer in seat 1', async () => {
+    const member = await verifiedToken('ajo-create');
+    const response = await createAjo(member.accessToken, ajoBody());
+    assert.equal(response.statusCode, 201, response.body);
+
+    const body = response.json() as {
+      ajo: Record<string, unknown>;
+      positions: { positionNumber: number; status: string }[];
+    };
+    assert.match(String(body.ajo['reference']), /^AJO-/);
+    assert.equal(body.ajo['name'], 'Lagos Savers');
+    assert.equal(body.ajo['status'], 'draft');
+    assert.equal(body.ajo['contributionKobo'], 100_000);
+    assert.equal(body.ajo['frequency'], 'WEEKLY');
+    assert.equal(body.ajo['collectionDay'], 'FRIDAY');
+    assert.equal(body.ajo['durationRounds'], 10);
+    assert.equal(body.ajo['maxMembers'], 10);
+    assert.equal(body.ajo['startDate'], '2026-11-06');
+    assert.equal(body.ajo['organizerUserId'], member.userId);
+    assert.equal(response.headers['location'], `/api/v1/ajos/${String(body.ajo['id'])}`);
+
+    // Rounds equal members, and the organizer occupies exactly one of them.
+    assert.equal(body.positions.length, 10);
+    assert.deepEqual(
+      body.positions.map((position) => position.positionNumber),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    );
+    assert.equal(body.positions.filter((position) => position.status === 'claimed').length, 1);
+  });
+
+  it('maps the API cadence BIWEEKLY onto the stored fortnightly', async () => {
+    const member = await verifiedToken('ajo-biweekly');
+    const response = await createAjo(
+      member.accessToken,
+      ajoBody({ frequency: 'BIWEEKLY', maxMembers: 5, durationRounds: 5 }),
+    );
+    assert.equal(response.statusCode, 201, response.body);
+    const body = response.json() as { ajo: { id: string; frequency: string } };
+    assert.equal(body.ajo.frequency, 'BIWEEKLY');
+
+    // The response echo is not the claim; the stored row is.
+    const stored = await admin.query<{ code: string }>(
+      `SELECT cf.code
+         FROM ajos a
+         JOIN contribution_frequencies cf ON cf.id = a.frequency_id
+        WHERE a.id = $1::uuid`,
+      [body.ajo.id],
+    );
+    assert.equal(stored.rows[0]?.code, 'fortnightly');
+  });
+
+  it('refuses a member who has not verified their email, with 403', async () => {
+    // A pending_verification account can sign in -- auth deliberately does not
+    // check account state at the door -- so this is a real token for a real,
+    // unverified member, which is exactly the caller the precondition is for.
+    const email = uniqueEmail('ajo-unverified');
+    const password = 'a sufficiently long passphrase';
+    const created = await post(validBody({ email, password }));
+    assert.equal(created.statusCode, 201, created.body);
+
+    const signedIn = await signIn(email, password, { deviceLabel: 'phone' });
+    assert.equal(signedIn.statusCode, 200, signedIn.body);
+    const token = (signedIn.json() as { accessToken: string }).accessToken;
+
+    const response = await createAjo(token, ajoBody());
+    assert.equal(response.statusCode, 403, response.body);
+  });
+
+  it('refuses an invalid configuration with 422, naming the field', async () => {
+    const member = await verifiedToken('ajo-invalid');
+    const cases: [string, Record<string, unknown>][] = [
+      ['maxMembers', { maxMembers: 3, durationRounds: 3 }],
+      ['durationRounds', { maxMembers: 10, durationRounds: 9 }],
+      ['contributionKobo', { contributionKobo: 99_900 }],
+      ['frequency', { frequency: 'DAILY' }],
+      ['collectionDay', { collectionDay: 'FUNDAY' }],
+      ['currency', { currency: 'USD' }],
+      ['startDate', { startDate: '06-11-2026' }],
+    ];
+    for (const [field, over] of cases) {
+      const response = await createAjo(member.accessToken, ajoBody(over));
+      assert.equal(response.statusCode, 422, `${field}: ${response.body}`);
+      assert.equal((response.json() as { field: string }).field, field);
+    }
+  });
+
+  it('refuses without a token', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      payload: ajoBody(),
+    });
+    assert.equal(response.statusCode, 401);
+  });
+});
