@@ -46,6 +46,8 @@ ownership to `ajo_migrator` and grants execution, which is what makes a
 | `LOGIN_RATE_LIMIT` `LOGIN_WINDOW_MS` | optional | Default 10 per 15 minutes, counted per address **and** per account |
 | `MAX_SESSIONS` | optional | Default 5, per 12.4.3 |
 | `PGPOOL_MAX` | optional | Default 10 |
+| `MOCK_WEBHOOK_SECRET` `PROVIDUSUNITY_WEBHOOK_SECRET` | to enable a provider | HMAC secret per provider. A provider with no secret is a provider that is switched on; with none set, every provider is off and the endpoint answers `404`. There is deliberately no default |
+| `WEBHOOK_RATE_LIMIT` `WEBHOOK_WINDOW_MS` | optional | Default 120 per minute per provider, a namespace separate from registration and login, because a provider is not a person |
 
 ## The access-token key
 
@@ -85,6 +87,44 @@ Two consequences worth planning for:
 Copy `.env.example` and fill it in. Keep the real `.env` out of version control;
 `.dockerignore` excludes it so it cannot be baked into a layer, where it would
 survive in the image history.
+
+## Provider webhooks
+
+`POST /api/v1/webhooks/payments/:provider` receives a payment provider's
+notification. The secret above is the HMAC key: the handler resolves the provider
+from the path, reads the raw body *before* any parser touches it, verifies the
+signature over those exact bytes, and only then parses. A route registered behind
+a JSON parser cannot do this, because the parser re-serialises the body and the
+signature stops matching — that is why the raw body is preserved separately.
+
+- An unsigned or mis-signed request is `401`. A signed request for an event type
+  the platform does not act on, a duplicate, or a malformed-but-authenticated body
+  is accepted (`202`) and recorded, because refusing a delivery a provider thinks
+  succeeded is how retries turn into an outage. An unknown provider is `404` and
+  an event outside the replay window is `422`.
+- Secrets have no defaults. `PROVIDUSUNITY_WEBHOOK_SECRET` is the *business* name;
+  whether it is the live integration is unresolved (`E3-01`), so the correct
+  production state today is to leave it unset. The `mock` provider exists so the
+  pipeline can be exercised without the vendor.
+
+When settlement itself is down, the worker spends an event's attempt budget
+against an unreachable database and marks it `failed`. Those rows are permanent —
+nothing retries a `failed` event — and once the outage is over a person has to
+say the cause is gone:
+
+```
+python3 scripts/replay_webhooks.py --db ajo --since 2026-10-01                 # dry run
+python3 scripts/replay_webhooks.py --db ajo --since 2026-10-01 \
+    --actor ops@example.ng --reason "settlement was down for two hours" --apply
+```
+
+The default is a dry run. Replaying is safe because
+`app.settle_provider_event` re-validates amount, currency and reference against
+the payment as it stands now, so an event that still does not match fails again
+rather than being forced through. Each replay writes an audit row naming the
+reason and the operator, and the operation is idempotent. The CLI requires a
+database role that can read `webhook_events` and execute the function; the
+migration role can, and `ajo_app` is granted the function.
 
 ## The three database roles
 
@@ -195,9 +235,10 @@ Honest list, so nobody discovers these in production:
 
 - **No vendor mail integration.** The relay contract above is the seam; an
   adapter for a specific provider is a thin function over it.
-- **No session or login endpoint.** Registration and verification exist; there is
-  no way to authenticate afterwards, and `user_credentials` is currently
-  write-only by policy.
+- **Auth still has gaps.** Registration, verification, sign-in, refresh, session
+  list and logout exist (`/api/v1/auth/*`), including the password and OTP paths.
+  What is missing is an authenticated `/me`, and the registration limiter still
+  uses its own budget rather than `config.login`.
 - **No application Dockerfile in `docker-compose.yml`.** The compose file is
   Postgres and Redis for local development; the API runs on the host.
 - **No deployment manifests.** No Kubernetes, systemd, or platform-specific

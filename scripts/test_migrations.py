@@ -4658,6 +4658,289 @@ def _discard_is_idempotent(db: str) -> str:
     return "a second delivery of a discarded event is absorbed, and the algorithm is still required"
 
 
+@case("a replay re-queues only what stopped, and never a settled event")
+def _replay_requeues_only_what_stopped(db: str) -> str:
+    """
+    §13.5 asks for replay so an outage is recoverable. The failure worth spending
+    a case on is not "does the row come back" -- it is "does anything come back
+    that should not".
+
+    Three things must survive this migration's write. A settled event is the one
+    that matters: re-queueing it is the only irreversible mistake available here,
+    because the settlement path would then meet `payments_one_success_per_contribution`
+    and stop -- leaving a row that says received and an audit trail that says
+    replayed, for an event that was captured weeks ago. A `received` event is
+    quieter but equally wrong, because a worker is on its way to it and a replay
+    would reset the attempt counter underneath one. `ignored` is a decision
+    somebody made on purpose.
+
+    The rest of the case is the thing an operator actually wants to know: that a
+    replay followed by a re-settle captures a payment whose earlier failure has
+    been fixed. Without that, this function is only ever a way to fail the same
+    way twice.
+    """
+    # Three separate contributions, on purpose. The earlier version of this case
+    # put all three events on one payment, which cannot work: the settled event
+    # captures the contribution, and then the stopped event -- the one this case
+    # exists to recover -- is refused by `payments_one_success_per_contribution`
+    # no matter what the replay does. The three events have to be independent for
+    # the last assertion to mean anything.
+    _pending_money_ajo(db, reference="replay-stops", group=21)
+    _pending_money_ajo(db, reference="replay-paid", group=22)
+    _pending_money_ajo(db, reference="replay-queued", group=23)
+
+    # The event that must stop. Matching payment, wrong amount, so the settlement
+    # path escalates rather than defers -- one call instead of eight attempts.
+    stopped = _verified_event(
+        db, "replay-stops", event_id="evt-replay-stops", amount=999999999,
+    )
+    if "amount mismatch" not in scalar(
+        db, f"SELECT app.settle_provider_event('{stopped}');"
+    ):
+        raise Failure(
+            "the fixture did not escalate on the amount mismatch, so this case is "
+            "not testing a replay of a stopped event at all"
+        )
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{stopped}';") != "failed":
+        raise Failure(
+            "the fixture did not fail, so this case is not testing a replay of a "
+            "stopped event at all"
+        )
+    if scalar(db, f"SELECT attempts::text FROM webhook_events WHERE id = '{stopped}';") != "1":
+        raise Failure("the fixture did not burn an attempt, so the reset proves nothing")
+
+    # The window this case replays. The whole point of the production call is a
+    # window, and this case has to use one: every other case in this file has left
+    # `failed` rows behind, so a NULL window would re-queue the lot and the count
+    # would be measuring the suite rather than the replay. Pinning both ends to the
+    # instant this event stopped isolates it -- timestamps here are microsecond
+    # `now()` values, so nothing else shares it.
+    stopped_at = scalar(
+        db, f"SELECT processed_at::text FROM webhook_events WHERE id = '{stopped}';"
+    )
+
+    # The event that must not come back, because it is already captured. A
+    # different payment now, so this one can settle without consuming the
+    # contribution the stopped event needs.
+    paid = _verified_event(
+        db, "replay-paid", event_id="evt-replay-already-paid", amount=1020000,
+    )
+    must_succeed(
+        db,
+        "settling the event that is already captured",
+        transaction(f"SELECT app.settle_provider_event('{paid}');").replace(
+            "ROLLBACK;", "COMMIT;"
+        ),
+    )
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{paid}';") != "processed":
+        raise Failure("the fixture did not settle, so this case cannot prove it was left alone")
+
+    # And one still on the queue, which a worker has not reached.
+    queued = _verified_event(
+        db, "replay-queued", event_id="evt-replay-still-queued", amount=1020000,
+    )
+
+    # The reason is not a formality. A hundred events re-queued with nothing
+    # recorded about why is an audit trail that cannot answer the only question
+    # anybody will have. Whitespace is not a reason either -- `btrim` is what makes
+    # `--reason ""` on a command line a refusal rather than an empty audit field.
+    must_fail(
+        db,
+        "replaying with no reason",
+        "SELECT app.replay_provider_event(NULL, NULL, 100, NULL);",
+        expect="must record why",
+    )
+    must_fail(
+        db,
+        "replaying with a blank reason",
+        "SELECT app.replay_provider_event(NULL, NULL, 100, '   ');",
+        expect="must record why",
+    )
+
+    must_fail(
+        db,
+        "replaying with a limit of zero",
+        "SELECT app.replay_provider_event(NULL, NULL, 0, 'a limit of nothing');",
+        expect="p_limit must be between 1 and 10000",
+    )
+
+    must_fail(
+        db,
+        "replaying a window that runs backwards",
+        "SELECT app.replay_provider_event(now(), now() - interval '1 day', 10, 'backwards');",
+        expect="window runs backwards",
+    )
+
+    replayed = scalar(
+        db,
+        f"SELECT app.replay_provider_event('{stopped_at}', '{stopped_at}', 100, "
+        "  'the settlement database was unreachable for two hours');",
+    )
+    if replayed != "1":
+        raise Failure(
+            f"expected exactly one event in the window to be re-queued, got {replayed}. "
+            "Anything more means a settled or still-queued event was replayed; anything "
+            "less means the stopped one was not found."
+        )
+
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{paid}';") != "processed":
+        raise Failure("the replay re-queued a settled event; that is the irreversible one")
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{queued}';") != "processing":
+        raise Failure("the replay re-queued an event that was already on the queue")
+    if scalar(db, f"SELECT status::text FROM webhook_events WHERE id = '{stopped}';") != "received":
+        raise Failure("the replay did not put the stopped event back on the queue")
+
+    # A fresh budget, and no trace of having stopped. A queued event that still
+    # carries its stop time answers "when did this stop" with a date for something
+    # that is running now.
+    if scalar(db, f"SELECT attempts::text FROM webhook_events WHERE id = '{stopped}';") != "0":
+        raise Failure("the replay did not reset the attempt counter; the old budget was left spent")
+    if scalar(
+        db, f"SELECT count(*)::text FROM webhook_events WHERE id = '{stopped}' AND processed_at IS NULL;"
+    ) != "1":
+        raise Failure("the replay left the stop time on an event that is now queued again")
+
+    # Why it was replayed, and what it was before, have to survive the overwrite.
+    # After the update there is nowhere else to recover either.
+    audit = scalar(
+        db,
+        f"""SELECT (a.after_state ->> 'reason') || '|' || a.action || '|'
+                  || a.subject_type::text || '|' || (a.before_state IS NULL)::text
+              FROM audit_logs a
+             WHERE a.subject_id = '{stopped}' AND a.action = 'webhook.replay';""",
+    )
+    if audit != "the settlement database was unreachable for two hours|webhook.replay|webhook_event|true":
+        raise Failure(
+            f"the replay was not audited in a way a later reader could use: {audit!r}"
+        )
+    if "amount" not in scalar(
+        db,
+        f"""SELECT a.after_state ->> 'previous_error' FROM audit_logs a
+             WHERE a.subject_id = '{stopped}' AND a.action = 'webhook.replay';""",
+    ):
+        raise Failure("the audit row did not record what the event had failed on")
+
+    # Running it again must be a no-op, not a second re-queue. "Replay everything
+    # that failed since the outage" is a command an operator runs more than once
+    # when they are not sure whether the first one worked.
+    if scalar(
+        db,
+        f"SELECT app.replay_provider_event('{stopped_at}', '{stopped_at}', 100, "
+        "  'checking whether the first replay took');",
+    ) != "0":
+        raise Failure("a second replay re-queued the same event; it is no longer failed")
+
+    # The reason an operator runs this at all. The earlier failure was an amount
+    # that did not match; fix the underlying record and the replayed event settles
+    # on the strength of the current state, not of anything it remembered.
+    must_succeed(
+        db,
+        "correcting the payment the stopped event referred to",
+        """UPDATE payments
+              SET contribution_amount_kobo = 999999999 / 1.02
+            WHERE provider_reference = 'replay-stops';""",
+    )
+    must_succeed(
+        db,
+        "reclaiming the replayed event",
+        f"""SELECT count(*) FROM app.claim_provider_event() WHERE id = '{stopped}';""",
+    )
+    outcome = scalar(db, f"SELECT app.settle_provider_event('{stopped}');")
+    if outcome != "captured":
+        raise Failure(
+            f"the replayed event did not capture after its underlying problem was "
+            f"fixed, it said {outcome!r}. Replay is only recovery if it can still succeed."
+        )
+
+    return (
+        "one stopped event was re-queued with a fresh budget, an audit row naming "
+        "the reason, and a settled or still-queued event left untouched; a second "
+        "replay was a no-op, and the replayed event captured once its underlying "
+        "failure was fixed"
+    )
+
+
+@case("a replay records who asked for it, not the raw actor GUC")
+def _replay_records_who_asked(db: str) -> str:
+    """
+    The audit row's `actor_type` has a CHECK constraint with its own vocabulary
+    (`user|system|service|webhook`) while `app.actor_type` is the GUC vocabulary
+    (`anon|member|...`). `app.audit_row()` maps between them; a function that wrote
+    the GUC value straight into the column would be refused by the CHECK -- and
+    refused only in production, where the API sets 'member' and a developer's ad
+    hoc call does not. This is the case that catches a missing mapping, and it also
+    pins the default: no actor at all is an unattended recovery job, which is
+    'system' rather than the 'service' an HTTP request would be.
+    """
+    _pending_money_ajo(db, reference="replay-actor", group=24)
+    stopped = _verified_event(
+        db, "replay-actor", event_id="evt-replay-actor", amount=999999999,
+    )
+    if "amount mismatch" not in scalar(
+        db, f"SELECT app.settle_provider_event('{stopped}');"
+    ):
+        raise Failure("the fixture did not escalate, so there is nothing to replay")
+
+    # The uncontrolled case, asserted because it is what a cron job gets: no actor
+    # set at all. It must not depend on a developer having exported a GUC.
+    if scalar(
+        db,
+        f"SELECT app.replay_provider_event("
+        f"  (SELECT processed_at FROM webhook_events WHERE id='{stopped}'),"
+        f"  (SELECT processed_at FROM webhook_events WHERE id='{stopped}'),"
+        f"  10, 'the settlement worker was unreachable');",
+    ) != "1":
+        raise Failure("the unattributed replay did not re-queue the stopped event")
+    if scalar(
+        db,
+        f"""SELECT a.actor_type || '|' || (a.actor_user_id IS NULL)::text
+              FROM audit_logs a WHERE a.subject_id = '{stopped}'
+               AND a.action = 'webhook.replay';""",
+    ) != "system|true":
+        raise Failure("an unattributed replay was not recorded as a system actor")
+
+    # The controlled case: the API's own vocabulary. 'member' is a person acting as
+    # themselves and has to arrive in the column as 'user', or the CHECK refuses it.
+    _pending_money_ajo(db, reference="replay-actor-2", group=25)
+    second = _verified_event(
+        db, "replay-actor-2", event_id="evt-replay-actor-2", amount=999999999,
+    )
+    if "amount mismatch" not in scalar(
+        db, f"SELECT app.settle_provider_event('{second}');"
+    ):
+        raise Failure("the second fixture did not escalate")
+
+    actor = scalar(db, "SELECT id FROM users WHERE email LIKE 'settle-24@%' LIMIT 1;")
+    if not actor:
+        raise Failure("the fixture did not create the user this case attributes the replay to")
+
+    must_succeed(
+        db,
+        "replaying as a member",
+        f"""SELECT set_config('app.actor_user_id', '{actor}', false),
+                   set_config('app.actor_type', 'member', false),
+                   app.replay_provider_event(
+                     (SELECT processed_at FROM webhook_events WHERE id='{second}'),
+                     (SELECT processed_at FROM webhook_events WHERE id='{second}'),
+                     10, 'a person asked for this one');""",
+    )
+    attributed = scalar(
+        db,
+        f"""SELECT a.actor_type || '|' || a.actor_user_id
+              FROM audit_logs a WHERE a.subject_id = '{second}'
+               AND a.action = 'webhook.replay';""",
+    )
+    if attributed != f"user|{actor}":
+        raise Failure(
+            f"'member' was not mapped to 'user' with the acting user recorded: {attributed!r}"
+        )
+
+    return (
+        "an unattributed replay is recorded as 'system' with no user, and a replay "
+        "run as a member is mapped to 'user' with the acting user id"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")
