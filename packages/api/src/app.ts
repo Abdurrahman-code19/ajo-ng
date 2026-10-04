@@ -20,6 +20,7 @@ import type { FinancialProvider } from '@ajo/domain';
 import { registerSessionRoutes } from './session-routes.js';
 import { registerMeRoutes } from './me-routes.js';
 import { registerAjoRoutes } from './ajos-routes.js';
+import { registerInvitationRoutes } from './invitations-routes.js';
 import { UnauthenticatedError, unauthenticated } from './auth.js';
 import { preserveRawBody } from './raw-body.js';
 import { registerWebhookRoutes } from './webhook-routes.js';
@@ -186,6 +187,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerSessionRoutes(app, { config, pool, loginLimiter, signer, verifier });
   registerMeRoutes(app, { pool, verifier });
   registerAjoRoutes(app, { pool, verifier });
+  registerInvitationRoutes(app, { pool });
   // Before any route is registered, and for every route: the webhook endpoint is
   // the only consumer of the raw bytes, but the parser has to be the app-wide one
   // because it is keyed by content type.

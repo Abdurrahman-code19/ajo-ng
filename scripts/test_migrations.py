@@ -5062,6 +5062,196 @@ SET LOCAL ROLE ajo_app;
     )
 
 
+@case("inviting a member mints one pending token and previews without the roster")
+def _create_invitation(db: str) -> str:
+    """
+    `app.create_invitation` (migration 111) is the only write path for an
+    invitation, because there is deliberately no INSERT policy on
+    `public.invitations`. This case pins two things that are easy to get
+    backwards: the inviter is derived from the session and never accepted as an
+    argument (so an organizer cannot invite into somebody else's Ajo), and the
+    anonymous preview is a curated projection rather than the row (FR-INV-003:
+    no member roster, no pot value).
+
+    The preview assertion that matters is the negative one. It would be easy to
+    "fix" `preview_invitation` into `SELECT to_jsonb(i)` some later day and have
+    every positive assertion still pass; the check that no invited address and no
+    `organizer_user_id` appear in the output is what fails when that happens.
+    """
+    org = "invite-org@example.ng"
+    other = "invite-other@example.ng"
+    ajo = "E5B Invite"
+    setup = f"""
+INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+VALUES ('t-invite-org', '{org}', 'active', true);
+INSERT INTO profiles (user_id, display_name)
+SELECT id, 'Ada Organizer' FROM users WHERE email = '{org}';
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{org}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.create_ajo('{ajo}', 'the test', 100000, 'NGN', 'weekly', 10, 'friday', DATE '2026-11-01');
+"""
+    body = setup + f"""
+SELECT 'inv=' || (app.create_invitation(
+  (SELECT id FROM ajos WHERE name = '{ajo}'),
+  'invitee1@example.ng', decode('01', 'hex'), now() + interval '72 hours', 'join us'
+)).status;
+SELECT 'preview=' || app.preview_invitation(decode('01', 'hex'))::text;
+SELECT 'seats=' || (SELECT count(*) FROM ajo_positions p
+   WHERE p.ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}') AND p.status = 'open');
+"""
+    out = must_succeed(
+        db, "create_invitation as the organizer", transaction(body)
+    )
+    for expected in ("inv=pending", "seats=9"):
+        if expected not in out:
+            raise Failure(
+                f"create_invitation did not produce {expected!r}:\n    {out.strip()[:400]}"
+            )
+    preview = ""
+    for line in out.splitlines():
+        if line.startswith("preview="):
+            preview = line
+    for expected in (
+        '"name": "E5B Invite"',
+        '"contributionKobo": 100000',
+        '"frequencyCode": "weekly"',
+        '"maxMembers": 10',
+        '"membersCount": 1',
+        '"name": "Ada Organizer"',
+        '"positionOptions": [2',
+    ):
+        if expected not in preview:
+            raise Failure(
+                f"preview is missing {expected!r}:\n    {preview[:500]}"
+            )
+    if "@example.ng" in preview:
+        raise Failure(
+            f"preview leaked an email address:\n    {preview[:500]}"
+        )
+    if "organizer_user_id" in preview:
+        raise Failure(
+            f"preview leaked the organizer's id:\n    {preview[:500]}"
+        )
+
+    # Rejections, each in its own transaction and each asserted on its own
+    # message rather than the SQLSTATE alone -- "not yours" and "already a
+    # member" must not be the same outcome.
+    # The non-organizer is made a *member* on purpose. A stranger cannot even see
+    # the Ajo through RLS, so the argument subquery would resolve to NULL and the
+    # function would answer "no Ajo to invite to" -- which is true, but tests the
+    # wrong line. A member can see the Ajo, so the call reaches the explicit
+    # `organizer_user_id <> v_user_id` branch and is refused for the reason that
+    # matters: being in the Ajo is not the same as owning it.
+    must_fail(
+        db,
+        "a member who is not the organizer",
+        f"BEGIN;{setup}RESET ROLE;"
+        f"INSERT INTO users (auth_subject_id, email, status, is_email_verified) "
+        f"VALUES ('t-invite-other', '{other}', 'active', true);"
+        f"UPDATE ajo_positions SET status = 'claimed' "
+        f" WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}') AND position_number = 2;"
+        f"INSERT INTO ajo_members (ajo_id, user_id, position_id, status, joined_at) "
+        f"SELECT a.id, u.id, p.id, 'active', now() "
+        f"  FROM ajos a, users u, ajo_positions p "
+        f" WHERE a.name = '{ajo}' AND u.email = '{other}' "
+        f"   AND p.ajo_id = a.id AND p.position_number = 2;"
+        f"SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{other}'), true);"
+        f"SET LOCAL ROLE ajo_app;"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'x@example.ng', decode('02', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="only the organizer",
+    )
+    # And a stranger, who cannot see the Ajo at all, gets the same non-disclosing
+    # "not yours" answer rather than a distinguishable "no such Ajo".
+    must_fail(
+        db,
+        "a stranger",
+        f"BEGIN;{setup}RESET ROLE;"
+        f"INSERT INTO users (auth_subject_id, email, status, is_email_verified) "
+        f"VALUES ('t-invite-stranger', 'invite-stranger@example.ng', 'active', true);"
+        f"SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = 'invite-stranger@example.ng'), true);"
+        f"SET LOCAL ROLE ajo_app;"
+        f"SELECT app.create_invitation(("
+        f"  SELECT id FROM ajos WHERE name = '{ajo}'"
+        f"), 'x@example.ng', decode('02', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="does not own it",
+    )
+    must_fail(
+        db,
+        "an address already in the Ajo",
+        f"BEGIN;{setup}"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'{org}', decode('02', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="already a member",
+    )
+    must_fail(
+        db,
+        "an address without an @",
+        f"BEGIN;{setup}"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'nope', decode('02', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="needs an email address",
+    )
+    must_fail(
+        db,
+        "an expiry in the past",
+        f"BEGIN;{setup}"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'invitee2@example.ng', decode('02', 'hex'), now() - interval '1 hour', null);ROLLBACK;",
+        expect="must expire in the future",
+    )
+    must_fail(
+        db,
+        "a full Ajo",
+        f"BEGIN;{setup}RESET ROLE;"
+        f"UPDATE ajo_positions SET status = 'claimed' "
+        f" WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}');"
+        f"SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{org}'), true);"
+        f"SET LOCAL ROLE ajo_app;"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'invitee2@example.ng', decode('02', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="no free positions",
+    )
+    # Two pending invitations to the same address collide on
+    # `invitations_one_pending_per_ajo_email`, so a duplicate is refused by the
+    # database rather than by the function remembering to check.
+    must_fail(
+        db,
+        "a duplicate pending invitation",
+        f"BEGIN;{setup}"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'invitee1@example.ng', decode('02', 'hex'), now() + interval '1 hour', null);"
+        f"SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'), "
+        f"'invitee1@example.ng', decode('03', 'hex'), now() + interval '1 hour', null);ROLLBACK;",
+        expect="invitations_one_pending_per_ajo_email",
+    )
+
+    # The grants again read from pg_proc: the suite connects as the superuser, so
+    # a successful call proves nothing about who else may call. `ajo_api` is the
+    # one that matters for the anonymous preview route -- it is not a superuser
+    # and does not bypass RLS, so EXECUTE has to come from its membership in
+    # `ajo_app`.
+    for role, fn, want, label in (
+        ("public", "app.create_invitation(uuid,text,bytea,timestamptz,text)", "false", "PUBLIC"),
+        ("ajo_app", "app.create_invitation(uuid,text,bytea,timestamptz,text)", "true", "ajo_app"),
+        ("public", "app.preview_invitation(bytea)", "false", "PUBLIC"),
+        ("ajo_api", "app.preview_invitation(bytea)", "true", "ajo_api"),
+    ):
+        got = scalar(
+            db, f"SELECT has_function_privilege('{role}', '{fn}', 'EXECUTE')::text;"
+        )
+        if got != want:
+            raise Failure(
+                f"{label} EXECUTE on {fn.split('(')[0]} should be {want}, got {got!r}"
+            )
+
+    return (
+        "mints a pending invitation for the organizer only, previews it without "
+        "the roster or pot, rejects a stranger, a member, a bad address, a stale "
+        "expiry, a full Ajo and a duplicate; EXECUTE stays ajo_app/ajo_api"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")
