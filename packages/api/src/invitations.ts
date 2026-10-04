@@ -72,6 +72,7 @@ interface RawInvitation {
   expires_at: Date;
   email: string;
   token_hash: Buffer;
+  ajo_id?: string;
 }
 
 interface CreateDbResult {
@@ -310,4 +311,206 @@ export async function previewInvitationByToken(_pool: pg.Pool, token: string): P
     feeDisclosure: feeDisclosure(kobo(contribution) as Kobo),
     rules: ajoRules(),
   };
+}
+
+export interface AcceptInvitationInput {
+  readonly token?: unknown;
+  readonly accept?: unknown;
+  readonly rulesAcknowledged?: unknown;
+}
+
+export interface AcceptInvitationResult {
+  readonly accepted: boolean;
+  readonly ajoId: string;
+  readonly positionNumber: number;
+}
+
+export async function acceptInvitation(
+  pool: pg.Pool,
+  identity: Identity,
+  input: AcceptInvitationInput,
+): Promise<AcceptInvitationResult> {
+  if ((identity as any).type !== 'member') {
+    throw new InvitationNotAllowedError();
+  }
+  if (!(identity as any).verified) {
+    throw new InvitationNotAllowedError();
+  }
+  const token = typeof input.token === 'string' && input.token.length > 0 ? input.token : null;
+  if (token === null) {
+    throw new ValidationError('token', 'token is required');
+  }
+  if (input.accept !== true) {
+    throw new ValidationError('accept', 'accept must be true to join');
+  }
+  if (input.rulesAcknowledged !== true) {
+    throw new ValidationError('rulesAcknowledged', 'you must acknowledge the Ajo rules');
+  }
+
+  const tokenHash = hashToken(token);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Try to find a pending invitation by token that is not expired
+    const inv = await client.query<RawInvitation>(
+      `SELECT id, status, expires_at, email, token_hash, ajo_id
+         FROM invitations
+        WHERE token_hash = $1 AND deleted_at IS NULL
+        FOR UPDATE`,
+      [tokenHash],
+    );
+    if (inv.rowCount === 0) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotFoundError();
+    }
+    const i = inv.rows[0] as any;
+    if (!i) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotFoundError();
+    }
+    if (i.status !== 'pending') {
+      await client.query('ROLLBACK');
+      throw new InvitationGoneError(i.status as InvitationRejection);
+    }
+    if (new Date(i.expires_at).getTime() <= Date.now()) {
+      await client.query('ROLLBACK');
+      throw new InvitationGoneError('expired');
+    }
+
+    // Verify the authenticated member's email matches the invited email
+    const user = await client.query<{ id: string; email: string }>(
+      `SELECT id, email FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [(identity as any).id],
+    );
+    if (user.rowCount === 0) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotAllowedError();
+    }
+    const u = user.rows[0] as any;
+    if (!u) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotAllowedError();
+    }
+    if (u.email.toLowerCase() !== String(i.email).toLowerCase()) {
+      await client.query('ROLLBACK');
+      throw new InvitationConflictError('this invitation was sent to a different email address');
+    }
+
+    // Find an open position for this ajo
+    const pos = await client.query<{ id: string; position_number: number }>(
+      `SELECT id, position_number
+         FROM ajo_positions
+        WHERE ajo_id = $1 AND status = 'open' AND deleted_at IS NULL
+        ORDER BY position_number
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED`,
+      [(i as any).ajo_id],
+    );
+    if (pos.rowCount === 0) {
+      await client.query('ROLLBACK');
+      throw new InvitationConflictError('Ajo has no free positions');
+    }
+    const p = pos.rows[0] as any;
+    if (!p) {
+      await client.query('ROLLBACK');
+      throw new InvitationConflictError('Ajo has no free positions');
+    }
+
+    // Claim position
+    await client.query(
+      `UPDATE ajo_positions SET status = 'claimed', updated_at = now() WHERE id = $1`,
+      [p.id],
+    );
+
+    // Create member record (joined_at set on insert; invitation_id linked)
+    await client.query(
+      `INSERT INTO ajo_members (ajo_id, user_id, position_id, invitation_id, status, joined_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'active', now(), now(), now())`,
+      [(i as any).ajo_id, u.id, p.id, i.id],
+    );
+
+    // Mark invitation as accepted
+    await client.query(
+      `UPDATE invitations SET status = 'accepted', accepted_by_user_id = $1, accepted_at = now(), updated_at = now() WHERE id = $2`,
+      [u.id, i.id],
+    );
+
+    await client.query('COMMIT');
+    return { accepted: true, ajoId: (i as any).ajo_id, positionNumber: p.position_number };
+  } catch (e) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+    if (e instanceof ValidationError || e instanceof InvitationNotAllowedError || e instanceof InvitationConflictError || e instanceof InvitationNotFoundError || e instanceof InvitationGoneError) {
+      throw e;
+    }
+    const code = sqlState(e);
+    if (code === '23505') {
+      throw new InvitationConflictError('you are already a member of this Ajo');
+    }
+    throw new InvitationConflictError('failed to accept invitation');
+  } finally {
+    client.release();
+  }
+}
+
+export async function declineInvitation(
+  pool: pg.Pool,
+  identity: Identity,
+  token: string,
+): Promise<{ declined: boolean }> {
+  if ((identity as any).type !== 'member') {
+    throw new InvitationNotAllowedError();
+  }
+  if (!(identity as any).verified) {
+    throw new InvitationNotAllowedError();
+  }
+  const tokenHash = hashToken(token);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inv = await client.query<RawInvitation>(
+      `SELECT id, status, expires_at, email, token_hash
+         FROM invitations
+        WHERE token_hash = $1 AND deleted_at IS NULL
+        FOR UPDATE`,
+      [tokenHash],
+    );
+    if (inv.rowCount === 0) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotFoundError();
+    }
+    const i = inv.rows[0] as any;
+    if (i.status !== 'pending') {
+      await client.query('ROLLBACK');
+      throw new InvitationGoneError(i.status as InvitationRejection);
+    }
+    const user = await client.query<{ id: string; email: string }>(
+      `SELECT id, email FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [(identity as any).id],
+    );
+    if (user.rowCount === 0 || !user.rows[0]) {
+      await client.query('ROLLBACK');
+      throw new InvitationNotAllowedError();
+    }
+    const u = user.rows[0] as any;
+    if (u.email.toLowerCase() !== String(i.email).toLowerCase()) {
+      await client.query('ROLLBACK');
+      throw new InvitationConflictError('this invitation was sent to a different email address');
+    }
+    await client.query(
+      `UPDATE invitations SET status = 'declined', declined_at = now(), updated_at = now() WHERE id = $1`,
+      [i.id],
+    );
+    await client.query('COMMIT');
+    return { declined: true };
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    if (e instanceof InvitationNotAllowedError || e instanceof InvitationConflictError || e instanceof InvitationNotFoundError || e instanceof InvitationGoneError) {
+      throw e;
+    }
+    throw new InvitationConflictError('failed to decline invitation');
+  } finally {
+    client.release();
+  }
 }

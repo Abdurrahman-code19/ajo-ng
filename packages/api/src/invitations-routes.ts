@@ -2,6 +2,8 @@ import type pg from 'pg';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ValidationError } from './identity.js';
 import {
+  acceptInvitation,
+  declineInvitation,
   createInvitations,
   InvitationConflictError,
   InvitationGoneError,
@@ -87,4 +89,70 @@ export function registerInvitationRoutes(app: FastifyInstance, deps: InvitationR
       return;
     }
   });
+
+  app.post('/api/v1/invitations/accept', async (req: FastifyRequest, res: FastifyReply) => {
+    try {
+      const identity = await requireIdentity(req);
+      const result = await acceptInvitation(deps.pool, identity, req.body as any);
+      res.status(200).send(result);
+      return;
+    } catch (e) {
+      if (e instanceof ValidationError) {
+        res.status(422).send({ error: e.message, field: e.field });
+        return;
+      }
+      if (e instanceof InvitationNotAllowedError) {
+        res.status(403).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationConflictError) {
+        res.status(409).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationNotFoundError) {
+        res.status(404).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationGoneError) {
+        res.status(410).send({ error: `invitation is ${e.message.split(' ')[2] || e.message}` });
+        return;
+      }
+      res.status(500).send({ error: 'internal server error' });
+      return;
+    }
+  });
+
+  app.post('/api/v1/invitations/:token/decline', async (req: FastifyRequest<{ Params: { token: string } }>, res: FastifyReply) => {
+    try {
+      const identity = await requireIdentity(req);
+      const token = req.params.token;
+      const result = await declineInvitation(deps.pool, identity, token);
+      res.status(200).send(result);
+      return;
+    } catch (e) {
+      if (e instanceof ValidationError) {
+        res.status(422).send({ error: e.message, field: e.field });
+        return;
+      }
+      if (e instanceof InvitationNotAllowedError) {
+        res.status(403).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationConflictError) {
+        res.status(409).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationNotFoundError) {
+        res.status(404).send({ error: e.message });
+        return;
+      }
+      if (e instanceof InvitationGoneError) {
+        res.status(410).send({ error: `invitation is ${e.message.split(' ')[2] || e.message}` });
+        return;
+      }
+      res.status(500).send({ error: 'internal server error' });
+      return;
+    }
+  });
 }
+
