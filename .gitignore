@@ -13,3 +13,6 @@ __pycache__/
 
 # Word lock files, created whenever the spec is open in Word
 ~$*.docx
+
+# Database dumps taken before a migration is applied to the live database.
+backups/*.dump

@@ -242,12 +242,24 @@ export async function createAjo(
     }
 
     const created = await client.query<AjoRow>(
-      // `(function(...)).*` expands the returned composite into the columns of
-      // the row, so the response is built from what was actually written rather
-      // than from the input echoed back. The join pulls the cadence's own code
-      // back for the response; `create_ajo` returns the Ajo row, not the code.
-      `SELECT a.*, cf.code AS frequency_code
-         FROM (SELECT (app.create_ajo($1, $2, $3, $4, $5, $6, $7, $8)).*) AS a
+      // `MATERIALIZED` is not decoration. `SELECT (app.create_ajo(...)).*` looks
+      // like it calls the function once and then expands the returned composite
+      // into columns -- it does not: PostgreSQL rewrites the expansion into one
+      // `(app.create_ajo(...)).<column>` expression per column, and a PL/pgSQL
+      // function is VOLATILE by default, so it is *called once per column*.
+      // `ajos` has 27 of them, which made every one of these requests create 27
+      // Ajos and return one of them.
+      //
+      // The CTE is materialized so the call is planned and evaluated exactly
+      // once and the rows below are field selections on an already-computed
+      // value. Naming the function in FROM instead -- `FROM app.create_ajo(...)`
+      // -- also evaluates it once, but then the cadence code needs a second
+      // round trip to join, and this is the same transaction either way.
+      `WITH created AS MATERIALIZED (
+         SELECT * FROM app.create_ajo($1, $2, $3, $4, $5, $6, $7, $8) AS a
+       )
+       SELECT a.*, cf.code AS frequency_code
+         FROM created a
          JOIN public.contribution_frequencies cf ON cf.id = a.frequency_id`,
       [
         config.name,

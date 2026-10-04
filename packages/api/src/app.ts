@@ -187,7 +187,7 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
   registerSessionRoutes(app, { config, pool, loginLimiter, signer, verifier });
   registerMeRoutes(app, { pool, verifier });
   registerAjoRoutes(app, { pool, verifier });
-  registerInvitationRoutes(app, { pool });
+  registerInvitationRoutes(app, { pool, verifier });
   // Before any route is registered, and for every route: the webhook endpoint is
   // the only consumer of the raw bytes, but the parser has to be the app-wide one
   // because it is keyed by content type.

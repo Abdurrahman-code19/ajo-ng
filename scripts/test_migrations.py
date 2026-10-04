@@ -5252,6 +5252,227 @@ SELECT 'seats=' || (SELECT count(*) FROM ajo_positions p
     )
 
 
+@case("redeeming an invitation claims one seat, spends the token, and records the rules version")
+def _join_ajo(db: str) -> str:
+    """
+    `app.join_ajo` (migration 112) is the only path from a token to a membership,
+    and it exists because that write cannot be done honestly in the application:
+    there is no INSERT policy on `ajo_members`, and a claim-then-insert route
+    would leave a member with no seat whenever the process died between the two
+    statements. Three claims are pinned here that an ordinary happy-path test
+    cannot see.
+
+    The first is *one* claim. `SELECT (app.join_ajo(...)).*` looks like a single
+    call followed by a column expansion and is not: PostgreSQL rewrites it into
+    one `(app.join_ajo(...)).<column>` per column, and a PL/pgSQL function is
+    VOLATILE by default, so it runs once per column and claims a seat each time.
+    The same mistake made `app.create_ajo` write 27 Ajos per request. The
+    assertion is on the number of claimed seats, not on the call succeeding: a
+    caller that only checked the final status would never have known.
+
+    The second is that the acknowledgement is *recorded*. BR-004 is consent to a
+    version of the rules, and a boolean cannot say which version.
+
+    The third is that the refusals are distinguishable. 23514 covers "wrong
+    version", "expired", "already accepted" and "no seats", and the API maps them
+    to different status codes, so each is asserted on its own message.
+    """
+    org = "join-org@example.ng"
+    first = "join-first@example.ng"
+    second = "join-second@example.ng"
+    stranger = "join-stranger@example.ng"
+    ajo = "E5B Join"
+    setup = f"""
+INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+VALUES ('t-join-org', '{org}', 'active', true),
+       ('t-join-first', '{first}', 'active', true),
+       ('t-join-second', '{second}', 'active', true),
+       ('t-join-stranger', '{stranger}', 'active', true);
+INSERT INTO profiles (user_id, display_name)
+SELECT id, 'Member ' || left(email, 4) FROM users WHERE email LIKE 'join-%@example.ng';
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{org}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.create_ajo('E5B Join', 'the test', 100000, 'NGN', 'weekly', 10,
+                      'friday', DATE '2026-11-06');
+SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  '{first}', decode('11', 'hex'), now() + interval '72 hours', null);
+SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  '{second}', decode('22', 'hex'), now() + interval '72 hours', null);
+RESET ROLE;
+"""
+    body = f"""{setup}
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT 'joined=' || (app.join_ajo(decode('11', 'hex'), '{first}', app.ajo_rules_version()))::text;
+SELECT 'claimed=' || (SELECT count(*) FROM ajo_positions
+                       WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}')
+                         AND status = 'claimed')::text;
+SELECT 'acknowledged=' || (SELECT count(*) FROM ajo_members
+                             WHERE invitation_id IS NOT NULL
+                               AND rules_acknowledged_version = app.ajo_rules_version())::text;
+SELECT 'status=' || (SELECT status FROM invitations WHERE token_hash = decode('11', 'hex'));
+RESET ROLE;
+"""
+    out = must_succeed(db, "join_ajo as the invited member", transaction(body))
+    # Two claimed seats: the organizer's own, and the invitee's. Three would mean
+    # the function was evaluated once per output column.
+    for expected in ("joined=(", "claimed=2", "acknowledged=1", "status=accepted"):
+        if expected not in out:
+            raise Failure(
+                f"join_ajo did not produce {expected!r}:\n    {out.strip()[:400]}"
+            )
+
+    for label, sql, expect in (
+        (
+            "an invitation redeemed by a different address",
+            f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{stranger}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('11', 'hex'), '{stranger}', app.ajo_rules_version());
+""",
+            "sent to a different address",
+        ),
+        (
+            "an acknowledgement of a stale rules version",
+            f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('11', 'hex'), '{first}',
+                    (app.ajo_rules_version() + 1)::smallint);
+""",
+            "rules have changed",
+        ),
+        (
+            "an expired invitation",
+            f"""
+UPDATE invitations SET expires_at = now() - interval '1 minute'
+ WHERE token_hash = decode('11', 'hex');
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('11', 'hex'), '{first}', app.ajo_rules_version());
+""",
+            "has expired",
+        ),
+        (
+            "a replayed redemption",
+            f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('11', 'hex'), '{first}', app.ajo_rules_version());
+SELECT app.join_ajo(decode('11', 'hex'), '{first}', app.ajo_rules_version());
+""",
+            "already accepted",
+        ),
+        (
+            "an unknown token",
+            f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('99', 'hex'), '{first}', app.ajo_rules_version());
+""",
+            "not valid",
+        ),
+        # Already a member. Not reachable through the API, which refuses to mint
+        # an invitation for somebody who already holds a seat. This is the race
+        # the check exists for: invited, then joined by some other route, then
+        # the token presented -- and it must not cost a second seat.
+        (
+            "somebody who is already a member",
+            f"""
+UPDATE ajo_positions SET status = 'claimed'
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}') AND position_number = 3;
+INSERT INTO ajo_members (ajo_id, user_id, position_id, status, joined_at)
+SELECT a.id, u.id, p.id, 'active', now()
+  FROM ajos a, users u, ajo_positions p
+ WHERE a.name = '{ajo}' AND u.email = '{first}'
+   AND p.ajo_id = a.id AND p.position_number = 3;
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{first}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('11', 'hex'), '{first}', app.ajo_rules_version());
+""",
+            "already a member",
+        ),
+    ):
+        must_fail(db, label, transaction(setup + sql), expect)
+
+    # A full Ajo: the tenth seat taken by somebody else before the token is
+    # redeemed. The invitation is not spent, so it is still usable if a seat frees.
+    must_fail(
+        db,
+        "an Ajo with no seat left",
+        transaction(
+            setup
+            + f"""
+UPDATE ajo_positions SET status = 'claimed'
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}')
+   AND position_number <> 1;
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{second}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.join_ajo(decode('22', 'hex'), '{second}', app.ajo_rules_version());
+"""
+        ),
+        "no free positions",
+    )
+
+    declined = must_succeed(
+        db,
+        "decline_invitation",
+        transaction(
+            setup
+            + f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{second}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT 'declined=' || app.decline_invitation(decode('22', 'hex'), '{second}')::text;
+SELECT 'members=' || (SELECT count(*) FROM ajo_members
+                       WHERE invitation_id IS NOT NULL)::text;
+SELECT 'status=' || (SELECT status FROM invitations WHERE token_hash = decode('22', 'hex'));
+RESET ROLE;
+"""
+        ),
+    )
+    for expected in ("declined=true", "members=0", "status=declined"):
+        if expected not in declined:
+            raise Failure(
+                f"decline_invitation did not produce {expected!r}:\n"
+                f"    {declined.strip()[:400]}"
+            )
+    must_fail(
+        db,
+        "a replayed decline",
+        transaction(
+            setup
+            + f"""
+SELECT set_config('app.user_id', (SELECT id::text FROM users WHERE email = '{second}'), true);
+SET LOCAL ROLE ajo_app;
+SELECT app.decline_invitation(decode('22', 'hex'), '{second}');
+SELECT app.decline_invitation(decode('22', 'hex'), '{second}');
+"""
+        ),
+        "already declined",
+    )
+
+    for role, fn, want, label in (
+        ("public", "app.join_ajo(bytea,text,smallint)", "false", "PUBLIC"),
+        ("ajo_app", "app.join_ajo(bytea,text,smallint)", "true", "ajo_app"),
+        ("public", "app.decline_invitation(bytea,text)", "false", "PUBLIC"),
+        ("ajo_api", "app.decline_invitation(bytea,text)", "true", "ajo_api"),
+    ):
+        got = scalar(
+            db, f"SELECT has_function_privilege('{role}', '{fn}', 'EXECUTE')::text;"
+        )
+        if got != want:
+            raise Failure(
+                f"{label} EXECUTE on {fn.split('(')[0]} should be {want}, got {got!r}"
+            )
+    return (
+        "claims exactly one seat under SKIP LOCKED, records the acknowledged rules "
+        "version on the membership, spends the token once; refuses a wrong address, "
+        "a stale acknowledgement, an expired link, a replay, a non-member, an "
+        "unknown token and a full Ajo without spending the token; declining writes "
+        "no membership and cannot be replayed; EXECUTE stays ajo_app-only"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ajo_migration_test")

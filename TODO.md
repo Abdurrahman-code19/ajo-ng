@@ -402,12 +402,22 @@ Enforced by the database, not just by the domain:
 
 ### Ajo lifecycle — E5
 
-- [ ] `E5-01` Create an Ajo with all parameters and validation — 5 to 20 members, default 10,
+- [x] `E5-01` Create an Ajo with all parameters and validation — 5 to 20 members, default 10,
       `CHECK (position_count BETWEEN 5 AND 20)`; the creator occupies one of those positions
 - [x] Ajo size rule enforced in the domain — `assertValidMemberCount`, 8 tests, `CAN §3`
-- [ ] `E5-02` Ajo rules and acknowledgement record (`BR-004` complete-cycle commitment)
-- [ ] `E5-03` Invitation generation, single-use validation (`BR-006` invitation only)
-- [ ] `E5-04` Join and position assignment
+- [ ] `E5-02` Ajo rules and acknowledgement record (`BR-004` complete-cycle commitment) —
+      the five disclosure clauses and `AJO_RULES_VERSION` are published and previewed, and
+      `join_ajo` records the version an invitee acknowledged on their membership row
+      (migration `112`); the rules text itself is still counsel's to settle
+- [x] `E5-03` Invitation generation, single-use validation (`BR-006` invitation only) —
+      `app.create_invitation` and `app.preview_invitation` (migration `111`), one raw token
+      per contact with only the SHA-256 stored, a partial unique index allowing one pending
+      invitation per address, 72-hour expiry, organizer-only minting, and an anonymous
+      preview that carries no roster and no pot
+- [x] `E5-04` Join and position assignment — `app.join_ajo` and `app.decline_invitation`
+      (migration `112`): the lowest open seat claimed with `FOR UPDATE SKIP LOCKED`, the
+      membership, the spent token and the recorded rules version written in one transaction,
+      so two acceptors of the last seat produce one member and one 409
 - [ ] `E5-05` Five-day enrollment window with **boundary tests** (`BR-001`)
 - [ ] `E5-06` Activation to `FUNDED` — positions lock here (`BR-002`)
 - [ ] `E5-07` Round scheduling and advance

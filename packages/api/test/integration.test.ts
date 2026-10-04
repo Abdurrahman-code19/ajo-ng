@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
-import { MockFinancialProvider } from '@ajo/domain';
+import { AJO_RULES_VERSION, MockFinancialProvider } from '@ajo/domain';
 import type { Pool } from 'pg';
 import { buildApp } from '../src/app.js';
 import {
@@ -1071,6 +1071,36 @@ describe('security notifications', () => {
     );
   });
 });
+
+/**
+ * A verified member at a *given* address, because redeeming an invitation is the
+ * one flow where the identity of the address is the point: the invitation is
+ * for `email@example.ng`, so the member who may redeem it has to be that member.
+ * `loginableMember` always invents its own address.
+ */
+async function memberWithEmail(_prefix: string, email: string) {
+  const password = 'a sufficiently long passphrase';
+  const created = await post(validBody({ email, password }));
+  assert.equal(created.statusCode, 201, created.body);
+  const token = mailer.sent.at(-1)?.token as string;
+  const verified = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/verify-email',
+    payload: { token },
+  });
+  assert.equal(verified.statusCode, 200, verified.body);
+  return { email, password };
+}
+
+async function verifiedMember(prefix: string) {
+  const member = await loginableMember(prefix);
+  const response = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+  assert.equal(response.statusCode, 200, response.body);
+  return {
+    ...member,
+    accessToken: (response.json() as { accessToken: string }).accessToken,
+  };
+}
 
 const signIn = (email: string, password: string, over: Record<string, unknown> = {}) =>
   app.inject({
@@ -2173,5 +2203,472 @@ describe('creating an Ajo (POST /api/v1/ajos)', () => {
       payload: ajoBody(),
     });
     assert.equal(response.statusCode, 401);
+  });
+});
+
+
+describe('invitations', () => {
+  const ajoBody = (over: Record<string, unknown> = {}) => ({
+    name: 'Invite Circle',
+    contributionKobo: 100_000,
+    currency: 'NGN',
+    frequency: 'WEEKLY',
+    collectionDay: 'FRIDAY',
+    durationRounds: 5,
+    maxMembers: 5,
+    startDate: '2026-11-06',
+    ...over,
+  });
+
+  async function anAjoWithSeats(prefix: string, name: string) {
+    const organizer = await verifiedMember(prefix);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(organizer.accessToken),
+      payload: ajoBody({ name }),
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    const ajoId = (created.json() as { ajo: { id: string } }).ajo.id;
+    return { organizer, ajoId };
+  }
+
+  it('mints a pending invitation and shows it to nobody but the organizer', async () => {
+    const { organizer, ajoId } = await anAjoWithSeats('inv-create', 'Invite Circle One');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(organizer.accessToken),
+      payload: { ajoId, contacts: [{ email: 'invitee-one@example.ng' }] },
+    });
+
+    assert.equal(response.statusCode, 202, response.body);
+    const body = response.json() as {
+      invitations: { id: string; token: string; channel: string; status: string; expiresAt: string }[];
+      deliverySummary: { delivered: string[] };
+    };
+    assert.equal(body.invitations.length, 1);
+    const invitation = body.invitations[0]!;
+    assert.equal(invitation.status, 'pending');
+    assert.equal(invitation.channel, 'email');
+    assert.deepEqual(body.deliverySummary.delivered, ['invitee-one@example.ng']);
+    // The lifetime is the spec's 72 hours, to within a second of the request.
+    const expiresInHours = (Date.parse(invitation.expiresAt) - Date.now()) / 3_600_000;
+    assert.ok(expiresInHours > 71.9 && expiresInHours < 72.1, `expires in ${expiresInHours} hours`);
+  });
+
+  it('previews the Ajo to an anonymous holder of the token, without the roster', async () => {
+    const { organizer, ajoId } = await anAjoWithSeats('inv-preview', 'Invite Circle Two');
+    const minted = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(organizer.accessToken),
+      payload: { ajoId, contacts: [{ email: 'invitee-two@example.ng' }] },
+    });
+    assert.equal(minted.statusCode, 202, minted.body);
+    const token = ((minted.json() as { invitations: { token: string }[] }).invitations[0] as { token: string }).token;
+
+    const response = await app.inject({ method: 'GET', url: `/api/v1/invitations/${token}` });
+    assert.equal(response.statusCode, 200, response.body);
+    const preview = response.json() as {
+      ajo: { name: string; contributionKobo: number; membersCount: number; maxMembers: number };
+      organizer: { name: string };
+      positionOptions: number[];
+      feeDisclosure: { contributionKobo: number; feeKobo: number; totalChargeKobo: number };
+      rules: { version: number; clauses: { code: string }[] };
+    };
+    assert.equal(preview.ajo.name, 'Invite Circle Two');
+    assert.equal(preview.ajo.contributionKobo, 100_000);
+    // The organizer holds seat 1, so there is one member and four free seats.
+    assert.equal(preview.ajo.membersCount, 1);
+    assert.deepEqual(preview.positionOptions, [2, 3, 4, 5]);
+    // The fee is disclosed rather than buried, and it is the same 2% the ledger charges.
+    assert.equal(preview.feeDisclosure.feeKobo, 2_000);
+    assert.equal(preview.feeDisclosure.totalChargeKobo, 102_000);
+    assert.equal(preview.rules.version, 1);
+    assert.equal(preview.rules.clauses.length, 5);
+    // FR-INV-003: no roster, no pot, and nobody's address.
+    assert.equal(JSON.stringify(preview).includes('invitee-two'), false);
+    assert.equal(JSON.stringify(preview).includes('@example.ng'), false);
+  });
+
+  it('answers 404 for a token that matches nothing, and 410 once the invitation is spent', async () => {
+    const { organizer, ajoId } = await anAjoWithSeats('inv-spent', 'Invite Circle Three');
+    const minted = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(organizer.accessToken),
+      payload: { ajoId, contacts: [{ email: 'invitee-three@example.ng' }] },
+    });
+    const token = ((minted.json() as { invitations: { token: string }[] }).invitations[0] as { token: string }).token;
+
+    const unknown = await app.inject({ method: 'GET', url: '/api/v1/invitations/not-a-real-token-at-all' });
+    assert.equal(unknown.statusCode, 404, unknown.body);
+
+    // Accept it as the invited member, which spends the token.
+    const invitee = await memberWithEmail('inv-spend', 'invitee-three@example.ng');
+    const signedIn = await signIn(invitee.email, invitee.password, { deviceLabel: 'phone' });
+    assert.equal(signedIn.statusCode, 200, signedIn.body);
+    const inviteeToken = (signedIn.json() as { accessToken: string }).accessToken;
+
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations/accept',
+      headers: withBearer(inviteeToken),
+      payload: { token, accept: true, rulesAcknowledged: true },
+    });
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    assert.equal((accepted.json() as { accepted: boolean }).accepted, true);
+
+    const afterAccept = await app.inject({ method: 'GET', url: `/api/v1/invitations/${token}` });
+    assert.equal(afterAccept.statusCode, 410, afterAccept.body);
+  });
+
+  it('refuses a contact with no addressable email, with 422 naming the field', async () => {
+    const { organizer, ajoId } = await anAjoWithSeats('inv-invalid', 'Invite Circle Four');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(organizer.accessToken),
+      payload: { ajoId, contacts: [{ phoneNumber: '+2348012345678' }] },
+    });
+    assert.equal(response.statusCode, 422, response.body);
+    assert.equal((response.json() as { field: string }).field, 'contacts.0.email');
+  });
+
+  it('refuses to invite into an Ajo the caller does not organize, and without a token', async () => {
+    const { ajoId } = await anAjoWithSeats('inv-notmine', 'Invite Circle Five');
+    const stranger = await verifiedMember('inv-stranger');
+    const refused = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(stranger.accessToken),
+      payload: { ajoId, contacts: [{ email: 'someone@example.ng' }] },
+    });
+    // The Ajo is invisible to a stranger, so "no such Ajo" and "not yours" are
+    // the same answer. Either way it is not a 202.
+    assert.equal(refused.statusCode, 403, refused.body);
+
+    const anonymous = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      payload: { ajoId, contacts: [{ email: 'someone@example.ng' }] },
+    });
+    assert.equal(anonymous.statusCode, 401, anonymous.body);
+  });
+});
+
+describe('redeeming an invitation', () => {
+  /**
+   * One Ajo, one invitation, one signed-in invitee at the invited address.
+   *
+   * The helpers here are shaped around the fact that redeeming a token is the
+   * one flow where *who you are* is the question: the invitation is addressed to
+   * an email, and the account that redeems it has to be the account at exactly
+   * that address. Everything else in the suite can invent its own identity.
+   */
+  async function memberAt(email: string) {
+    const password = 'a sufficiently long passphrase';
+    const created = await post(validBody({ email, password }));
+    assert.equal(created.statusCode, 201, created.body);
+    const verified = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/verify-email',
+      payload: { token: mailer.sent.at(-1)?.token as string },
+    });
+    assert.equal(verified.statusCode, 200, verified.body);
+    const signedIn = await signIn(email, password, { deviceLabel: 'phone' });
+    assert.equal(signedIn.statusCode, 200, signedIn.body);
+    return { email, accessToken: (signedIn.json() as { accessToken: string }).accessToken };
+  }
+
+  async function anAjo(prefix: string, name: string, over: Record<string, unknown> = {}) {
+    const organizer = await verifiedMember(prefix);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(organizer.accessToken),
+      payload: {
+        name,
+        contributionKobo: 100_000,
+        currency: 'NGN',
+        frequency: 'WEEKLY',
+        collectionDay: 'FRIDAY',
+        durationRounds: 5,
+        maxMembers: 5,
+        startDate: '2026-11-06',
+        ...over,
+      },
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    return { organizer, ajoId: (created.json() as { ajo: { id: string } }).ajo.id };
+  }
+
+  const invite = async (accessToken: string, ajoId: string, email: string) => {
+    const minted = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(accessToken),
+      payload: { ajoId, contacts: [{ email }] },
+    });
+    assert.equal(minted.statusCode, 202, minted.body);
+    return (minted.json() as { invitations: { token: string }[] }).invitations[0]!.token;
+  };
+
+  const accept = (accessToken: string, token: string, rulesAcknowledged = true) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations/accept',
+      headers: withBearer(accessToken),
+      payload: { token, accept: true, rulesAcknowledged },
+    });
+
+  const decline = (accessToken: string, token: string) =>
+    app.inject({ method: 'POST', url: `/api/v1/invitations/${token}/decline`, headers: withBearer(accessToken) });
+
+  /** The memberships the API wrote, as the superuser sees them. */
+  const memberships = async (ajoId: string) =>
+    (
+      await admin.query<{
+        position_number: number;
+        position_status: string;
+        rules_acknowledged_version: number | null;
+        via_invitation: boolean;
+      }>(
+        `SELECT p.position_number, p.status AS position_status,
+                m.rules_acknowledged_version, m.invitation_id IS NOT NULL AS via_invitation
+           FROM public.ajo_members m
+           LEFT JOIN public.ajo_positions p ON p.id = m.position_id
+          WHERE m.ajo_id = $1 AND m.deleted_at IS NULL
+          ORDER BY p.position_number NULLS LAST`,
+        [ajoId],
+      )
+    ).rows;
+
+  /**
+   * Fills `count` seats with real invitees, the only way seats can be filled.
+   * An Ajo may not have fewer than five members, so "no seat left" has to be
+   * arranged by filling a real Ajo rather than by making a small one.
+   */
+  async function fillSeats(organizerToken: string, ajoId: string, prefix: string, count: number) {
+    for (let seat = 0; seat < count; seat += 1) {
+      const email = `${prefix}-${seat}@example.ng`;
+      const token = await invite(organizerToken, ajoId, email);
+      const member = await memberAt(email);
+      const response = await accept(member.accessToken, token);
+      assert.equal(response.statusCode, 200, response.body);
+    }
+  }
+
+  const invitationRow = async (token: string) =>
+    (
+      await admin.query<{ status: string; accepted_by_user_id: string | null; declined_at: Date | null }>(
+        `SELECT i.status, i.accepted_by_user_id, i.declined_at
+           FROM public.invitations i
+          WHERE i.token_hash = $1`,
+        [hashToken(token)],
+      )
+    ).rows[0];
+
+  it('keeps the version the database checks in step with the clauses the domain publishes', async () => {
+    // `join_ajo` refuses an acknowledgement of any version but the current one,
+    // and the current one lives in the database as well as in the domain. Those
+    // are two constants that have to agree, and nothing would notice if they
+    // drifted except a member who could no longer join: the API would send the
+    // domain's version and the function would refuse it as stale.
+    const stored = await admin.query<{ version: number }>(
+      'SELECT app.ajo_rules_version()::int AS version',
+    );
+    assert.equal(stored.rows[0]?.version, AJO_RULES_VERSION);
+  });
+
+  it('claims the lowest free seat, records the acknowledged rules, and writes exactly one membership', async () => {
+    const { organizer, ajoId } = await anAjo('join-one', 'Redeem Circle One');
+    const token = await invite(organizer.accessToken, ajoId, 'redeem-one@example.ng');
+    const invitee = await memberAt('redeem-one@example.ng');
+
+    const response = await accept(invitee.accessToken, token);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { accepted: true, ajoId, positionNumber: 2, rulesVersion: 1 });
+
+    // The organizer's seat 1 and the invitee's seat 2, and nothing else. One
+    // membership per member is the FR-INV-005 rule that the multi-column call
+    // bug was quietly breaking three times over.
+    const rows = await memberships(ajoId);
+    assert.equal(rows.length, 2, JSON.stringify(rows));
+    assert.deepEqual(
+      rows.map((row) => [row.position_number, row.position_status]),
+      [
+        [1, 'claimed'],
+        [2, 'claimed'],
+      ],
+    );
+    const joined = rows[1]!;
+    assert.equal(joined.via_invitation, true);
+    // The version consented to, not a boolean: an acknowledgement that cannot
+    // say which text was agreed to is not evidence of anything.
+    assert.equal(joined.rules_acknowledged_version, 1);
+
+    const invitation = await invitationRow(token);
+    assert.equal(invitation?.status, 'accepted');
+    assert.notEqual(invitation?.accepted_by_user_id, null);
+    assert.equal(invitation?.declined_at, null);
+  });
+
+  it('refuses an accept that has not acknowledged the rules, and one from a different address', async () => {
+    const { organizer, ajoId } = await anAjo('join-refuse', 'Redeem Circle Two');
+    const token = await invite(organizer.accessToken, ajoId, 'redeem-two@example.ng');
+    const invitee = await memberAt('redeem-two@example.ng');
+    const stranger = await verifiedMember('join-stranger');
+
+    const unacknowledged = await accept(invitee.accessToken, token, false);
+    assert.equal(unacknowledged.statusCode, 422, unacknowledged.body);
+
+    const wrongAddress = await accept(stranger.accessToken, token);
+    assert.equal(wrongAddress.statusCode, 403, wrongAddress.body);
+
+    // Neither attempt cost anything: the seat is still open and the token still
+    // works for its real owner.
+    assert.equal((await memberships(ajoId)).length, 1);
+    const accepted = await accept(invitee.accessToken, token);
+    assert.equal(accepted.statusCode, 200, accepted.body);
+  });
+
+  it('answers 410 to a replayed accept and leaves the first membership alone', async () => {
+    const { organizer, ajoId } = await anAjo('join-replay', 'Redeem Circle Three');
+    const token = await invite(organizer.accessToken, ajoId, 'redeem-three@example.ng');
+    const invitee = await memberAt('redeem-three@example.ng');
+
+    assert.equal((await accept(invitee.accessToken, token)).statusCode, 200);
+    const replay = await accept(invitee.accessToken, token);
+    assert.equal(replay.statusCode, 410, replay.body);
+
+    // The replay did not burn a second seat, which is what a single-use token is
+    // for: two accepted accepts would have meant a duplicate membership.
+    assert.equal((await memberships(ajoId)).length, 2);
+    const preview = await app.inject({ method: 'GET', url: `/api/v1/invitations/${token}` });
+    assert.equal(preview.statusCode, 410, preview.body);
+  });
+
+  it('gives the last seat to one of two acceptors and 409s the other', async () => {
+    // A five-seat Ajo with one seat left. Both invitees were told that seat is
+    // theirs, and they redeem at the same moment.
+    const { organizer, ajoId } = await anAjo('join-race', 'Redeem Circle Four');
+    await fillSeats(organizer.accessToken, ajoId, 'redeem-four', 3);
+    const first = await invite(organizer.accessToken, ajoId, 'redeem-four-a@example.ng');
+    const second = await invite(organizer.accessToken, ajoId, 'redeem-four-b@example.ng');
+    const one = await memberAt('redeem-four-a@example.ng');
+    const other = await memberAt('redeem-four-b@example.ng');
+
+    const [a, b] = await Promise.all([accept(one.accessToken, first), accept(other.accessToken, second)]);
+    const statuses = [a.statusCode, b.statusCode].sort();
+    // 200 and 409: the loser's transaction found no open position rather than
+    // being handed a seat the winner holds. `FOR UPDATE SKIP LOCKED` is what
+    // makes this the only possible answer.
+    assert.deepEqual(statuses, [200, 409], `${a.body}\n${b.body}`);
+
+    const rows = await memberships(ajoId);
+    assert.equal(rows.length, 5, JSON.stringify(rows));
+    assert.deepEqual(
+      rows.map((row) => row.position_number),
+      [1, 2, 3, 4, 5],
+    );
+    // Exactly one of the two tokens was spent, and the other is still pending:
+    // the refusal happened before the claim, so nothing was half-done.
+    const statuses2 = [
+      (await invitationRow(first))?.status,
+      (await invitationRow(second))?.status,
+    ].sort();
+    assert.deepEqual(statuses2, ['accepted', 'pending']);
+  });
+
+  it('409s an accept when the Ajo has no seat left at all', async () => {
+    const { organizer, ajoId } = await anAjo('join-full', 'Redeem Circle Five');
+
+    // Minted first, on purpose. Minting into a full Ajo is itself refused with a
+    // 409, so the only way to reach this state is to hold a valid invitation and
+    // then lose the race for the last seat -- which is the real-world shape of it.
+    const token = await invite(organizer.accessToken, ajoId, 'redeem-five@example.ng');
+    await fillSeats(organizer.accessToken, ajoId, 'redeem-five-full', 4);
+    assert.equal((await memberships(ajoId)).length, 5);
+
+    const invitee = await memberAt('redeem-five@example.ng');
+    const refused = await accept(invitee.accessToken, token);
+    assert.equal(refused.statusCode, 409, refused.body);
+    assert.equal((await memberships(ajoId)).length, 5);
+    // Their token is not spent: the invitation is still theirs to use if
+    // somebody leaves.
+    assert.equal((await invitationRow(token))?.status, 'pending');
+  });
+
+  it('declines without creating a membership, and frees the address to be invited again', async () => {
+    const { organizer, ajoId } = await anAjo('join-decline', 'Redeem Circle Six');
+    const declined = await invite(organizer.accessToken, ajoId, 'redeem-six@example.ng');
+    const first = await memberAt('redeem-six@example.ng');
+
+    const response = await decline(first.accessToken, declined);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { declined: true });
+
+    // Declining creates nothing, so the only trace is the spent token.
+    assert.equal((await memberships(ajoId)).length, 1);
+    const row = await invitationRow(declined);
+    assert.equal(row?.status, 'declined');
+    assert.notEqual(row?.declined_at, null);
+
+    const replay = await decline(first.accessToken, declined);
+    assert.equal(replay.statusCode, 410, replay.body);
+
+    // The partial unique index allowed a fresh invitation to the same address
+    // only because the first one is no longer pending -- which is the whole
+    // reason declining exists.
+    const again = await invite(organizer.accessToken, ajoId, 'redeem-six@example.ng');
+    assert.notEqual(again, declined);
+    const stranger = await verifiedMember('join-decline-stranger');
+    assert.equal((await accept(stranger.accessToken, again)).statusCode, 403);
+    // The member who declined may take the second invitation: declining is not
+    // refusing the Ajo forever, it is refusing that invitation.
+    assert.equal((await accept(first.accessToken, again)).statusCode, 200);
+    assert.equal((await memberships(ajoId)).length, 2);
+  });
+
+  it('410s an accept on an invitation whose window has closed', async () => {
+    const { organizer, ajoId } = await anAjo('join-expired', 'Redeem Circle Seven');
+    const token = await invite(organizer.accessToken, ajoId, 'redeem-seven@example.ng');
+    const invitee = await memberAt('redeem-seven@example.ng');
+
+    // Nothing sweeps expired invitations on a timer, so the check has to be
+    // derived at redemption time rather than trusted from the row's status.
+    await admin.query(
+      `UPDATE public.invitations
+          SET expires_at = now() - interval '1 minute'
+        WHERE token_hash = $1`,
+      [hashToken(token)],
+    );
+
+    const refused = await accept(invitee.accessToken, token);
+    assert.equal(refused.statusCode, 410, refused.body);
+    assert.equal((await memberships(ajoId)).length, 1);
+    assert.equal((await invitationRow(token))?.status, 'pending');
+  });
+
+  it('refuses to mint an invitation for somebody who already holds a seat', async () => {
+    // The counterpart to the guard inside `join_ajo`, and the cheaper half of it:
+    // the organizer is told at mint time, before a token exists to leak. The
+    // race that guard exists for -- invited, then joined by some other route --
+    // is not reachable through the API and is covered in the migration suite.
+    const { organizer, ajoId } = await anAjo('join-member', 'Redeem Circle Eight');
+    const first = await invite(organizer.accessToken, ajoId, 'redeem-eight@example.ng');
+    const invitee = await memberAt('redeem-eight@example.ng');
+    assert.equal((await accept(invitee.accessToken, first)).statusCode, 200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invitations',
+      headers: withBearer(organizer.accessToken),
+      payload: { ajoId, contacts: [{ email: 'redeem-eight@example.ng' }] },
+    });
+    assert.equal(second.statusCode, 409, second.body);
+    assert.equal((await memberships(ajoId)).length, 2);
   });
 });
