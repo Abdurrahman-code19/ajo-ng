@@ -15,6 +15,7 @@ import {
   collectionDayCode,
   collectionDayFromCode,
   createAjo,
+  enrollmentWindow,
   evaluateEnrollmentWindow,
   frequencyCode,
   frequencyFromCode,
@@ -109,6 +110,7 @@ describe('Ajo state machine', () => {
 
 describe('5-day enrollment window', () => {
   const openedAt = new Date('2026-01-01T00:00:00.000Z');
+  const closesAt = new Date('2026-01-06T00:00:00.000Z');
 
   it('does not cancel while positions remain open', () => {
     const day4 = new Date('2026-01-05T00:00:00.000Z');
@@ -129,6 +131,64 @@ describe('5-day enrollment window', () => {
 
   it('uses a five day window', () => {
     assert.equal(ENROLLMENT_WINDOW_DAYS, 5);
+  });
+
+  it('closes exactly five days after it opens', () => {
+    const window = enrollmentWindow(openedAt);
+    assert.equal(window.opensAt.toISOString(), openedAt.toISOString());
+    assert.equal(window.closesAt.toISOString(), closesAt.toISOString());
+  });
+
+  // The day-5 boundary is where the previous implementation was wrong. Counting
+  // whole elapsed days from the open reports day 5 at 00:00 on the fifth day --
+  // four days and one second of waiting -- which cancels an Ajo a full day early
+  // and would refuse a member who had four days left to decide.
+  it('does not cancel one second before the window closes', () => {
+    const justBefore = new Date(closesAt.getTime() - 1_000);
+    const result = evaluateEnrollmentWindow(openedAt, justBefore, 7, 10);
+    assert.equal(result.shouldCancel, false);
+    assert.equal(result.closesAt?.toISOString(), closesAt.toISOString());
+  });
+
+  it('cancels on the closing instant itself', () => {
+    assert.equal(evaluateEnrollmentWindow(openedAt, closesAt, 7, 10).shouldCancel, true);
+  });
+
+  it('cancels one second after the window closes', () => {
+    const justAfter = new Date(closesAt.getTime() + 1_000);
+    assert.equal(evaluateEnrollmentWindow(openedAt, justAfter, 7, 10).shouldCancel, true);
+  });
+
+  it('still has four days left on the fourth day, not none', () => {
+    const day4 = new Date('2026-01-05T00:00:00.000Z');
+    const remaining = closesAt.getTime() - day4.getTime();
+    assert.equal(remaining, 24 * 60 * 60 * 1000);
+    assert.equal(evaluateEnrollmentWindow(openedAt, day4, 7, 10).shouldCancel, false);
+  });
+
+  // The stored close is authoritative. A caller that has it must not have it
+  // overridden by a derivation, because the two disagreeing is precisely how a
+  // member sees a countdown to a different instant than the one the database
+  // refuses a join at.
+  it('prefers a supplied close over one derived from the open', () => {
+    const stored = new Date('2026-01-04T12:00:00.000Z');
+    const at = new Date('2026-01-04T13:00:00.000Z');
+    assert.equal(evaluateEnrollmentWindow(openedAt, at, 7, 10, stored).shouldCancel, true);
+    assert.equal(evaluateEnrollmentWindow(openedAt, at, 7, 10).shouldCancel, false);
+  });
+
+  it('reports no window for a full Ajo, which has already activated', () => {
+    const result = evaluateEnrollmentWindow(openedAt, closesAt, 10, 10);
+    assert.equal(result.shouldCancel, false);
+    assert.equal(result.closesAt, undefined);
+  });
+
+  it('reports the window on the open path so a caller can show it', () => {
+    const day1 = new Date('2026-01-02T00:00:00.000Z');
+    const result = evaluateEnrollmentWindow(openedAt, day1, 3, 10);
+    assert.equal(result.shouldCancel, false);
+    assert.equal(result.opensAt?.toISOString(), openedAt.toISOString());
+    assert.equal(result.closesAt?.toISOString(), closesAt.toISOString());
   });
 });
 

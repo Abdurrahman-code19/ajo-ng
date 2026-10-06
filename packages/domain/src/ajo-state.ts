@@ -183,24 +183,78 @@ export function assertNotTerminal(current: AjoState): void {
  */
 export const ENROLLMENT_WINDOW_DAYS = 5;
 
+const MS_PER_DAY = 86_400_000;
+
+export interface EnrollmentWindow {
+  readonly shouldCancel: boolean;
+  readonly reason?: string;
+  /**
+   * When the window ran, reported so a caller can render it.
+   *
+   * Absent only for a full Ajo: activation happens on the fill, so there is no
+   * enrollment left to count down to. Returning a close time there would invite a
+   * countdown to an event that has already happened.
+   */
+  readonly opensAt?: Date;
+  readonly closesAt?: Date;
+}
+
+/**
+ * The five-day window opens at `openedAt` and closes exactly five days later.
+ *
+ * Returned rather than left to each caller to compute, because the timestamp pair
+ * is written by `app.open_enrollment` and read by three separate places: the API
+ * response, the frontend countdown, and the tests. Three independent
+ * implementations of "plus five days" is three chances to disagree by a day.
+ */
+export function enrollmentWindow(openedAt: Date): { readonly opensAt: Date; readonly closesAt: Date } {
+  return {
+    // Written out rather than as `opensAt,`: the parameter is `openedAt` and the
+    // field is `opensAt`, and a shorthand would quietly bind the wrong one. The
+    // field names follow the database columns (`enrollment_opens_at`,
+    // `enrollment_closes_at`) so nothing has to be translated at the boundary.
+    opensAt: openedAt,
+    closesAt: new Date(openedAt.getTime() + ENROLLMENT_WINDOW_DAYS * MS_PER_DAY),
+  };
+}
+
+/**
+ * Decide whether an enrollment window has closed on an unfilled Ajo.
+ *
+ * `closesAt` is taken from the stored window when the caller has it, and derived
+ * from `openedAt` when it does not. Deriving it rather than counting elapsed
+ * whole days from the open is the substantive part: `Math.floor(elapsed / 86400000)
+ * >= 5` reports day 5 at the *start* of the fifth day, which is four days and one
+ * second of waiting, and would cancel an Ajo a full day early. Comparing against
+ * the close instant gets the boundary right, and `>=` is the boundary the
+ * database uses in `app.assert_joinable`.
+ */
 export function evaluateEnrollmentWindow(
   openedAt: Date,
   now: Date,
   positionsFilled: number,
   positionsTotal: number,
-): { readonly shouldCancel: boolean; readonly reason?: string } {
+  closesAt?: Date,
+): EnrollmentWindow {
+  const closes = closesAt ?? new Date(openedAt.getTime() + ENROLLMENT_WINDOW_DAYS * MS_PER_DAY);
+
   if (positionsFilled >= positionsTotal) {
+    // Full is full at any hour, so this is checked before the clock and reports no
+    // window: an Ajo that activated on the fill has no remaining enrollment, and
+    // returning a close time for it would invite a caller to count down to an
+    // event that already happened.
     return { shouldCancel: false };
   }
-  const elapsedMs = now.getTime() - openedAt.getTime();
-  const elapsedDays = Math.floor(elapsedMs / 86_400_000);
-  if (elapsedDays >= ENROLLMENT_WINDOW_DAYS) {
+
+  if (now.getTime() >= closes.getTime()) {
     return {
       shouldCancel: true,
       reason: `enrollment window of ${ENROLLMENT_WINDOW_DAYS} days closed with ${positionsFilled}/${positionsTotal} positions filled`,
+      opensAt: openedAt,
+      closesAt: closes,
     };
   }
-  return { shouldCancel: false };
+  return { shouldCancel: false, opensAt: openedAt, closesAt: closes };
 }
 
 /** Ajo.ng charges the organizer, not the member. */

@@ -145,6 +145,57 @@ def scalar(db: str, sql: str) -> str:
             return line.strip()
     return out[0].strip() if out else ""
 
+
+def commit(body: str) -> str:
+    """
+    Run `body` and keep it.
+
+    The lifecycle cases below need their fixtures to outlive the transaction that
+    wrote them, because the assertion is usually made by a *different*
+    transaction: a join that has to be refused at day six, a sweep that has to
+    find the row a previous sweep created. `transaction()` rolls back precisely so
+    the rest of the suite is unaffected, and that is the wrong tool here.
+
+    Deferred constraint triggers still fire, because the COMMIT is the point at
+    which they would have fired anyway -- unlike `transaction()`, which forces them
+    early with `SET CONSTRAINTS ALL IMMEDIATE`.
+    """
+    return f"BEGIN;\n{body}\nCOMMIT;"
+
+
+def _seed_users(db: str, label: str, users: list[tuple[str, str]]) -> None:
+    """
+    Create `users` and their profiles, and keep them.
+
+    Split out from the case bodies because of a rule that is easy to trip over:
+    the fixtures cannot be written *after* `SET LOCAL ROLE ajo_app`, which is what
+    every `as_role` body does. `users` is RLS-protected, so the insert is refused
+    with "new row violates row-level security policy" -- the role is in place
+    precisely so that user rows cannot be planted by application code, and the
+    test suite has to create them as itself.
+
+    Kept rather than rolled back, because the cases assert across transactions:
+    a join refused at day six needs an invite that an earlier transaction minted.
+    """
+    rows = ",\n       ".join(
+        f"('{sid}', '{email}', 'active', true)" for sid, email in users
+    )
+    names = ",\n              ".join(
+        f"'{email}'" for _, email in users
+    )
+    must_succeed(
+        db,
+        label,
+        commit(
+            f"""
+INSERT INTO users (auth_subject_id, email, status, is_email_verified)
+VALUES {rows};
+INSERT INTO profiles (user_id, display_name)
+SELECT id, left(email, 4) FROM users WHERE email IN ({names});
+"""
+        ),
+    )
+
 # ---------------------------------------------------------------------------
 # Cases. Each returns a short human-readable line describing what it proved.
 # ---------------------------------------------------------------------------
@@ -5470,6 +5521,789 @@ SELECT app.decline_invitation(decode('22', 'hex'), '{second}');
         "a stale acknowledgement, an expired link, a replay, a non-member, an "
         "unknown token and a full Ajo without spending the token; declining writes "
         "no membership and cannot be replayed; EXECUTE stays ajo_app-only"
+    )
+
+
+@case("a draft has no enrollment clock, and opening enrollment starts one")
+def _enrollment_clock(db: str) -> str:
+    """
+    EC-061: a draft has no clock running on it. `app.create_ajo` (110) stamps
+    `enrollment_opens_at` and `enrollment_closes_at` at creation because the
+    columns are NOT NULL, and migration 113 does not change that -- it makes the
+    placeholder unreadable instead. Nothing sweeps a `draft`, and
+    `app.assert_joinable` only consults the window for an Ajo already in
+    `enrollment`, so an abandoned draft cancels nothing and collects nothing.
+
+    The claim worth testing is that the placeholder is *replaced*, not merely
+    ignored. The fixture is aged past the end of its own placeholder window, and
+    the assertion is that the window which comes back is a full five days from
+    now. A draft that sat for six days gets five days of enrollment, not zero.
+    """
+    org = "clock-org@example.ng"
+    ajo = "E5C Clock"
+    _seed_users(db, "an organizer", [("t-clock-org", org)])
+    must_succeed(
+        db,
+        "a draft",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.create_ajo('{ajo}', 'the test', 100000, 'NGN', 'weekly', 5,
+                      'friday', DATE '2026-11-06');""",
+            commit=True,
+        ),
+    )
+
+    # Age the draft so its creation-time placeholder window has already closed,
+    # the way a draft abandoned for a week actually looks.
+    must_succeed(
+        db,
+        "ageing the draft past its placeholder window",
+        commit(
+            f"""
+UPDATE ajos SET created_at = now() - interval '6 days',
+                enrollment_opens_at = now() - interval '6 days',
+                enrollment_closes_at = now() - interval '1 day'
+ WHERE name = '{ajo}';
+"""
+        ),
+    )
+
+    out = must_succeed(
+        db,
+        "opening enrollment on an aged draft",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""
+SELECT 'window=' || (app.open_enrollment(
+  (SELECT id FROM ajos WHERE name = '{ajo}')))::text;
+SELECT 'status=' || (SELECT status FROM ajos WHERE name = '{ajo}');
+SELECT 'days=' || round(EXTRACT(epoch FROM (
+  enrollment_closes_at - enrollment_opens_at)) / 86400.0, 4)::text
+  FROM ajos WHERE name = '{ajo}';
+SELECT 'left=' || round(EXTRACT(epoch FROM (
+  enrollment_closes_at - now())) / 86400.0, 4)::text
+  FROM ajos WHERE name = '{ajo}';
+""",
+            commit=True,
+        ),
+    )
+    if "status=enrollment" not in out:
+        raise Failure(f"the Ajo did not enter enrollment:\n    {out.strip()[:400]}")
+    if "days=5.0000" not in out:
+        raise Failure(
+            "the window is not exactly five days:\n" f"    {out.strip()[:400]}"
+        )
+    # The placeholder closed a day ago, so a window carried over from creation
+    # would report a negative remainder here.
+    if "left=5.0000" not in out and "left=4.9999" not in out:
+        raise Failure(
+            "the clock did not restart: the remainder is not a full five days, so "
+            "the placeholder leaked into the window\n"
+            f"    {out.strip()[:400]}"
+        )
+
+    # A second open, an unknown Ajo and an anonymous caller. Each impersonates a
+    # real caller: `app.open_enrollment` reads the identity GUC before it looks at
+    # the Ajo, so a missing GUC reports "requires an authenticated caller" and the
+    # assertion would pass for the wrong reason on all three.
+    must_fail(
+        db,
+        "opening enrollment a second time",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.open_enrollment((SELECT id FROM ajos WHERE name = '{ajo}'));""",
+        ),
+        expect="already open",
+    )
+    must_fail(
+        db,
+        "an unknown Ajo",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            """SELECT app.open_enrollment('00000000-0000-7000-8000-000000000001');""",
+        ),
+        expect="no such Ajo",
+    )
+    must_fail(
+        db,
+        "an unauthenticated caller",
+        "BEGIN;\nSELECT set_config('app.user_id', '', false);\nSET LOCAL ROLE ajo_app;\n"
+        f"""SELECT app.open_enrollment((SELECT id FROM ajos WHERE name = '{ajo}'));\nROLLBACK;""",
+        expect="requires an authenticated caller",
+    )
+
+    for role, fn, want, label in (
+        ("public", "app.open_enrollment(uuid)", "false", "PUBLIC"),
+        ("ajo_app", "app.open_enrollment(uuid)", "true", "ajo_app"),
+        ("public", "app.close_expired_enrollment()", "false", "PUBLIC"),
+        ("ajo_app", "app.close_expired_enrollment()", "false", "ajo_app"),
+    ):
+        got = scalar(db, f"SELECT has_function_privilege('{role}', '{fn}', 'EXECUTE')::text;")
+        if got != want:
+            raise Failure(f"{label} EXECUTE on {fn} should be {want}, got {got!r}")
+
+    return (
+        "an aged draft gets a fresh five days rather than its expired placeholder; "
+        "a second open, an unknown Ajo and an anonymous caller are all refused; "
+        "open_enrollment is ajo_app-only and the sweep is nobody's but the owner's"
+    )
+
+
+@case("the enrollment window cannot be extended")
+def _no_extension(db: str) -> str:
+    """
+    EC-053 and CANONICAL section 3: the window is *exactly* five days and the
+    organizer cannot move it. The invitees were told when this closes, so moving
+    that date is not a configuration change -- it is a change to a promise already
+    made to them.
+
+    `app.open_enrollment` computes the window itself, so any movement is only
+    reachable with a bare `UPDATE`, which is what `app.assert_enrollment_window`
+    exists to refuse. Both directions are asserted. Shortening was considered and
+    rejected: CANONICAL says the window is exactly five days, so a three-day
+    window is not a shorter version of the rule, it is a different rule.
+    """
+    org = "extend-org@example.ng"
+    ajo = "E5D Extend"
+    _seed_users(db, "an organizer", [("t-extend-org", org)])
+    must_succeed(
+        db,
+        "an Ajo in enrollment",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""
+SELECT app.create_ajo('{ajo}', 'the test', 100000, 'NGN', 'weekly', 5,
+                      'friday', DATE '2026-11-06');
+SELECT app.open_enrollment((SELECT id FROM ajos WHERE name = '{ajo}'));
+""",
+            commit=True,
+        ),
+    )
+
+    must_fail(
+        db,
+        "extending by two days",
+        commit(f"UPDATE ajos SET enrollment_closes_at = enrollment_closes_at + interval '2 days' WHERE name = '{ajo}';"),
+        expect="cannot move its enrollment window",
+    )
+    must_fail(
+        db,
+        "extending by a single second",
+        commit(f"UPDATE ajos SET enrollment_closes_at = enrollment_closes_at + interval '1 second' WHERE name = '{ajo}';"),
+        expect="cannot move its enrollment window",
+    )
+    must_fail(
+        db,
+        "shortening the window by one day",
+        commit(f"UPDATE ajos SET enrollment_closes_at = enrollment_closes_at - interval '1 day' WHERE name = '{ajo}';"),
+        expect="cannot move its enrollment window",
+    )
+    must_fail(
+        db,
+        "moving the open date",
+        commit(f"UPDATE ajos SET enrollment_opens_at = enrollment_opens_at - interval '1 day' WHERE name = '{ajo}';"),
+        expect="cannot move its enrollment window",
+    )
+    # A bare UPDATE straight into `enrollment` is the other half of EC-061. It is
+    # accepted, and the window it lands with is a fresh five days rather than
+    # whatever placeholder the draft was carrying -- the trigger stamps the
+    # transition, so a draft aged past its own placeholder still gets a full
+    # window.
+    later = "E5D Later"
+    _seed_users(db, "a second organizer", [("t-extend-later", "extend-later@example.ng")])
+    must_succeed(
+        db,
+        "a second draft",
+        as_role(
+            db,
+            "ajo_app",
+            "extend-later@example.ng",
+            f"""SELECT app.create_ajo('{later}', 'the test', 100000, 'NGN', 'weekly', 5,
+                      'friday', DATE '2026-11-06');""",
+            commit=True,
+        ),
+    )
+    must_succeed(
+        db,
+        "ageing the second draft past its placeholder",
+        commit(
+            f"""
+UPDATE ajos SET created_at = now() - interval '9 days',
+                enrollment_opens_at = now() - interval '9 days',
+                enrollment_closes_at = now() - interval '4 days'
+ WHERE name = '{later}';
+"""
+        ),
+    )
+    out = must_succeed(
+        db,
+        "entering enrollment with a bare UPDATE",
+        commit(
+            f"""
+UPDATE ajos SET status = 'enrollment' WHERE name = '{later}';
+SELECT 'days=' || round(EXTRACT(epoch FROM (
+  enrollment_closes_at - enrollment_opens_at)) / 86400.0, 4)::text
+  FROM ajos WHERE name = '{later}';
+SELECT 'left=' || round(EXTRACT(epoch FROM (
+  enrollment_closes_at - now())) / 86400.0, 4)::text
+  FROM ajos WHERE name = '{later}';
+"""
+        ),
+    )
+    if "days=5.0000" not in out:
+        raise Failure(
+            "a bare UPDATE into enrollment did not start a five-day window:\n"
+            f"    {out.strip()[:300]}"
+        )
+    # The draft is nine days old and its placeholder closed four days ago, so a
+    # window inherited from creation reports a *negative* remainder here. Anything
+    # near five proves the trigger stamped the transition.
+    if "left=4.999" not in out and "left=5.000" not in out:
+        raise Failure(
+            "the bare UPDATE kept the stale placeholder: a nine-day-old draft got "
+            f"a window that had already closed:\n    {out.strip()[:300]}"
+        )
+    return (
+        "one second past the close is refused as firmly as two days, and so is "
+        "shortening or moving the open date; a bare UPDATE into enrollment is "
+        "accepted but restamps a fresh five days rather than inheriting a stale "
+        "placeholder"
+    )
+
+
+@case("the last seat claimed activates the Ajo, and locks its positions")
+def _activate_on_fill(db: str) -> str:
+    """
+    EC-051: "Enrollment fills every position on day 4, so the Ajo activates early
+    rather than waiting for day 5. Activation proceeds on the fill event, not on a
+    calendar event."
+
+    The claim is therefore not that activation is possible on the fill, but that it
+    *happens* on the fill -- here, with four and a half days left on the clock.
+    Nothing in this case advances time. If activation were wired to the expiry
+    sweep instead, this Ajo would still be sitting in `enrollment` and the
+    assertion would fail.
+
+    The trigger is on `ajo_members` rather than inside `app.join_ajo` so that it is
+    the only way in: a seat claimed through any other path has to activate the Ajo
+    too, or a full Ajo waits until day five and cancels a rotation every member
+    joined correctly.
+
+    Position locking is the second half of E5-06 and is already enforced by
+    `app.assert_positions_locked`, which reads this status -- so it is pinned here
+    against the state the trigger just wrote rather than tested on its own.
+    """
+    org = "fill-org@example.ng"
+    ajo = "E5E Fill"
+    members = [f"fill-{i}@example.ng" for i in range(1, 5)]
+    _seed_users(db, "an organizer and four invitees",
+                [("t-fill-org", org)]
+                + [(f"t-fill-{i}", m) for i, m in enumerate(members, start=1)])
+    must_succeed(
+        db,
+        "a draft, opened and invited",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.create_ajo('{ajo}', 'the test', 100000, 'NGN', 'weekly', 5,
+                      'friday', DATE '2026-11-06');
+SELECT app.open_enrollment((SELECT id FROM ajos WHERE name = '{ajo}'));
+"""
+            + "".join(
+                f"""SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  '{m}', decode('{i:02x}', 'hex'), now() + interval '72 hours', null);
+"""
+                for i, m in enumerate(members, start=1)
+            ),
+            commit=True,
+        ),
+    )
+    # The tokens must actually be in the table. `create_invitation` reports
+    # success by returning the row even when nothing was inserted -- that was
+    # migration 112's own bug with a hard-coded idempotency key -- so the count is
+    # asserted rather than the exit status.
+    minted = scalar(
+        db,
+        f"SELECT count(*)::text FROM invitations WHERE ajo_id ="
+        f" (SELECT id FROM ajos WHERE name = '{ajo}');",
+    )
+    if minted != "4":
+        raise Failure(
+            f"expected 4 pending invitations, found {minted}; the join assertions "
+            "below would fail with 'link is not valid' for the wrong reason"
+        )
+
+    # Four joins for five seats: the organizer took seat 1 when the Ajo was
+    # created, so the fourth join fills the Ajo and none before it may activate it.
+    #
+    # One round trip per invitee for the join, one scalar read either side of it.
+    #
+    # The status is read outside the joining transaction rather than as a SELECT
+    # alongside it, for two reasons. One statement cannot observe a change it
+    # makes: in `... || app.join_ajo(...) || (SELECT status ...) || ...` there is
+    # no evaluation order that puts the join before the re-read, so "after" would
+    # equal "before" every time. And `psql -c` with several statements prints only
+    # the last result set, so a labelled SELECT beside the join is silently not in
+    # the output at all -- the label never appears and the assertion reads an empty
+    # list rather than a wrong value.
+    before: list[str] = []
+    after: list[str] = []
+    for i, m in enumerate(members, start=1):
+        before.append(scalar(db, f"SELECT status::text FROM ajos WHERE name = '{ajo}';"))
+        must_succeed(
+            db,
+            f"invitee {i} joining",
+            as_role(
+                db,
+                "ajo_app",
+                m,
+                f"""SELECT app.join_ajo(decode('{i:02x}', 'hex'), '{m}',
+                    app.ajo_rules_version());""",
+                commit=True,
+            ),
+        )
+        after.append(scalar(db, f"SELECT status::text FROM ajos WHERE name = '{ajo}';"))
+
+    if before != ["enrollment"] * 4:
+        raise Failure(
+            f"the Ajo was not in enrollment for each of the four joins: {before}"
+        )
+    if after != ["enrollment"] * 3 + ["active"]:
+        raise Failure(f"the Ajo did not activate on the fill event: {after}")
+
+    must_fail(
+        db,
+        "reordering a position after activation",
+        commit(
+            f"""
+UPDATE ajo_positions SET position_number = 5
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}')
+   AND position_number = 2;
+"""
+        ),
+        expect="the turn order is locked at activation",
+    )
+    _seed_users(db, "a late invitee", [("t-fill-late", "fill-late@example.ng")])
+    must_fail(
+        db,
+        "an invitation redeemed after activation",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  'fill-late@example.ng', decode('ee', 'hex'), now() + interval '72 hours', null);""",
+        ),
+        expect="invitations are closed once an Ajo is active",
+    )
+    return (
+        "activates with 4.5 days left on the clock, not on day 5; the first three "
+        "joins leave it in enrollment; positions and invitations are both closed "
+        "once it is active"
+    )
+
+
+@case("the five-day close cancels an unfilled Ajo and refuses a late join")
+def _day_five_close(db: str) -> str:
+    """
+    BR-001 and EC-050: the window is five days, positions cannot be extended, and
+    an unfilled Ajo at the close is cancelled with its collected contributions
+    refunded in full.
+
+    Two independent mechanisms are tested, because only one of them exists in the
+    code and the other is what makes the rule real without it. `app.close_expired_
+    enrollment` is the sweep that would run from a scheduler, and there is no
+    scheduler in this codebase -- no pg_cron, no job runner. So the refusal a
+    member would hit at day six is asserted through `app.assert_joinable` instead,
+    which derives expiry from the clock and therefore does not care whether the
+    sweep has been called. The sweep is asserted separately for the transition and
+    the reason it records.
+
+    The exact boundary is pinned at five days and one second: the window closed,
+    the status was never swept, and the join must still be refused. A `<` where
+    `>=` belongs would let that member in.
+    """
+    org = "close-org@example.ng"
+    late = "close-late@example.ng"
+    last = "close-last@example.ng"
+    ajo = "E5F Close"
+    _seed_users(db, "an organizer and two late invitees",
+                [("t-close-org", org), ("t-close-late", late),
+                 ("t-close-last", last)])
+    # The Ajo is inserted already in `enrollment` with a window that closed a
+    # second ago. It cannot be *aged* into that state: the transition into
+    # enrollment restamps the window, and every later update is refused. That is
+    # the immutability guarantee working, and it leaves the expired state
+    # reachable only by constructing the row directly -- which is exactly what an
+    # Ajo looks like on day six before any sweep has run.
+    #
+    # The organizer's membership is written with `assert_joinable` disabled,
+    # because that trigger would otherwise refuse the organizer's own seat on an
+    # Ajo whose window has closed. Disabling it on `ajos` is not an option: that
+    # table carries the deferred constraint triggers, and PostgreSQL refuses
+    # `ALTER TABLE ... DISABLE TRIGGER` while any are pending.
+    must_succeed(
+        db,
+        "an Ajo whose window closed a second ago and was never swept",
+        commit(
+            f"""
+INSERT INTO ajos (name, organizer_user_id, contribution_amount_kobo, frequency_id,
+                  enrollment_opens_at, enrollment_closes_at, total_rounds, currency,
+                  status, position_count)
+SELECT '{ajo}', u.id, 100000, f.id, now() - interval '5 days' - interval '1 second',
+       now() - interval '1 second', 5, 'NGN', 'enrollment', 5
+  FROM users u, contribution_frequencies f
+ WHERE u.email = '{org}' AND f.code = 'weekly';
+-- The organizer's own membership arrives through `materialize_organizer_membership`
+-- when the first position is inserted, and `assert_joinable` would refuse it on an
+-- Ajo whose window has already closed. So the trigger is off for that one insert.
+-- It is not disabled on `ajos`, whose deferred constraint triggers forbid
+-- `ALTER TABLE ... DISABLE TRIGGER` outright while any are pending.
+ALTER TABLE public.ajo_members DISABLE TRIGGER ajo_members_joinable;
+INSERT INTO ajo_positions (ajo_id, position_number)
+SELECT a.id, n FROM ajos a, generate_series(1, 5) AS n WHERE a.name = '{ajo}';
+ALTER TABLE public.ajo_members ENABLE TRIGGER ajo_members_joinable;
+"""
+        ),
+    )
+    if scalar(
+        db,
+        f"SELECT count(*)::text FROM ajos a JOIN users u ON u.id = a.organizer_user_id"
+        f" WHERE a.name = '{ajo}'"
+        f" AND EXISTS (SELECT 1 FROM ajo_members m WHERE m.ajo_id = a.id);",
+    ) != "1":
+        raise Failure(
+            "the organizer did not get a membership; the fixture this case sweeps "
+            "is not shaped like a real Ajo"
+        )
+    # Two pending invitations, so the late attempt has a live token. A member
+    # cannot redeem twice and a token is spent on use, so one invitee is not
+    # enough for "join before the close" followed by "refused after it".
+    must_succeed(
+        db,
+        "inviting two members before the window closed",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  '{late}', decode('a1', 'hex'), now() + interval '30 days', null);
+SELECT app.create_invitation((SELECT id FROM ajos WHERE name = '{ajo}'),
+  '{last}', decode('a2', 'hex'), now() + interval '30 days', null);""",
+            commit=True,
+        ),
+    )
+    if scalar(db, f"SELECT status::text FROM ajos WHERE name = '{ajo}';") != "enrollment":
+        raise Failure(
+            "the Ajo's status changed without the sweep; the unswept case this "
+            "case depends on no longer exists"
+        )
+    must_fail(
+        db,
+        "a join one second after the window closed",
+        as_role(
+            db,
+            "ajo_app",
+            last,
+            f"""
+SELECT app.join_ajo(decode('a2', 'hex'), '{last}', app.ajo_rules_version());
+""",
+        ),
+        expect="5-day enrollment window for this Ajo closed",
+    )
+    # The refusal must also be enforced on the membership write itself, so a path
+    # that bypasses `app.join_ajo` cannot seat a member in an expired Ajo.
+    #
+    # `last` rather than the organizer: the organizer already holds a seat, and the
+    # unique constraint would report "already exists" before the trigger got a
+    # word in. The assertion is on the trigger, so the row has to be otherwise
+    # insertable.
+    must_fail(
+        db,
+        "a membership written directly into an expired Ajo",
+        commit(
+            f"""
+INSERT INTO ajo_members (ajo_id, user_id, position_id, status, joined_at)
+SELECT a.id, u.id, p.id, 'active', now()
+  FROM ajos a, users u, ajo_positions p
+ WHERE a.name = '{ajo}' AND u.email = '{last}'
+   AND p.ajo_id = a.id AND p.status = 'open';
+"""
+        ),
+        expect="5-day enrollment window for this Ajo closed",
+    )
+
+    # The sweep, and the transition it records. The sweep covers the whole table
+    # and other cases have left Ajos of their own in it, so every count here is
+    # filtered to this Ajo -- `swept=1` would be an assertion about the rest of
+    # the suite as much as about this case.
+    out = must_succeed(
+        db,
+        "the expiry sweep",
+        f"""
+BEGIN;
+SELECT 'swept=' || count(*)::text FROM app.close_expired_enrollment()
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}');
+SELECT 'status=' || status::text FROM ajos WHERE name = '{ajo}';
+SELECT 'reason=' || coalesce(cancellation_reason, 'none') FROM ajos WHERE name = '{ajo}';
+SELECT 'cancelled_at=' || (cancelled_at IS NOT NULL)::text FROM ajos WHERE name = '{ajo}';
+COMMIT;
+""",
+    )
+    if "swept=1" not in out:
+        raise Failure(f"the sweep did not find the expired Ajo:\n    {out.strip()[:400]}")
+    if "status=cancelled" not in out:
+        raise Failure(f"the sweep did not cancel the expired Ajo:\n    {out.strip()[:400]}")
+    if "BR-001" not in out:
+        raise Failure(f"the cancellation did not record the rule that caused it:\n    {out.strip()[:400]}")
+    if "cancelled_at=true" not in out:
+        raise Failure(f"cancelled_at was not stamped:\n    {out.strip()[:400]}")
+
+    # Idempotent: a second sweep finds nothing, because `cancelled` is terminal.
+    again = must_succeed(
+        db,
+        "the sweep a second time",
+        f"""SELECT 'again=' || count(*)::text FROM app.close_expired_enrollment()
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}');""",
+    )
+    if "again=0" not in again:
+        raise Failure(f"the sweep is not idempotent:\n    {again.strip()[:300]}")
+    return (
+        "a join one second after the window closed is refused from the clock "
+        "rather than from a swept status, and the membership write is refused "
+        "too; the sweep cancels the unfilled Ajo, records BR-001 and the fill "
+        "count, and is idempotent"
+    )
+
+
+@case("a full Ajo still in enrollment is activated by the sweep, not cancelled")
+def _sweep_heals_a_full_ajo(db: str) -> str:
+    """
+    The fill trigger activates on the fill, so a full Ajo in `enrollment` should be
+    unreachable. It is reachable in one way that matters: a seat claimed by some
+    path that does not insert a membership -- a support tool, a future replacement
+    flow, a backfill.
+
+    That is the worst outcome available to a member who did everything right, so
+    `app.close_expired_enrollment` re-evaluates fullness instead of trusting the
+    status. It is built here by claiming positions directly, with no membership
+    rows, which is precisely the state that would otherwise reach day five as a
+    full rotation about to be cancelled.
+    """
+    org = "heal-org@example.ng"
+    ajo = "E5G Heal"
+    _seed_users(db, "an organizer", [("t-heal-org", org)])
+    must_succeed(
+        db,
+        "a draft, opened",
+        as_role(
+            db,
+            "ajo_app",
+            org,
+            f"""SELECT app.create_ajo('{ajo}', 'the test', 100000, 'NGN', 'weekly', 5,
+                      'friday', DATE '2026-11-06');
+SELECT app.open_enrollment((SELECT id FROM ajos WHERE name = '{ajo}'));""",
+            commit=True,
+        ),
+    )
+    # Claim every seat without writing a membership, so no trigger can fire.
+    must_succeed(
+        db,
+        "claiming every seat without a membership",
+        commit(
+            f"""
+UPDATE ajo_positions SET status = 'claimed'
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}') AND deleted_at IS NULL;
+"""
+        ),
+    )
+    out = must_succeed(
+        db,
+        "the sweep over a full Ajo",
+        f"""
+BEGIN;
+SELECT 'swept=' || count(*)::text FROM app.close_expired_enrollment()
+ WHERE ajo_id = (SELECT id FROM ajos WHERE name = '{ajo}');
+SELECT 'status=' || status::text FROM ajos WHERE name = '{ajo}';
+SELECT 'activated_at=' || (activated_at IS NOT NULL)::text FROM ajos WHERE name = '{ajo}';
+COMMIT;
+""",
+    )
+    if "status=active" not in out or "activated_at=true" not in out:
+        raise Failure(
+            "the sweep cancelled a full Ajo instead of activating it:\n"
+            f"    {out.strip()[:400]}"
+        )
+    return (
+        "a full Ajo whose seats were claimed without memberships is activated "
+        "rather than cancelled, so no claim path can reach day five as a full "
+        "rotation"
+    )
+
+
+@case("a cancelled Ajo records what it owes, and does not pretend it paid")
+def _unpaid_vs_owed(db: str) -> str:
+    """
+    BR-001 promises a refund in full when an unfilled Ajo closes. A refund needs a
+    provider call this codebase cannot make yet -- ProvidusUnity has supplied no
+    sandbox specifications and no credentials.
+
+    The Ajo is therefore cancelled, which is CANONICAL section 3's only automatic
+    edge out of ENROLLMENT, and the amount owed is recorded on the cancellation.
+    Nothing is faked: the sweep writes no refund, flips no contribution status and
+    calls no provider, so the obligation stays visible and payable rather than
+    being marked done. E5-09 settles it.
+
+    The two arms are the ones that must differ. A `pending` contribution is an
+    intention, and refunding it would invent a transaction that never happened;
+    a `paid` one is money somebody gave us, and the kobo has to be named so that
+    whoever performs the refund is not guessing.
+    """
+    org = "owed-org@example.ng"
+    member = "owed-member@example.ng"
+    # Two Ajos rather than one rewritten twice: the sweep refuses to touch a
+    # terminal status, so the `paid` arm needs an Ajo of its own rather than a
+    # second pass over the first one's cancellation.
+    ids = {
+        "pending": ("00000000-0000-4000-8000-0000000000c5",
+                    "00000000-0000-4000-8000-0000000000c6",
+                    "00000000-0000-4000-8000-0000000000c7"),
+        "paid": ("00000000-0000-4000-8000-0000000000d5",
+                 "00000000-0000-4000-8000-0000000000d6",
+                 "00000000-0000-4000-8000-0000000000d7"),
+    }
+    _seed_users(db, "an organizer and a member",
+                [("t-owed-org", org), ("t-owed-member", member)])
+    # `{{status}}` survives the f-string so `.format()` can fill it in: the SQL is
+    # built once and stamped twice, and an unescaped `{status}` would be
+    # interpolated while `status` is still unbound.
+    setup = f"""
+-- Positions, and through them the organizer's membership, are inserted with the
+-- membership trigger off. `app.assert_joinable` would otherwise refuse the
+-- organizer's own seat on an Ajo whose window has already closed -- which is
+-- correct behaviour, and makes the fixture impossible to build through the
+-- normal path.
+--
+-- No trigger is disabled on `ajos` itself: that table carries the deferred
+-- constraint triggers for every Ajo invariant, and `ALTER TABLE ... DISABLE
+-- TRIGGER` is refused with "cannot ALTER TABLE ajos because it has pending
+-- trigger events" while any are queued. Which is the database telling us that
+-- disabling triggers mid-transaction is not a thing you do.
+--
+-- The Ajo is therefore inserted directly into `enrollment` with the expired
+-- window it would have six hours after opening. That is the only way to write the
+-- state at all, and it is correct that no other way exists.
+INSERT INTO ajos (id, name, organizer_user_id, contribution_amount_kobo,
+                  frequency_id, enrollment_opens_at, enrollment_closes_at,
+                  total_rounds, currency, status, position_count)
+SELECT '{{ajo_id}}', '{{name}}', u.id, 1000000, f.id,
+       now() - interval '5 days' - interval '1 second',
+       now() - interval '1 second', 5, 'NGN', 'enrollment', 5
+  FROM users u, contribution_frequencies f
+ WHERE u.email = '{org}' AND f.code = 'weekly';
+ALTER TABLE public.ajo_members DISABLE TRIGGER ajo_members_joinable;
+INSERT INTO ajo_positions (ajo_id, position_number)
+SELECT '{{ajo_id}}', n FROM generate_series(1, 5) AS n;
+ALTER TABLE public.ajo_members ENABLE TRIGGER ajo_members_joinable;
+INSERT INTO rounds (id, ajo_id, round_number, status, due_date, opens_at,
+                    closes_at, target_amount_kobo)
+SELECT '{{round_id}}', '{{ajo_id}}', 1, 'in_progress', current_date, now(),
+       now() + interval '3 days', 1000000;
+INSERT INTO contribution_schedules (id, round_id, ajo_id, due_date,
+                                    expected_amount_kobo, expected_member_count,
+                                    late_cutoff_at)
+SELECT '{{schedule_id}}', '{{round_id}}', '{{ajo_id}}', current_date, 1000000, 5,
+       now() + interval '5 days';
+-- `paid_at`, and nothing else. `contributions_paid_has_timestamp` requires it,
+-- and `fee_kobo` / `charged_amount_kobo` are GENERATED ALWAYS, so writing them
+-- is refused outright rather than ignored -- the provider confirms the charged
+-- amount, the database derives the fee, and a caller may supply neither.
+INSERT INTO contributions (schedule_id, member_id, position_id, ajo_id, round_id,
+                           user_id, amount_kobo, due_date, status, paid_at)
+SELECT '{{schedule_id}}', m.id, m.position_id, m.ajo_id, '{{round_id}}', m.user_id,
+       1000000, current_date, '{{status}}',
+       CASE WHEN '{{status}}' = 'paid' THEN now() ELSE NULL END
+  FROM ajo_members m WHERE m.ajo_id = '{{ajo_id}}';
+-- The round aggregates are stored, and a deferred trigger checks them at COMMIT
+-- against the contributions. A fixture that writes contributions without
+-- restating `fee_collected_kobo` fails on the same COMMIT that inserted them, so
+-- it is restated here in the same transaction. This is the trigger's own HINT.
+UPDATE rounds r
+   SET fee_collected_kobo = COALESCE((
+         SELECT sum(c.fee_kobo) FROM contributions c
+          WHERE c.round_id = r.id AND c.status = 'paid'
+            AND c.superseded_at IS NULL AND c.deleted_at IS NULL), 0),
+       base_pool_kobo = COALESCE((
+         SELECT sum(c.amount_kobo) FROM contributions c
+          WHERE c.round_id = r.id AND c.status = 'paid'
+            AND c.superseded_at IS NULL AND c.deleted_at IS NULL), 0)
+ WHERE r.id = '{{round_id}}';
+"""
+    for status, want in (("pending", "cancelled"), ("paid", "cancelled")):
+        ajo_id, round_id, schedule_id = ids[status]
+        must_succeed(
+            db,
+            f"a {status} contribution on an expired unfilled Ajo",
+            commit(setup.format(ajo_id=ajo_id, round_id=round_id,
+                                schedule_id=schedule_id, status=status,
+                                name=f"E5H Owed {status}")),
+        )
+        out = must_succeed(
+            db,
+            f"the sweep over the {status} Ajo",
+            f"""
+BEGIN;
+SELECT 'swept=' || count(*)::text FROM app.close_expired_enrollment()
+ WHERE ajo_id = '{ajo_id}';
+SELECT 'status=' || status::text FROM ajos WHERE id = '{ajo_id}';
+SELECT 'reason=' || coalesce(cancellation_reason, 'none') FROM ajos WHERE id = '{ajo_id}';
+COMMIT;
+""",
+        )
+        if f"status={want}" not in out:
+            raise Failure(
+                f"a {status} contribution gave {want!r} rather than the expected status:\n"
+                f"    {out.strip()[:400]}"
+            )
+        # The obligation is reported by the sweep's return value, so it is read
+        # before the row is committed: after the cancel the Ajo is terminal and a
+        # second sweep finds nothing, which is the idempotence asserted elsewhere.
+        if status == "paid" and "owed in refunds" not in out:
+            raise Failure(
+                "the cancellation did not say how much is owed, so whoever performs "
+                f"the refund would be guessing:\n    {out.strip()[:400]}"
+            )
+        if status == "pending" and "owed in refunds" in out:
+            raise Failure(
+                "a pending contribution was treated as money owed; refunding an "
+                f"intention would invent a transaction:\n    {out.strip()[:400]}"
+            )
+        # And the contribution is untouched: the sweep records an obligation, it
+        # does not discharge one.
+        left = scalar(
+            db,
+            f"SELECT status::text FROM contributions WHERE schedule_id = '{schedule_id}';",
+        )
+        if left != status:
+            raise Failure(
+                f"the sweep changed the contribution to {left!r}; it must leave the "
+                "money alone until E5-09 performs the refund"
+            )
+    return (
+        "an expired unfilled Ajo cancels with nothing owed when it holds only a "
+        "pending contribution, and with a paid one it names the kobo owed in the "
+        "cancellation reason and leaves the contribution untouched for E5-09"
     )
 
 

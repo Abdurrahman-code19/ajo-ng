@@ -2672,3 +2672,427 @@ describe('redeeming an invitation', () => {
     assert.equal((await memberships(ajoId)).length, 2);
   });
 });
+
+describe('opening enrollment (POST /api/v1/ajos/:id/activate)', () => {
+  // Per user-flows 2.0.2 this endpoint is DRAFT to ENROLLMENT. It does not
+  // activate an Ajo, and none of these tests assert that it does.
+  const ajoBody = (over: Record<string, unknown> = {}) => ({
+    name: 'Window Circle',
+    contributionKobo: 100_000,
+    currency: 'NGN',
+    frequency: 'WEEKLY',
+    collectionDay: 'FRIDAY',
+    durationRounds: 5,
+    maxMembers: 5,
+    startDate: '2026-11-06',
+    ...over,
+  });
+
+  async function organizerToken(prefix: string): Promise<{ token: string; userId: string }> {
+    const member = await loginableMember(prefix);
+    const response = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    assert.equal(response.statusCode, 200, response.body);
+    return {
+      token: (response.json() as { accessToken: string }).accessToken,
+      userId: member.userId,
+    };
+  }
+
+  async function draftAjo(prefix: string): Promise<{ token: string; userId: string; ajoId: string }> {
+    const organizer = await organizerToken(prefix);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(organizer.token),
+      payload: ajoBody(),
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    return { ...organizer, ajoId: (created.json() as { ajo: { id: string } }).ajo.id };
+  }
+
+  // `payload` is typed as a record and cast at the inject boundary, matching the
+  // `post` helper. Typed as `unknown` it selects the callback overload of
+  // `inject` instead of the options one, and the returned `Chain` has no
+  // `statusCode`.
+  const activate = (
+    token: string,
+    ajoId: string,
+    payload: Record<string, unknown> = { confirm: true },
+  ): Promise<LightMyRequestResponse> =>
+    app.inject({
+      method: 'POST',
+      url: `/api/v1/ajos/${ajoId}/activate`,
+      headers: withBearer(token),
+      payload: payload as object,
+    });
+
+  it('moves a draft to enrollment and returns the five-day window it just started', async () => {
+    const draft = await draftAjo('enroll-open');
+
+    const before = new Date();
+    const response = await activate(draft.token, draft.ajoId);
+    assert.equal(response.statusCode, 200, response.body);
+
+    const body = response.json() as {
+      ajoId: string;
+      status: string;
+      enrollment: { opensAt: string; closesAt: string };
+    };
+    assert.equal(body.ajoId, draft.ajoId);
+    assert.equal(body.status, 'enrollment');
+
+    // Five days exactly, and the clock starts now rather than at creation --
+    // EC-061. A window measured from the draft's own placeholder would have
+    // already been partly spent by the time an organizer opens enrollment.
+    const opensAt = new Date(body.enrollment.opensAt);
+    const closesAt = new Date(body.enrollment.closesAt);
+    assert.equal(closesAt.getTime() - opensAt.getTime(), 5 * 24 * 60 * 60 * 1000);
+    assert.ok(
+      Math.abs(opensAt.getTime() - before.getTime()) < 60_000,
+      `enrollment opened at ${opensAt.toISOString()}, expected near ${before.toISOString()}`,
+    );
+
+    // The response is not the claim: read the stored row back.
+    const stored = await admin.query<{
+      status: string;
+      enrollment_opens_at: Date;
+      enrollment_closes_at: Date;
+    }>(
+      `SELECT status::text AS status, enrollment_opens_at, enrollment_closes_at
+         FROM ajos WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+    const row = stored.rows[0];
+    assert.equal(row?.status, 'enrollment');
+    assert.equal(row?.enrollment_closes_at.getTime() - row!.enrollment_opens_at.getTime(), 5 * 86_400_000);
+  });
+
+  it('refuses a second opening with 409, and leaves the first window intact', async () => {
+    const draft = await draftAjo('enroll-twice');
+    assert.equal((await activate(draft.token, draft.ajoId)).statusCode, 200);
+
+    const first = await admin.query<{ enrollment_closes_at: Date }>(
+      `SELECT enrollment_closes_at FROM ajos WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+
+    const second = await activate(draft.token, draft.ajoId);
+    assert.equal(second.statusCode, 409, second.body);
+    assert.match((second.json() as { message: string }).message, /already open/);
+
+    // The refused call must not re-stamp the window, or a double tap would hand
+    // the organizer five more days by accident.
+    const after = await admin.query<{ enrollment_closes_at: Date }>(
+      `SELECT enrollment_closes_at FROM ajos WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+    assert.equal(after.rows[0]?.enrollment_closes_at.getTime(), first.rows[0]?.enrollment_closes_at.getTime());
+  });
+
+  it('refuses a member who is not the organizer with 403', async () => {
+    const draft = await draftAjo('enroll-stranger');
+    const stranger = await organizerToken('enroll-stranger-other');
+
+    const response = await activate(stranger.token, draft.ajoId);
+    assert.equal(response.statusCode, 403, response.body);
+    assert.match((response.json() as { message: string }).message, /organizer/);
+
+    const stored = await admin.query<{ status: string }>(
+      `SELECT status::text AS status FROM ajos WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+    assert.equal(stored.rows[0]?.status, 'draft');
+  });
+
+  it('refuses an unknown Ajo with 404', async () => {
+    const draft = await draftAjo('enroll-missing');
+    const response = await activate(draft.token, '00000000-0000-4000-8000-000000000000');
+    assert.equal(response.statusCode, 404, response.body);
+  });
+
+  // `confirm` is required by section 11.1's body shape. Defaulting a missing one
+  // would make the field decorative and the 409 that follows surprising: the
+  // caller would be told the Ajo was already enrolling in an enrollment they
+  // never asked for.
+  it('refuses a body without confirm, and one that is not true', async () => {
+    const draft = await draftAjo('enroll-unconfirmed');
+    for (const payload of [{}, { confirm: false }, { confirm: 'yes' }]) {
+      const response = await activate(draft.token, draft.ajoId, payload);
+      assert.equal(response.statusCode, 400, `${JSON.stringify(payload)}: ${response.body}`);
+    }
+    const stored = await admin.query<{ status: string }>(
+      `SELECT status::text AS status FROM ajos WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+    assert.equal(stored.rows[0]?.status, 'draft');
+  });
+
+  it('refuses an extra field in the body rather than ignoring it', async () => {
+    const draft = await draftAjo('enroll-extra');
+    const response = await activate(draft.token, draft.ajoId, { confirm: true, status: 'active' });
+    assert.equal(response.statusCode, 400, response.body);
+  });
+
+  it('refuses without a token', async () => {
+    const draft = await draftAjo('enroll-anon');
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/ajos/${draft.ajoId}/activate`,
+      payload: { confirm: true },
+    });
+    assert.equal(response.statusCode, 401);
+  });
+
+  it('refuses with 409 once the Ajo is past enrollment', async () => {
+    const draft = await draftAjo('enroll-cancelled');
+    // The terminal fields come with the status. Two separate guards insist on it
+    // -- `app.assert_terminal_timestamps` (when) and the
+    // `ajos_cancelled_has_reason` check constraint (why) -- and both are doing
+    // their job on a test's hand-written UPDATE as much as on a real one. An
+    // Ajo that could reach `cancelled` without a reason would be exactly the
+    // record BR-001 depends on, missing the part that explains it.
+    await admin.query(
+      `UPDATE ajos
+          SET status = 'cancelled',
+              cancelled_at = now(),
+              cancellation_reason = 'closed by test'
+        WHERE id = $1::uuid`,
+      [draft.ajoId],
+    );
+
+    const response = await activate(draft.token, draft.ajoId);
+    assert.equal(response.statusCode, 409, response.body);
+    // The response carries the API's own phrasing, not the function's: the SQL
+    // says "this Ajo is cancelled and its enrollment window is closed", and
+    // forwarding that verbatim would leak a storage-level word to an API client.
+    assert.match((response.json() as { message: string }).message, /no longer opening enrollment/);
+  });
+});
+
+describe('reading Ajos (GET /api/v1/ajos, GET /api/v1/ajos/:id)', () => {
+  const ajoBody = (over: Record<string, unknown> = {}) => ({
+    name: 'Read Circle',
+    contributionKobo: 100_000,
+    currency: 'NGN',
+    frequency: 'WEEKLY',
+    collectionDay: 'FRIDAY',
+    durationRounds: 5,
+    maxMembers: 5,
+    startDate: '2026-11-06',
+    ...over,
+  });
+
+  async function signedIn(prefix: string): Promise<{ token: string; userId: string }> {
+    const member = await loginableMember(prefix);
+    const response = await signIn(member.email, member.password, { deviceLabel: 'phone' });
+    assert.equal(response.statusCode, 200, response.body);
+    return {
+      token: (response.json() as { accessToken: string }).accessToken,
+      userId: member.userId,
+    };
+  }
+
+  async function draftAjo(
+    prefix: string,
+    over: Record<string, unknown> = {},
+  ): Promise<{ token: string; ajoId: string }> {
+    const organizer = await signedIn(prefix);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(organizer.token),
+      payload: ajoBody(over) as object,
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    return { token: organizer.token, ajoId: (created.json() as { ajo: { id: string } }).ajo.id };
+  }
+
+  it('lists the Ajos the caller belongs to, enrollment first', async () => {
+    const caller = await signedIn('ajo-read-list');
+    const soon = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(caller.token),
+      payload: ajoBody({ name: 'Open Circle' }) as object,
+    });
+    const soonId = (soon.json() as { ajo: { id: string } }).ajo.id;
+    await app.inject({
+      method: 'POST',
+      url: `/api/v1/ajos/${soonId}/activate`,
+      headers: withBearer(caller.token),
+      payload: { confirm: true } as object,
+    });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(caller.token),
+      payload: ajoBody({ name: 'Draft Circle' }) as object,
+    });
+    const draftId = (created.json() as { ajo: { id: string } }).ajo.id;
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos',
+      headers: withBearer(caller.token),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json() as {
+      data: {
+        id: string;
+        name: string;
+        status: string;
+        contributionKobo: number;
+        positionsTotal: number;
+        positionsFilled: number;
+        membersCount: number;
+        yourRole: string;
+        enrollmentClosesAt: string | null;
+      }[];
+      page: { nextCursor: null };
+    };
+
+    const ids = body.data.map((row) => row.id);
+    assert.ok(ids.includes(soonId));
+    assert.ok(ids.includes(draftId));
+    // The Ajo with a clock running sorts above the one that is doing nothing,
+    // so the dashboard's first row is the thing that needs a decision.
+    assert.equal(ids.indexOf(soonId) < ids.indexOf(draftId), true);
+
+    const summary = body.data.find((row) => row.id === soonId);
+    assert.ok(summary);
+    assert.equal(summary.status, 'enrollment');
+    assert.equal(summary.contributionKobo, 100_000);
+    assert.equal(summary.positionsTotal, 5);
+    // The organizer occupies one of the five positions, not one above them.
+    assert.equal(summary.positionsFilled, 1);
+    assert.equal(summary.membersCount, 1);
+    assert.equal(summary.yourRole, 'organizer');
+    assert.ok(summary.enrollmentClosesAt !== null);
+    assert.equal(body.page.nextCursor, null);
+  });
+
+  it('filters by status and rejects an unknown query key', async () => {
+    const caller = await signedIn('ajo-read-filter');
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(caller.token),
+      payload: ajoBody({ name: 'Filtered Circle' }) as object,
+    });
+    const ajoId = (created.json() as { ajo: { id: string } }).ajo.id;
+
+    const drafts = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos?status=draft',
+      headers: withBearer(caller.token),
+    });
+    assert.equal(drafts.statusCode, 200, drafts.body);
+    const draftIds = (drafts.json() as { data: { id: string }[] }).data.map((row) => row.id);
+    assert.ok(draftIds.includes(ajoId));
+
+    const enrollment = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos?status=enrollment',
+      headers: withBearer(caller.token),
+    });
+    assert.equal(enrollment.statusCode, 200, enrollment.body);
+    assert.ok(
+      !(enrollment.json() as { data: { id: string }[] }).data.some((row) => row.id === ajoId),
+    );
+
+    const unknown = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos?page=2',
+      headers: withBearer(caller.token),
+    });
+    assert.equal(unknown.statusCode, 400, unknown.body);
+  });
+
+  it('reads one Ajo with its seat board and roster', async () => {
+    const caller = await signedIn('ajo-read-detail');
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/ajos',
+      headers: withBearer(caller.token),
+      payload: ajoBody({ name: 'Detail Circle', maxMembers: 7, durationRounds: 7 }) as object,
+    });
+    const ajoId = (created.json() as { ajo: { id: string } }).ajo.id;
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/ajos/${ajoId}`,
+      headers: withBearer(caller.token),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json() as {
+      ajo: { id: string; name: string; status: string; yourPosition: number | null };
+      positions: { positionNumber: number; status: string }[];
+      members: { positionNumber: number | null; fullName: string }[];
+    };
+
+    assert.equal(body.ajo.id, ajoId);
+    assert.equal(body.ajo.name, 'Detail Circle');
+    assert.equal(body.ajo.status, 'draft');
+    // The organizer's seat is reported to the UI, so the roster can show the
+    // turn order instead of an anonymous list of members.
+    assert.equal(body.ajo.yourPosition, 1);
+    assert.equal(body.positions.length, 7);
+    assert.deepEqual(
+      body.positions.map((position) => position.positionNumber),
+      [1, 2, 3, 4, 5, 6, 7],
+    );
+    assert.equal(body.positions.filter((position) => position.status === 'claimed').length, 1);
+    assert.equal(body.positions.filter((position) => position.status === 'open').length, 6);
+    assert.equal(body.members.length, 1);
+    const organizerSeat = body.members[0];
+    assert.ok(organizerSeat);
+    assert.equal(organizerSeat.positionNumber, 1);
+    // The roster names people from `profiles.display_name`, falling back to the
+    // verified email for accounts that have no profile row yet.
+    assert.ok(organizerSeat.fullName.length > 0);
+  });
+
+  it('answers 404 for an Ajo the caller has no relationship with', async () => {
+    const owner = await draftAjo('ajo-read-owner');
+    const stranger = await signedIn('ajo-read-stranger');
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/ajos/${owner.ajoId}`,
+      headers: withBearer(stranger.token),
+    });
+    // 404 and not 403: a 403 would confirm the id exists, and an Ajo invisible
+    // to this caller is one they must not learn is real. The enforcement is the
+    // `ajos_select` policy, so there is no membership check here to get wrong.
+    assert.equal(response.statusCode, 404, response.body);
+    assert.equal((response.json() as { error: string }).error, 'not_found');
+  });
+
+  it('hides other people\'s Ajos from the list entirely', async () => {
+    const owner = await draftAjo('ajo-read-hide-owner');
+    const stranger = await signedIn('ajo-read-hide-stranger');
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos',
+      headers: withBearer(stranger.token),
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    const ids = (response.json() as { data: { id: string }[] }).data.map((row) => row.id);
+    assert.equal(ids.includes(owner.ajoId), false);
+  });
+
+  it('rejects an unknown id shape with 400 and an absent token with 401', async () => {
+    const caller = await signedIn('ajo-read-shapes');
+    const malformed = await app.inject({
+      method: 'GET',
+      url: '/api/v1/ajos/not-a-uuid',
+      headers: withBearer(caller.token),
+    });
+    assert.equal(malformed.statusCode, 400, malformed.body);
+
+    const anonymous = await app.inject({ method: 'GET', url: '/api/v1/ajos' });
+    assert.equal(anonymous.statusCode, 401);
+  });
+});

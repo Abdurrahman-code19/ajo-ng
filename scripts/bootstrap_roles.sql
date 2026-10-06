@@ -296,6 +296,24 @@ REVOKE EXECUTE ON FUNCTION app.post_ledger_transaction(
   timestamptz, text
 ) FROM PUBLIC, ajo_app;
 
+-- The same hazard, for the same reason, one migration later.
+--
+-- `app.close_expired_enrollment` is migration 113's enrolment sweep. It cancels
+-- Ajos, stamps `cancelled_at` and writes `cancellation_reason`, so EXECUTE on it
+-- is a write capability no request handler should have -- a compromised route
+-- could cancel every Ajo in the table by calling it in a loop. Migration 113
+-- revokes it from PUBLIC and grants it to nobody, and that revoke was undone here
+-- by the blanket grant above, exactly as happened to
+-- `app.post_ledger_transaction` above.
+--
+-- The function is deliberately granted to nobody at all. It exists for a
+-- scheduler that this deployment does not have yet, and until one does, the only
+-- correct caller is a superuser or `ajo_migrator` running it by hand -- which is
+-- how the migration tests exercise it. Enrolment expiry is still enforced without
+-- it: `app.assert_joinable` refuses a late join from the clock alone, so a
+-- missing sweep delays a status change and never permits an invalid one.
+REVOKE EXECUTE ON FUNCTION app.close_expired_enrollment() FROM PUBLIC, ajo_app;
+
 COMMENT ON SCHEMA app IS
   'Trigger and policy functions. Owned by ajo_migrator so the six SECURITY '
   'DEFINER functions in here execute with bounded privilege instead of a '
