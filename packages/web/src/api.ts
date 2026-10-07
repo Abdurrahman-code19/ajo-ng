@@ -34,6 +34,17 @@ export class ApiError extends Error {
 
 const TOKEN_KEY = 'ajo.web.accessToken';
 
+/**
+ * API origin, configurable at build time so the same client runs in dev
+ * (same-origin `/api`, proxied by Vite) and on Vercel (VITE_API_URL pointing
+ * at the hosted API). Empty string means same-origin.
+ */
+const API_BASE = (() => {
+  const configured = (import.meta as { env?: Record<string, string | undefined> }).env
+    ?.VITE_API_URL;
+  return configured && configured !== '' ? configured.replace(/\/+$/, '') : '';
+})();
+
 export function getToken(): string | null {
   return typeof window === 'undefined' ? null : window.localStorage.getItem(TOKEN_KEY);
 }
@@ -64,7 +75,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   let response: Response;
   try {
-    response = await fetch(`/api/v1${path}`, {
+    response = await fetch(`${API_BASE}/api/v1${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

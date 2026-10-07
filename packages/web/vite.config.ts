@@ -6,6 +6,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
+    // The quick-tunnel name for sharing the live demo changes on every
+    // restart, so any *.trycloudflare.com host may reach the dev server.
+    allowedHosts: ['.trycloudflare.com'],
     proxy: {
       '/api': 'http://127.0.0.1:3000',
       // Demo-only "you have mail" surface (scripts/dev-mailbox.mjs). The

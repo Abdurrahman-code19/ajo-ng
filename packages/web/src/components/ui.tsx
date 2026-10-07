@@ -10,6 +10,8 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 /**
  * THE button. One primary action per screen (DESIGN §6).
  * 40px tall, 8px radius; loading replaces label with a spinner.
+ * The primary action is the gradient CTA — the one place the brand lets
+ * colour run, so the shape stays disciplined elsewhere (DESIGN §2).
  */
 export function Button({
   variant = 'primary',
@@ -22,9 +24,9 @@ export function Button({
 }: ButtonProps) {
   const variants: Record<string, string> = {
     primary:
-      'bg-[var(--primary)] text-white hover:bg-[var(--primary-hover)] active:scale-[0.99]',
+      'bg-gradient-cta text-white shadow-[0_10px_22px_-10px_var(--primary)] hover:brightness-110 active:scale-[0.98]',
     secondary:
-      'bg-[var(--surface)] text-[var(--ink)] border border-[var(--line)] hover:border-[var(--primary)] hover:text-[var(--primary)]',
+      'bg-[var(--surface)] text-[var(--ink)] border border-[var(--line)] hover:border-[var(--primary)] hover:text-[var(--primary)] shadow-[var(--shadow-soft)]',
     danger:
       'bg-[var(--danger)] text-white hover:opacity-90',
     ghost:
@@ -38,7 +40,8 @@ export function Button({
   return (
     <button
       className={`inline-flex items-center justify-center gap-2 rounded-lg font-semibold
-        transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50
+        transition-[transform,filter,background-color,border-color,color] duration-150
+        disabled:cursor-not-allowed disabled:opacity-50
         ${variants[variant]} ${sizes[size]} ${className}`}
       disabled={disabled || loading}
       {...rest}
@@ -58,6 +61,64 @@ export function Spinner({ className = 'h-4 w-4' }: { className?: string }) {
         d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
       />
     </svg>
+  );
+}
+
+/**
+ * Shimmering placeholder for content that is still loading — the demo shows
+ * a skeleton instead of a spinner wherever it can (DESIGN §motion).
+ */
+export function Skeleton({ className = '', ...rest }: { className?: string } & React.HTMLAttributes<HTMLDivElement>) {
+  return <div className={`skeleton ${className}`} {...rest} />;
+}
+
+const AVATAR_HUES = [
+  'from-[var(--primary)] to-[var(--deep)]',
+  'from-[oklch(70% 0.1 205)] to-[var(--primary)]',
+  'from-[var(--gold)] to-[oklch(45% 0.1 84)]',
+  'from-[oklch(70% 0.12 285)] to-[var(--primary)]',
+  'from-[oklch(68% 0.12 155)] to-[oklch(45% 0.12 155)]',
+];
+
+function hueFor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i += 1) {
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }
+  return AVATAR_HUES[Math.abs(hash) % AVATAR_HUES.length];
+}
+
+export function initialsOf(name: string): string {
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase() ?? '')
+      .join('') || '?'
+  );
+}
+
+/** Gradient monogram: the cheapest distinctive mark in the product. */
+export function Avatar({
+  name,
+  label,
+  size = 'md',
+  className = '',
+}: {
+  name: string;
+  label?: string;
+  size?: 'sm' | 'md' | 'lg';
+  className?: string;
+}) {
+  const sizeClass = size === 'lg' ? 'h-12 w-12 text-base' : size === 'sm' ? 'h-7 w-7 text-[11px]' : 'h-10 w-10 text-sm';
+  return (
+    <span
+      className={`inline-flex shrink-0 select-none items-center justify-center rounded-full bg-gradient-to-br font-bold text-white ${hueFor(name)} ${sizeClass} ${className}`}
+      aria-label={label ?? `Avatar for ${name}`}
+    >
+      {initialsOf(name)}
+    </span>
   );
 }
 
@@ -90,7 +151,9 @@ export function StatusChip({ status }: { status: string }) {
 
 export function Card({ children, className = '' }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`rounded-xl border border-[var(--line)] bg-[var(--surface)] ${className}`}>
+    <div
+      className={`rounded-2xl border border-[var(--line)] bg-[var(--surface)] shadow-[var(--shadow-soft)] ${className}`}
+    >
       {children}
     </div>
   );
@@ -125,8 +188,8 @@ export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       {...props}
-      className={`h-11 w-full rounded-lg border border-[var(--line)] bg-[var(--cloud)] px-3.5 text-base
-        placeholder:text-[var(--muted)] transition-colors duration-150
+      className={`h-11 w-full rounded-lg border border-[var(--line)] bg-[var(--cloud)] px-3.5 text-base placeholder:text-[var(--muted)]
+        transition-[border-color,background-color] duration-150
         focus:border-[var(--primary)] focus:bg-[var(--surface)] focus:outline-none
         ${props.className ?? ''}`}
     />

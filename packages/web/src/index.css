@@ -1,5 +1,5 @@
 /**
- * The colour and type tokens for AJO.ng (see DESIGN.md).
+ * The colour, type and motion tokens for AJO.ng (see DESIGN.md).
  *
  * Brand hexes are fixed by CANONICAL and converted to OKLCH for the tokens;
  * they are only repeated here because Tailwind v4 reads tokens from CSS.
@@ -10,8 +10,10 @@
   /* Brand (OKLCH, from CANONICAL §0) */
   --deep: oklch(23.93% 0.058 256.7);
   --deep-ink: oklch(17% 0.05 256); /* hover for deep */
+  --deep-2: oklch(30% 0.055 258); /* gradient companion */
   --primary: oklch(57.26% 0.218 259.8);
   --primary-hover: oklch(50% 0.218 259.8);
+  --primary-bright: oklch(64% 0.2 259); /* gradient highs */
   --primary-wash: oklch(96% 0.03 259.8);
   --cyan: oklch(75.91% 0.125 204.8);
   --gold: oklch(83.69% 0.164 84.4);
@@ -25,10 +27,31 @@
   --cyan-wash: oklch(95% 0.04 205);
   --gold-wash: oklch(95% 0.06 84);
   --danger-wash: oklch(96% 0.03 25);
+
+  /* Gradients — the brand reads as light, so gradients are saved for moments:
+     the primary CTA, the hero headline on navy, and the logo splash. */
+  --gradient-cta: linear-gradient(135deg, var(--primary) 0%, var(--primary-bright) 100%);
+  --gradient-navy: linear-gradient(
+    135deg,
+    var(--deep) 0%,
+    var(--deep-2) 52%,
+    var(--primary) 130%
+  );
+  --gradient-text-cyan: linear-gradient(92deg, var(--cyan) 0%, #ffffff 75%);
+
+  /* Elevation */
+  --shadow-soft:
+    0 1px 2px color-mix(in oklab, var(--deep) 6%, transparent),
+    0 10px 28px -14px color-mix(in oklab, var(--deep) 22%, transparent);
+  --shadow-pop: 0 28px 56px -16px color-mix(in oklab, var(--deep) 35%, transparent);
+
+  /* Glass */
+  --glass: color-mix(in oklab, var(--surface) 78%, transparent);
 }
 
 html {
   font-size: 16px;
+  background: var(--cloud);
 }
 
 body {
@@ -49,6 +72,36 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* The display face is Plus Jakarta Sans — the wireframe's voice. Headings
+   pick it up automatically; the .font-display utility carries it to numerals
+   and labels when a heading feel is wanted without a heading element. */
+h1,
+h2,
+h3,
+h4 {
+  font-family:
+    "Plus Jakarta Sans",
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  letter-spacing: -0.02em;
+}
+
+.font-display {
+  font-family:
+    "Plus Jakarta Sans",
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  letter-spacing: -0.02em;
+}
+
 .tnum {
   font-variant-numeric: tabular-nums;
 }
@@ -59,6 +112,139 @@ body {
   outline-offset: 2px;
 }
 
+/* --- Motion (DESIGN §7) -------------------------------------------------
+   Card enter: 200ms fade-up; progress fills: ~500ms; the rest are micro. */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes glow-drift {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+    opacity: 0.55;
+  }
+  50% {
+    transform: translate(36px, -24px) scale(1.18);
+    opacity: 0.85;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.anim-fade-up {
+  animation: fade-up 0.45s cubic-bezier(0.22, 0.8, 0.36, 1) both;
+}
+
+.anim-pop {
+  animation: pop-in 0.4s cubic-bezier(0.22, 0.8, 0.36, 1) both;
+}
+
+.anim-delay-1 {
+  animation-delay: 60ms;
+}
+.anim-delay-2 {
+  animation-delay: 120ms;
+}
+.anim-delay-3 {
+  animation-delay: 180ms;
+}
+.anim-delay-4 {
+  animation-delay: 240ms;
+}
+
+/* Skeleton loading: shimmer over a soft line. Runs once per element mount;
+   under reduced motion it sits still (the global rule kills the animation). */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.75rem;
+  background-color: var(--line);
+  background-image: linear-gradient(
+    90deg,
+    var(--line) 0%,
+    color-mix(in oklab, var(--surface) 75%, var(--line)) 45%,
+    var(--line) 64%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s linear infinite;
+}
+
+/* The primary gradient surface for CTAs and hero accents. */
+.bg-gradient-cta {
+  background-image: var(--gradient-cta);
+}
+
+/* Navy gradient banner (hero on the dashboard, invite card, splash). */
+.bg-gradient-navy {
+  background-image: var(--gradient-navy);
+}
+
+/* Cyan→white text gradient, for the word that matters on navy. */
+.text-gradient-cyan {
+  background-image: var(--gradient-text-cyan);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Frosted app chrome — top bar and bottom nav. */
+.glass {
+  background-color: var(--glass);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+
+/* Ambient glow, used on navy surfaces (auth panel, splash). */
+.glow-blob {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(110px);
+  animation: glow-drift 14s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Visible a11y focus for links inside cards (kept inside the global rule). */
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -66,5 +252,6 @@ body {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
