@@ -39,6 +39,7 @@ export class AjoNotFoundError extends Error {
 export interface AjoSummary {
   readonly id: string;
   readonly reference: string;
+  readonly organizerUserId: string;
   readonly name: string;
   readonly status: string;
   readonly contributionKobo: number;
@@ -64,6 +65,7 @@ export interface AjoListResponse {
 interface SummaryRow {
   id: string;
   reference: string;
+  organizer_user_id: string;
   name: string;
   status: string;
   contribution_amount_kobo: string;
@@ -96,6 +98,7 @@ interface SummaryRow {
 const SUMMARY_SELECT = `
   SELECT a.id,
          a.reference,
+         a.organizer_user_id,
          a.name,
          a.status::text AS status,
          a.contribution_amount_kobo,
@@ -164,6 +167,7 @@ function toSummary(row: SummaryRow): AjoSummary {
   return {
     id: row.id,
     reference: row.reference,
+    organizerUserId: row.organizer_user_id,
     name: row.name,
     status: row.status,
     contributionKobo: Number(row.contribution_amount_kobo),

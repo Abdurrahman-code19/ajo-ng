@@ -236,7 +236,14 @@ export function createVerificationSender(
   relay?: MailRelayConfig,
 ): VerificationSender {
   if (environment !== 'production') {
-    return createLoggingSender(log);
+    // Development defaults to logging the token so a fellow developer can read
+    // it -- but when a relay IS configured (the demo, or a dev box with a real
+    // provider) the token should travel the production path instead, so the
+    // mailbox, and the web app's "you have mail" surface, see the real send.
+    if (relay === undefined) {
+      return createLoggingSender(log);
+    }
+    return createHttpRelaySender(relay);
   }
 
   if (relay === undefined) {

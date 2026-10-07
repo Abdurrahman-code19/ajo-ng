@@ -210,6 +210,22 @@ describe('the verification sender guards production', () => {
     await sender.sendVerificationToken({ to: 'a@b.ng', userId: 'x', token: 't' });
     assert.equal(logged.length, 1, 'the development sender did not log');
   });
+
+  it('uses the relay in development when one is configured', async () => {
+    // The demo runs development with a local relay stub so verification tokens
+    // travel the production path (and land in the demo mailbox) instead of only
+    // a log line. A configured relay must win over logging even outside prod.
+    const logged: object[] = [];
+    const sender = createVerificationSender(
+      'development',
+      { info: (fields: object): void => void logged.push(fields) },
+      { url: 'http://127.0.0.1:1/never-reached', token: 'relay-secret', from: 'no-reply@example.ng' },
+    );
+    await assert.rejects(() =>
+      sender.sendVerificationToken({ to: 'a@b.ng', userId: 'x', token: 't' }),
+    );
+    assert.equal(logged.length, 0, 'the development sender logged the token');
+  });
 });
 
 describe('the mail relay configuration', () => {
